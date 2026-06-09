@@ -751,4 +751,122 @@ absl::StatusOr<AvroValue> DataFileReader::NextValue() {
 
 void DataFileReader::Rewind() { reader_.rewind(); }
 
+// ---------------------------------------------------------------------------
+// StreamingDataFileWriter
+// ---------------------------------------------------------------------------
+
+StreamingDataFileWriter::StreamingDataFileWriter(
+    rust::container::StreamingDataFileWriter writer)
+    : writer_(std::move(writer)) {}
+
+absl::StatusOr<StreamingDataFileWriter> StreamingDataFileWriter::Create(
+    const AvroSchema& schema, Codec codec) {
+  rs_std::Result<rust::container::AvroCodec, rust::vec_u8::VecU8> rust_codec =
+      rust::container::AvroCodec::from_i32(static_cast<int32_t>(codec));
+  if (!rust_codec.has_value()) {
+    return absl::InvalidArgumentError(FromVecU8(std::move(rust_codec).err()));
+  }
+  rs_std::Result<rust::container::StreamingDataFileWriter, rust::vec_u8::VecU8>
+      result = rust::container::StreamingDataFileWriter::create(
+          schema.schema_, std::move(rust_codec).value());
+  if (!result.has_value()) {
+    return absl::InvalidArgumentError(FromVecU8(std::move(result).err()));
+  }
+  return StreamingDataFileWriter(std::move(result).value());
+}
+
+absl::StatusOr<AvroSchema> StreamingDataFileWriter::Schema() const {
+  rs_std::Result<rust::schema::AvroSchema, rust::vec_u8::VecU8> result =
+      writer_.schema();
+  if (!result.has_value()) {
+    return absl::FailedPreconditionError(FromVecU8(std::move(result).err()));
+  }
+  return AvroSchema(std::move(result).value());
+}
+
+absl::Status StreamingDataFileWriter::Append(const AvroValue& value) {
+  return ToStatus(writer_.append(value.value_), kBadInput);
+}
+
+absl::StatusOr<std::string> StreamingDataFileWriter::TakeBytes() {
+  return UnwrapString(writer_.take_bytes(), absl::StatusCode::kInternal);
+}
+
+absl::StatusOr<std::string> StreamingDataFileWriter::Finish() {
+  return UnwrapString(writer_.finish(), absl::StatusCode::kInternal);
+}
+
+bool StreamingDataFileWriter::IsFinished() const {
+  return writer_.is_finished();
+}
+
+// ---------------------------------------------------------------------------
+// StreamingDataFileReader
+// ---------------------------------------------------------------------------
+
+StreamingDataFileReader::StreamingDataFileReader(
+    rust::container::StreamingDataFileReader reader)
+    : reader_(std::move(reader)) {}
+
+absl::StatusOr<StreamingDataFileReader> StreamingDataFileReader::FromBytes(
+    absl::string_view data) {
+  rs_std::Result<rust::container::StreamingDataFileReader, rust::vec_u8::VecU8>
+      result = rust::container::StreamingDataFileReader::from_bytes(
+          ToByteSpan(data));
+  if (!result.has_value()) {
+    return absl::InvalidArgumentError(FromVecU8(std::move(result).err()));
+  }
+  return StreamingDataFileReader(std::move(result).value());
+}
+
+absl::StatusOr<StreamingDataFileReader>
+StreamingDataFileReader::FromBytesWithSchema(const AvroSchema& reader_schema,
+                                             absl::string_view data) {
+  rs_std::Result<rust::container::StreamingDataFileReader, rust::vec_u8::VecU8>
+      result = rust::container::StreamingDataFileReader::from_bytes_with_schema(
+          reader_schema.schema_, ToByteSpan(data));
+  if (!result.has_value()) {
+    return absl::InvalidArgumentError(FromVecU8(std::move(result).err()));
+  }
+  return StreamingDataFileReader(std::move(result).value());
+}
+
+absl::StatusOr<StreamingDataFileReader> StreamingDataFileReader::FromPath(
+    absl::string_view path) {
+  rs_std::Result<rust::container::StreamingDataFileReader, rust::vec_u8::VecU8>
+      result = rust::container::StreamingDataFileReader::from_path(
+          ToByteSpan(path));
+  if (!result.has_value()) {
+    return absl::InvalidArgumentError(FromVecU8(std::move(result).err()));
+  }
+  return StreamingDataFileReader(std::move(result).value());
+}
+
+absl::StatusOr<StreamingDataFileReader>
+StreamingDataFileReader::FromPathWithSchema(const AvroSchema& reader_schema,
+                                            absl::string_view path) {
+  rs_std::Result<rust::container::StreamingDataFileReader, rust::vec_u8::VecU8>
+      result = rust::container::StreamingDataFileReader::from_path_with_schema(
+          reader_schema.schema_, ToByteSpan(path));
+  if (!result.has_value()) {
+    return absl::InvalidArgumentError(FromVecU8(std::move(result).err()));
+  }
+  return StreamingDataFileReader(std::move(result).value());
+}
+
+AvroSchema StreamingDataFileReader::WriterSchema() const {
+  return AvroSchema(reader_.writer_schema());
+}
+
+bool StreamingDataFileReader::HasNext() { return reader_.has_next(); }
+
+absl::StatusOr<AvroValue> StreamingDataFileReader::NextValue() {
+  rs_std::Result<rust::value::AvroValue, rust::vec_u8::VecU8> result =
+      reader_.next_value();
+  if (!result.has_value()) {
+    return absl::OutOfRangeError(FromVecU8(std::move(result).err()));
+  }
+  return AvroValue(std::move(result).value());
+}
+
 }  // namespace security::avro

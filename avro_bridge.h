@@ -20,6 +20,8 @@ namespace security::avro {
 class AvroValue;
 class DataFileWriter;
 class DataFileReader;
+class StreamingDataFileWriter;
+class StreamingDataFileReader;
 
 // Compression codec for object container files. The set deliberately
 // matches avrocpp (null/deflate/snappy/zstd); bzip2 and xz are excluded.
@@ -94,6 +96,8 @@ class AvroSchema final {
   friend class AvroValue;
   friend class DataFileWriter;
   friend class DataFileReader;
+  friend class StreamingDataFileWriter;
+  friend class StreamingDataFileReader;
   friend absl::StatusOr<std::string> EncodeDatum(const AvroSchema& schema,
                                                  const AvroValue& value);
   friend absl::StatusOr<std::string> EncodeDatumSchemata(
@@ -251,6 +255,8 @@ class AvroValue final {
  private:
   friend class DataFileWriter;
   friend class DataFileReader;
+  friend class StreamingDataFileWriter;
+  friend class StreamingDataFileReader;
   friend absl::StatusOr<std::string> EncodeDatum(const AvroSchema& schema,
                                                  const AvroValue& value);
   friend absl::StatusOr<std::string> EncodeDatumSchemata(
@@ -362,6 +368,87 @@ class DataFileReader final {
   explicit DataFileReader(rust::container::DataFileReader reader);
 
   rust::container::DataFileReader reader_;
+};
+
+// Streaming object container file writer. Unlike DataFileWriter, values are
+// not all buffered: Append encodes into a ~16 KB block buffer that
+// auto-flushes full blocks into an internal buffer. Drain the encoded bytes
+// incrementally with TakeBytes (full blocks only) and finish with Finish
+// (flushes the final partial block). The concatenation of every TakeBytes
+// result followed by the Finish result is a complete, valid container file.
+// Use this to bound peak memory when writing large files; use DataFileWriter
+// when you want the whole file from one ToBytes call.
+class StreamingDataFileWriter final {
+ public:
+  StreamingDataFileWriter(StreamingDataFileWriter&&) noexcept = default;
+  StreamingDataFileWriter& operator=(StreamingDataFileWriter&&) noexcept =
+      default;
+  StreamingDataFileWriter(const StreamingDataFileWriter&) = delete;
+  StreamingDataFileWriter& operator=(const StreamingDataFileWriter&) = delete;
+
+  static absl::StatusOr<StreamingDataFileWriter> Create(const AvroSchema& schema,
+                                                        Codec codec);
+
+  // The schema the writer was created with. Fails after Finish.
+  absl::StatusOr<AvroSchema> Schema() const;
+
+  // Validates and encodes `value`; may auto-flush a full block internally.
+  // Fails after Finish.
+  absl::Status Append(const AvroValue& value);
+
+  // Returns the bytes already flushed to the internal buffer (header plus any
+  // full blocks), draining them. Does not force a partial flush, so may
+  // return "". Fails after Finish.
+  absl::StatusOr<std::string> TakeBytes();
+
+  // Flushes any pending block, returns the remaining bytes, and consumes the
+  // writer. Further calls fail. (With no buffered values the result is just
+  // the header plus whatever was already flushed.)
+  absl::StatusOr<std::string> Finish();
+
+  // True once Finish has consumed the writer.
+  bool IsFinished() const;
+
+ private:
+  explicit StreamingDataFileWriter(rust::container::StreamingDataFileWriter writer);
+
+  rust::container::StreamingDataFileWriter writer_;
+};
+
+// Streaming object container file reader. Unlike DataFileReader, this decodes
+// one value per NextValue instead of decoding the whole file up front. Use it
+// to bound peak memory when reading large files. There is no Count (unknown
+// without consuming the file) and no Rewind (a consumed stream cannot be
+// rewound); use DataFileReader if you need either.
+class StreamingDataFileReader final {
+ public:
+  StreamingDataFileReader(StreamingDataFileReader&&) noexcept = default;
+  StreamingDataFileReader& operator=(StreamingDataFileReader&&) noexcept =
+      default;
+  StreamingDataFileReader(const StreamingDataFileReader&) = delete;
+  StreamingDataFileReader& operator=(const StreamingDataFileReader&) = delete;
+
+  static absl::StatusOr<StreamingDataFileReader> FromBytes(
+      absl::string_view data);
+  static absl::StatusOr<StreamingDataFileReader> FromBytesWithSchema(
+      const AvroSchema& reader_schema, absl::string_view data);
+  static absl::StatusOr<StreamingDataFileReader> FromPath(
+      absl::string_view path);
+  static absl::StatusOr<StreamingDataFileReader> FromPathWithSchema(
+      const AvroSchema& reader_schema, absl::string_view path);
+
+  // The schema the file was written with.
+  AvroSchema WriterSchema() const;
+
+  // HasNext is non-const: it fills a single-value lookahead buffer.
+  bool HasNext();
+  // NextValue fails with kOutOfRange after the last value.
+  absl::StatusOr<AvroValue> NextValue();
+
+ private:
+  explicit StreamingDataFileReader(rust::container::StreamingDataFileReader reader);
+
+  rust::container::StreamingDataFileReader reader_;
 };
 
 }  // namespace security::avro

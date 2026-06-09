@@ -87,5 +87,69 @@ int main(int argc, char** argv) {
               << std::endl;
   }
 
+  // Streaming variant: write incrementally (draining encoded bytes as we go
+  // instead of buffering every value) and read back one value at a time.
+  auto stream_writer_or = security::avro::StreamingDataFileWriter::Create(
+      schema, security::avro::Codec::kDeflate);
+  if (!stream_writer_or.ok()) {
+    std::cerr << "Streaming Create failed: " << stream_writer_or.status()
+              << std::endl;
+    return 1;
+  }
+  auto& stream_writer = *stream_writer_or;
+
+  std::string file;  // The caller owns the sink; the writer never holds it all.
+  for (int i = 0; i < 3; ++i) {
+    auto record = security::avro::AvroValue::CreateRecord();
+    auto sensor = security::avro::AvroValue::CreateString("stream");
+    if (!sensor.ok()) {
+      std::cerr << "CreateString failed: " << sensor.status() << std::endl;
+      return 1;
+    }
+    (void)record.RecordPut("sensor", *sensor);
+    (void)record.RecordPut(
+        "value", security::avro::AvroValue::CreateDouble(100.0 + i));
+    (void)record.RecordPut("healthy",
+                           security::avro::AvroValue::CreateBoolean(true));
+    if (auto s = stream_writer.Append(record); !s.ok()) {
+      std::cerr << "Streaming Append failed: " << s << std::endl;
+      return 1;
+    }
+    auto chunk = stream_writer.TakeBytes();  // Drain what's been flushed.
+    if (!chunk.ok()) {
+      std::cerr << "TakeBytes failed: " << chunk.status() << std::endl;
+      return 1;
+    }
+    file += *chunk;
+  }
+  auto tail = stream_writer.Finish();
+  if (!tail.ok()) {
+    std::cerr << "Finish failed: " << tail.status() << std::endl;
+    return 1;
+  }
+  file += *tail;
+  std::cout << "Streamed container file size: " << file.size() << " bytes"
+            << std::endl;
+
+  auto stream_reader_or =
+      security::avro::StreamingDataFileReader::FromBytes(file);
+  if (!stream_reader_or.ok()) {
+    std::cerr << "Streaming FromBytes failed: " << stream_reader_or.status()
+              << std::endl;
+    return 1;
+  }
+  auto& stream_reader = *stream_reader_or;
+  while (stream_reader.HasNext()) {
+    auto value_or = stream_reader.NextValue();
+    if (!value_or.ok()) {
+      std::cerr << "Streaming NextValue failed: " << value_or.status()
+                << std::endl;
+      return 1;
+    }
+    auto json_or = value_or->ToJsonString();
+    std::cout << "Streamed record: " << (json_or.ok() ? *json_or : "<error>")
+              << std::endl;
+  }
+
   return 0;
 }
