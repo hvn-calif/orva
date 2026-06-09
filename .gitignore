@@ -1,0 +1,14 @@
+# avoid trailing `/` because these are symlinks
+/bazel-*
+/target
+bazelisk
+MODULE.bazel.lock
+build/
+rust/target/
+
+
+# Added by cargo
+#
+# already existing elements were commented out
+
+#/target

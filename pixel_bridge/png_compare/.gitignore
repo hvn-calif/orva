@@ -1,0 +1,14 @@
+# Locally built libraries and their checked-out sources
+zlib-src/
+libpng-src/
+build-zlib/
+build-png/
+install/
+refsrc/
+*.log
+# Cargo build output
+rust_tools/target/
+# Compiled C++ harness and generated artifacts
+cpp/png_decode
+out/
+fixtures/

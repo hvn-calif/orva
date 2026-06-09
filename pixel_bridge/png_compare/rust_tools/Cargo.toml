@@ -1,0 +1,19 @@
+[package]
+name = "rust_tools"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gen_fixtures"
+path = "src/bin/gen_fixtures.rs"
+
+[[bin]]
+name = "rust_decode"
+path = "src/bin/rust_decode.rs"
+
+# Pinned to the exact versions pixel_bridge resolves (image 0.25.10 -> png 0.18.1).
+[dependencies]
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+png = "=0.18.1"
+
+[workspace]
