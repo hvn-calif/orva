@@ -5,5 +5,6 @@
 //! WARNING: This crate should never be used from Rust, instead use image directly.
 
 pub mod image;
+pub mod png_text;
 pub mod reader;
 pub mod vec_u8;

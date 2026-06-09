@@ -313,6 +313,25 @@ absl::StatusOr<std::optional<std::string>> ImageDecoder::GetIptcMetadata() {
   return GetMetadata(decoder_.iptc_metadata());
 }
 
+std::vector<PngTextChunk> ImageDecoder::GetPngTextMetadata() {
+  rust::png_text::PngTextChunks chunks = decoder_.png_text_chunks();
+  const uintptr_t count = chunks.len();
+  std::vector<PngTextChunk> result;
+  result.reserve(count);
+  for (uintptr_t i = 0; i < count; ++i) {
+    // StringViewFromVecU8 is lifetime-bound to its argument. Bind the VecU8s to
+    // named locals so they outlive the string_views, rather than relying on
+    // full-expression temporary lifetime.
+    auto keyword = chunks.keyword(i);
+    auto text = chunks.text(i);
+    result.push_back(PngTextChunk{
+        .keyword = std::string(StringViewFromVecU8(keyword)),
+        .text = std::string(StringViewFromVecU8(text)),
+    });
+  }
+  return result;
+}
+
 absl::StatusOr<ImageReader> ImageReader::NewFromFile(
     absl::string_view filepath) {
   rs_std::Result<rust::reader::ImageReader,

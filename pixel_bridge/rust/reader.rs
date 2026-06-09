@@ -133,8 +133,57 @@ impl ImageReader {
 fn png(
     d: RustImageReader<Box<dyn ReadSeek>>,
 ) -> Result<ImageDecoder, String> {
-    let decoder = RustPngDecoder::new(d.into_inner()).map_err(|e| e.to_string())?;
-    Ok(ImageDecoder::new(GenericImageDecoder::Png(Box::new(decoder))))
+    let mut reader = d.into_inner();
+
+    // Read text chunks (tEXt/zTXt/iTXt) before handing the reader to the image
+    // crate, which does not expose them. Best-effort, then rewind so the image
+    // decoder sees the stream from the start (same approach as the TIFF path).
+    let png_text = read_png_text(&mut reader);
+    reader.seek(std::io::SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+
+    let decoder = RustPngDecoder::new(reader).map_err(|e| e.to_string())?;
+    let mut image_decoder = ImageDecoder::new(GenericImageDecoder::Png(Box::new(decoder)));
+    image_decoder.png_text = png_text;
+    Ok(image_decoder)
+}
+
+/// Reads PNG text chunks (`tEXt`/`zTXt`/`iTXt`) from `reader` as
+/// `(keyword, text)` pairs.
+///
+/// Best-effort: if the header cannot be parsed, or an individual compressed
+/// chunk cannot be decoded, it is skipped rather than propagated, so malformed
+/// text never breaks image decoding. Entries are grouped by chunk type (`tEXt`,
+/// then `zTXt`, then `iTXt`), preserving order within each type. Only chunks
+/// appearing before the image data (`IDAT`) are captured, which is the standard
+/// placement; trailing text chunks are not read.
+fn read_png_text(reader: &mut Box<dyn ReadSeek>) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+
+    // `png_reader` holds the `&mut *reader` borrow; it is dropped when this
+    // function returns, releasing the borrow before the caller seeks `reader`.
+    let png_reader = match png::Decoder::new(&mut *reader).read_info() {
+        Ok(png_reader) => png_reader,
+        Err(_) => return entries,
+    };
+    let info = png_reader.info();
+
+    // tEXt and zTXt are Latin-1 in the file; the png crate has already decoded
+    // them to UTF-8 Strings. iTXt is UTF-8 by definition.
+    for chunk in &info.uncompressed_latin1_text {
+        entries.push((chunk.keyword.clone(), chunk.text.clone()));
+    }
+    for chunk in &info.compressed_latin1_text {
+        if let Ok(text) = chunk.get_text() {
+            entries.push((chunk.keyword.clone(), text));
+        }
+    }
+    for chunk in &info.utf8_text {
+        if let Ok(text) = chunk.get_text() {
+            entries.push((chunk.keyword.clone(), text));
+        }
+    }
+
+    entries
 }
 
 #[inline(never)]

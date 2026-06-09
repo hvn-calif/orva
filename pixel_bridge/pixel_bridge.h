@@ -57,6 +57,15 @@ enum class ChromaSubsampling {
   kCs410,
 };
 
+// A single PNG text chunk surfaced as a keyword/value pair. tEXt, zTXt, and
+// iTXt chunks are all folded into this representation; keywords may repeat
+// (e.g. multiple "Comment" entries). Both fields are UTF-8 (the decoder
+// transcodes the Latin-1 tEXt/zTXt chunks).
+struct PngTextChunk final {
+  std::string keyword;
+  std::string text;
+};
+
 // Information about strides (offset to the next sample).
 struct Strides final {
   // Add this to an index to get to the next sample in x-direction.
@@ -184,6 +193,13 @@ class ImageDecoder final {
   // don’t support embedded metadata this function should always return
   // std::nullopt. Fails if the IPTC metadata is not parsable.
   absl::StatusOr<std::optional<std::string>> GetIptcMetadata();
+  // Returns the PNG text chunks (tEXt/zTXt/iTXt) embedded in the image as a
+  // flat list of keyword/value pairs. Returns an empty vector for images that
+  // are not PNG or that carry no text chunks; individual chunks that cannot be
+  // decoded are skipped. Entries are grouped by chunk type (tEXt, then zTXt,
+  // then iTXt). Only text chunks appearing before the image data are captured.
+  // Note: Only relevant for PNG images.
+  std::vector<PngTextChunk> GetPngTextMetadata();
   // Sets the background color for transparent pixels if available. Since this
   // can decode to multitude of different bit-depths, this allows overriding for
   // 8-bit and 16-bit respectively. This leaves the input untouched if no alpha

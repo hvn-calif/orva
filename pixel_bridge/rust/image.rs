@@ -1,4 +1,5 @@
 use crate::{
+    png_text::PngTextChunks,
     reader::{Format, ReadSeek},
     vec_u8::VecU8,
 };
@@ -125,6 +126,9 @@ pub struct ImageDecoder {
     sample_layout: Option<RustSampleLayout>,
     background_subs: Option<(RustRgba<u8>, RustRgba<u16>)>,
     pub(crate) should_premultiply: bool,
+    // PNG text chunks (tEXt/zTXt/iTXt) parsed at construction time. Empty for
+    // non-PNG images. Set by the PNG builder in `reader.rs`.
+    pub(crate) png_text: Vec<(String, String)>,
 }
 
 impl std::fmt::Debug for ImageDecoder {
@@ -357,6 +361,7 @@ impl ImageDecoder {
             inner: Some(rust_decoder),
             background_subs: None,
             should_premultiply: false,
+            png_text: Vec::new(),
         }
     }
 
@@ -606,6 +611,14 @@ impl ImageDecoder {
     /// always return Ok(None).
     pub fn iptc_metadata(&mut self) -> Result<Option<VecU8>, VecU8> {
         self.get_metadata(|inner| inner.iptc_metadata())
+    }
+
+    /// Returns the PNG text chunks (tEXt/zTXt/iTXt) parsed from the image as a
+    /// flat list of keyword/text pairs. Empty for non-PNG images and for PNGs
+    /// without text chunks. The chunks are parsed eagerly when the decoder is
+    /// constructed (see the PNG builder in `reader.rs`).
+    pub fn png_text_chunks(&self) -> PngTextChunks {
+        self.png_text.clone().into()
     }
 
     /// Sets the background color for transparent pixels if available. Since this
