@@ -1,0 +1,69 @@
+Mechanism 2 -- TSAN dl_iterate_phdr interceptor <-> dynamic-loader-lock inversion.
+
+Captured with `gdb -p <pid> -batch -ex "thread apply all bt"` while the reproducer
+(src/dlopen_loi.rs) was in a throughput collapse under ThreadSanitizer on
+aarch64 / RHEL9 glibc / rustc nightly-2026-05-19. These stacks are verbatim from
+the running process; frame paths say `src/main.rs` because the scratchpad
+reproducer crate used that filename -- `actor_backtrace` / `actor_dlopen` are the
+same functions committed here as src/dlopen_loi.rs.
+
+Two locks:
+  L = glibc dynamic-loader lock (taken by dl_iterate_phdr AND dlopen/dlclose)
+  T = TSAN internal LibIgnore lock (sanitizer_mutex, taken by TSAN's interceptors)
+
+================================================================================
+(A) CAPTURE side -- how Backtrace::capture() reaches dl_iterate_phdr / wants L.
+    This is the chain that is NOT visible in std's backtrace.rs source: create()
+    takes lock(), then trace_unsynchronized() drives the libgcc unwinder, which
+    calls _Unwind_Find_FDE -> dl_iterate_phdr (loader lock L) per frame.
+    [snaps/s10.txt, Thread 13]
+--------------------------------------------------------------------------------
+#0  execute_cfa_program_generic ()                       from /lib64/libgcc_s.so.1
+#1  uw_frame_state_for ()                                from /lib64/libgcc_s.so.1
+#2  _Unwind_Backtrace ()                                 from /lib64/libgcc_s.so.1
+#3  std::backtrace_rs::backtrace::libunwind::trace ()    at .../backtrace/src/backtrace/libunwind.rs:117
+#4  std::backtrace_rs::backtrace::trace_unsynchronized   at .../backtrace/src/backtrace/mod.rs:66
+#5  std::backtrace::Backtrace::create ()                 at library/std/src/backtrace.rs:331
+#6  dl_open_loi::actor_backtrace ()                      at src/main.rs:14   (== pixel_bridge image.rs:295)
+    ... thread spawn frames ...
+
+================================================================================
+(B) DLOPEN side, holding T and going for L. TSAN's dlclose interceptor takes the
+    LibIgnore lock T (OnLibraryLoaded), then calls dl_iterate_phdr to refresh its
+    module map -- which wants the loader lock L.  order: T -> L
+    [snaps/s33.txt, Thread 4]
+--------------------------------------------------------------------------------
+#0  internal_munmap ()                                   at sanitizer_linux.cpp:283
+#1  __sanitizer::UnmapOrDie ()                           at sanitizer_posix.cpp:59
+#2  Destroy ()                                           at sanitizer_common.h:542
+#3  ~InternalMmapVector ()                               at sanitizer_common.h:652
+#4  dl_iterate_phdr_cb ()                                at sanitizer_linux_libcdep.cpp:778
+#5  dl_iterate_phdr ()                                   from /lib64/libc.so.6          <-- wants loader lock L
+#6  ___interceptor_dl_iterate_phdr ()                    at tsan_interceptors_posix.cpp:2512
+#7  init ()                                              at sanitizer_linux_libcdep.cpp:789
+#8  __sanitizer::LibIgnore::OnLibraryLoaded ()           at sanitizer_libignore.cpp:54  <-- holds TSAN lock T
+#9  ___interceptor_dlclose ()                            at sanitizer_common_interceptors.inc:6550
+#10 dl_open_loi::actor_dlopen ()                         at src/main.rs:23
+
+================================================================================
+(C) DLOPEN side, blocked WANTING T. Another dlclose thread is parked acquiring
+    the LibIgnore lock T (GenericScopedLock) that (B)/others hold, while it sits
+    inside the real dlclose holding loader-lock state.  order: L -> T
+    [snaps/s57.txt, Thread 9]
+--------------------------------------------------------------------------------
+#0  FutexWait ()                                         at sanitizer_linux.cpp:832
+#1  __sanitizer::BlockingMutex ... Wait ()               at sanitizer_mutex.cpp:35      <-- blocked on TSAN lock T
+#2  Lock ()                                              at sanitizer_mutex.h:196
+#3  GenericScopedLock ()                                 at sanitizer_mutex.h:383
+#4  __sanitizer::LibIgnore::OnLibraryLoaded ()           at sanitizer_libignore.cpp:39
+#5  ___interceptor_dlclose ()                            at sanitizer_common_interceptors.inc:6550
+#6  dl_open_loi::actor_dlopen ()                         at src/main.rs:23
+
+================================================================================
+Cycle: capture threads sit in _Unwind_Find_FDE/dl_iterate_phdr holding/queuing on
+L while TSAN wants T; dlclose threads hold T (OnLibraryLoaded) and call
+dl_iterate_phdr wanting L. L<->T taken in opposite orders across threads ->
+lock-order inversion. Observed effect: capture throughput collapsed from
+~32,000 per 500ms to 0-7 per 500ms (momentary hard 0) for a sustained window.
+On glibc with a recursive loader lock this is a severe livelock; on a
+non-recursive loader path it is a permanent hang. Either way: denial of service.
