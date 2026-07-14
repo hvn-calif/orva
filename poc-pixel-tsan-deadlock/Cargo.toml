@@ -1,0 +1,31 @@
+[package]
+name = "pixel_tsan_deadlock_poc"
+version = "0.1.0"
+edition = "2021"
+license-file = "../LICENSE"
+
+[[bin]]
+# Mechanism 1: reentrant std backtrace lock (rust#130187).
+name = "pixel_tsan_deadlock_poc"
+path = "src/main.rs"
+
+[[bin]]
+# Mechanism 2: TSAN dl_iterate_phdr interceptor <-> loader-lock inversion.
+name = "dlopen_loi"
+path = "src/dlopen_loi.rs"
+
+[[bin]]
+# Mechanism 2: the reviewer's actual repro (barrier + capture + panic, no dlopen).
+name = "barrier_repro"
+path = "src/barrier_repro.rs"
+
+[dependencies]
+libc = "0.2"
+
+# pixel_bridge catches image-crate panics via std::panic::catch_unwind, which
+# only exists with the unwinding runtime. This mirrors the shipped build.
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
