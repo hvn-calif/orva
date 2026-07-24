@@ -5,7 +5,9 @@
 
 // Example: the typical avrocpp workflow (compile a schema, build generic
 // datums, write an object container file, read it back) on top of the
-// memory-safe Rust implementation.
+// memory-safe Rust implementation. Both the writer and the reader stream:
+// encoded bytes are drained incrementally while writing, and input is fed
+// in chunks while reading, so neither side ever holds the whole file.
 int main(int argc, char** argv) {
   const std::string schema_json = R"({
     "type": "record",
@@ -27,7 +29,8 @@ int main(int argc, char** argv) {
   std::cout << "Schema: " << schema.FullName().value_or("?")
             << " rabin_fingerprint=" << schema.FingerprintRabin() << std::endl;
 
-  // Build two records.
+  // Write: append records, draining encoded bytes as we go. The caller owns
+  // the sink (here a string; a file or socket works the same way).
   auto writer_or = security::avro::DataFileWriter::Create(
       schema, security::avro::Codec::kDeflate);
   if (!writer_or.ok()) {
@@ -37,7 +40,8 @@ int main(int argc, char** argv) {
   }
   auto& writer = *writer_or;
 
-  for (int i = 0; i < 2; ++i) {
+  std::string file;
+  for (int i = 0; i < 3; ++i) {
     auto record = security::avro::AvroValue::CreateRecord();
     auto sensor =
         security::avro::AvroValue::CreateString(i == 0 ? "temp" : "pressure");
@@ -57,99 +61,69 @@ int main(int argc, char** argv) {
       std::cerr << "Append failed: " << s << std::endl;
       return 1;
     }
-  }
-
-  auto bytes_or = writer.ToBytes();
-  if (!bytes_or.ok()) {
-    std::cerr << "ToBytes failed: " << bytes_or.status() << std::endl;
-    return 1;
-  }
-  std::cout << "Container file size: " << bytes_or->size() << " bytes"
-            << std::endl;
-
-  // Read the container file back.
-  auto reader_or = security::avro::DataFileReader::FromBytes(*bytes_or);
-  if (!reader_or.ok()) {
-    std::cerr << "FromBytes failed: " << reader_or.status() << std::endl;
-    return 1;
-  }
-  auto& reader = *reader_or;
-  std::cout << "Values in file: " << reader.Count() << std::endl;
-
-  while (reader.HasNext()) {
-    auto value_or = reader.NextValue();
-    if (!value_or.ok()) {
-      std::cerr << "NextValue failed: " << value_or.status() << std::endl;
-      return 1;
-    }
-    auto json_or = value_or->ToJsonString();
-    std::cout << "Record: " << (json_or.ok() ? *json_or : "<error>")
-              << std::endl;
-  }
-
-  // Streaming variant: write incrementally (draining encoded bytes as we go
-  // instead of buffering every value) and read back one value at a time.
-  auto stream_writer_or = security::avro::StreamingDataFileWriter::Create(
-      schema, security::avro::Codec::kDeflate);
-  if (!stream_writer_or.ok()) {
-    std::cerr << "Streaming Create failed: " << stream_writer_or.status()
-              << std::endl;
-    return 1;
-  }
-  auto& stream_writer = *stream_writer_or;
-
-  std::string file;  // The caller owns the sink; the writer never holds it all.
-  for (int i = 0; i < 3; ++i) {
-    auto record = security::avro::AvroValue::CreateRecord();
-    auto sensor = security::avro::AvroValue::CreateString("stream");
-    if (!sensor.ok()) {
-      std::cerr << "CreateString failed: " << sensor.status() << std::endl;
-      return 1;
-    }
-    (void)record.RecordPut("sensor", *sensor);
-    (void)record.RecordPut(
-        "value", security::avro::AvroValue::CreateDouble(100.0 + i));
-    (void)record.RecordPut("healthy",
-                           security::avro::AvroValue::CreateBoolean(true));
-    if (auto s = stream_writer.Append(record); !s.ok()) {
-      std::cerr << "Streaming Append failed: " << s << std::endl;
-      return 1;
-    }
-    auto chunk = stream_writer.TakeBytes();  // Drain what's been flushed.
+    auto chunk = writer.TakeBytes();  // Drain whatever is encoded so far.
     if (!chunk.ok()) {
       std::cerr << "TakeBytes failed: " << chunk.status() << std::endl;
       return 1;
     }
     file += *chunk;
   }
-  auto tail = stream_writer.Finish();
+  auto tail = writer.Finish();
   if (!tail.ok()) {
     std::cerr << "Finish failed: " << tail.status() << std::endl;
     return 1;
   }
   file += *tail;
-  std::cout << "Streamed container file size: " << file.size() << " bytes"
-            << std::endl;
+  std::cout << "Container file size: " << file.size() << " bytes" << std::endl;
 
-  auto stream_reader_or =
-      security::avro::StreamingDataFileReader::FromBytes(file);
-  if (!stream_reader_or.ok()) {
-    std::cerr << "Streaming FromBytes failed: " << stream_reader_or.status()
+  // Read: feed the file in chunks (as if arriving from disk or a socket)
+  // and decode values as soon as they become available.
+  auto reader = security::avro::DataFileReader::Create();
+  const size_t kChunkSize = 64;
+  for (size_t offset = 0; offset < file.size(); offset += kChunkSize) {
+    if (auto s = reader.Feed(
+            absl::string_view(file).substr(offset, kChunkSize));
+        !s.ok()) {
+      std::cerr << "Feed failed: " << s << std::endl;
+      return 1;
+    }
+    while (true) {
+      auto ready = reader.NextReady();
+      if (!ready.ok()) {
+        std::cerr << "NextReady failed: " << ready.status() << std::endl;
+        return 1;
+      }
+      if (!*ready) break;
+      auto value_or = reader.NextValue();
+      if (!value_or.ok()) {
+        std::cerr << "NextValue failed: " << value_or.status() << std::endl;
+        return 1;
+      }
+      auto json_or = value_or->ToJsonString();
+      std::cout << "Record: " << (json_or.ok() ? *json_or : "<error>")
+                << std::endl;
+    }
+  }
+  if (auto s = reader.CloseInput(); !s.ok()) {
+    std::cerr << "CloseInput failed: " << s << std::endl;
+    return 1;
+  }
+  auto final_ready = reader.NextReady();
+  if (!final_ready.ok()) {
+    std::cerr << "Final NextReady failed: " << final_ready.status()
               << std::endl;
     return 1;
   }
-  auto& stream_reader = *stream_reader_or;
-  while (stream_reader.HasNext()) {
-    auto value_or = stream_reader.NextValue();
-    if (!value_or.ok()) {
-      std::cerr << "Streaming NextValue failed: " << value_or.status()
-                << std::endl;
-      return 1;
-    }
-    auto json_or = value_or->ToJsonString();
-    std::cout << "Streamed record: " << (json_or.ok() ? *json_or : "<error>")
-              << std::endl;
+  if (!reader.AtEnd()) {
+    std::cerr << "Stream did not end cleanly" << std::endl;
+    return 1;
   }
+  std::cout << "Writer schema round-tripped: "
+            << (reader.WriterSchema().ok() &&
+                        *reader.WriterSchema() == schema
+                    ? "yes"
+                    : "no")
+            << std::endl;
 
   return 0;
 }

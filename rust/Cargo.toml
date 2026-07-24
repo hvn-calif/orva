@@ -19,14 +19,14 @@ doctest = false
 apache-avro = { version = "0.21", features = ["snappy", "zstandard"] }
 serde_json = "1.0"
 paste = "1.0"
-# Self-referential cell for the streaming OCF writer/reader, whose
-# apache-avro Writer<'a, _>/Reader<'a, _> borrow an owned Schema. Proc-macro
-# free; its internal unsafe is what lets this crate keep #![forbid(unsafe_code)].
-# See StreamingDataFileWriter/StreamingDataFileReader in container.rs.
-self_cell = "1"
 md-5 = "0.10"
 sha2 = "0.10"
 uuid = "1"
+# Generates the container writer's random sync marker (container.rs). Same
+# version apache-avro already uses, so no new crate enters the flattened
+# dependency list the Crubit build generates. (uuid's "v4" feature would
+# pull a second getrandom major version, which that list cannot express.)
+rand = "0.9"
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,9 +1,11 @@
 #include "avro_bridge.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "gmock/gmock.h"
@@ -342,6 +344,39 @@ TEST(DatumTest, SetMaxAllocationBytesFirstCallWins) {
 
 // -- Object container files -------------------------------------------------
 
+// Writes `values` through the writer, draining after each append, and
+// returns the complete container file. Marks the test failed and returns ""
+// on any writer error (EXPECT alone would keep running into operator-> on a
+// failed StatusOr, which aborts without attribution).
+std::string WriteFile(const AvroSchema& schema, Codec codec,
+                      const std::vector<AvroValue>& values) {
+  auto writer = DataFileWriter::Create(schema, codec);
+  if (!writer.ok()) {
+    ADD_FAILURE() << "Create failed: " << writer.status();
+    return "";
+  }
+  std::string out;
+  for (const AvroValue& value : values) {
+    if (auto s = writer->Append(value); !s.ok()) {
+      ADD_FAILURE() << "Append failed: " << s;
+      return "";
+    }
+    auto chunk = writer->TakeBytes();
+    if (!chunk.ok()) {
+      ADD_FAILURE() << "TakeBytes failed: " << chunk.status();
+      return "";
+    }
+    out += *chunk;
+  }
+  auto tail = writer->Finish();
+  if (!tail.ok()) {
+    ADD_FAILURE() << "Finish failed: " << tail.status();
+    return "";
+  }
+  out += *tail;
+  return out;
+}
+
 class ContainerCodecTest : public ::testing::TestWithParam<Codec> {};
 
 TEST_P(ContainerCodecTest, WriteReadRoundtrip) {
@@ -350,42 +385,188 @@ TEST_P(ContainerCodecTest, WriteReadRoundtrip) {
 
   auto writer = DataFileWriter::Create(*schema, GetParam());
   ASSERT_TRUE(writer.ok());
+  EXPECT_TRUE(writer->Schema() == *schema);
   AvroValue first = MakeUser(1, "a");
   AvroValue second = MakeUser(2, "b");
   ASSERT_TRUE(writer->Append(first).ok());
   ASSERT_TRUE(writer->Append(second).ok());
-  EXPECT_EQ(writer->Count(), 2);
-  EXPECT_TRUE(writer->Schema() == *schema);
-
-  auto bytes = writer->ToBytes();
+  auto bytes = writer->Finish();
   ASSERT_TRUE(bytes.ok());
+  EXPECT_TRUE(writer->IsFinished());
 
   auto reader = DataFileReader::FromBytes(*bytes);
   ASSERT_TRUE(reader.ok());
-  EXPECT_EQ(reader->Count(), 2);
-  EXPECT_TRUE(reader->WriterSchema() == *schema);
-  ASSERT_TRUE(reader->HasNext());
+  EXPECT_TRUE(reader->HeaderReady());
+  EXPECT_TRUE(*reader->WriterSchema() == *schema);
+  ASSERT_TRUE(reader->NextReady().value_or(false));
+  ASSERT_TRUE(reader->NextReady().value_or(false));  // idempotent
   EXPECT_TRUE(*reader->NextValue() == first);
   EXPECT_TRUE(*reader->NextValue() == second);
-  EXPECT_FALSE(reader->HasNext());
+  EXPECT_FALSE(reader->NextReady().value_or(true));
+  EXPECT_TRUE(reader->AtEnd());
   EXPECT_EQ(reader->NextValue().status().code(),
             absl::StatusCode::kOutOfRange);
-  reader->Rewind();
-  EXPECT_TRUE(*reader->NextValue() == first);
 }
 
 INSTANTIATE_TEST_SUITE_P(AllCodecs, ContainerCodecTest,
                          ::testing::Values(Codec::kNull, Codec::kDeflate,
                                            Codec::kSnappy, Codec::kZstandard));
 
-TEST(ContainerTest, AppendInvalidValueFails) {
+TEST(ContainerTest, ChunkedFeedRoundtrip) {
+  // The streaming read path driven from C++: feed a multi-value file in
+  // small chunks and drain values as they become decodable.
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  std::vector<AvroValue> values;
+  for (int i = 0; i < 50; ++i) values.push_back(MakeUser(i, "chunked"));
+  std::string bytes = WriteFile(*schema, Codec::kDeflate, values);
+
+  DataFileReader reader = DataFileReader::Create();
+  int seen = 0;
+  const size_t kChunk = 7;
+  for (size_t off = 0; off < bytes.size(); off += kChunk) {
+    ASSERT_TRUE(
+        reader.Feed(absl::string_view(bytes).substr(off, kChunk)).ok());
+    while (reader.NextReady().value_or(false)) {
+      auto value = reader.NextValue();
+      ASSERT_TRUE(value.ok());
+      EXPECT_EQ(value->GetRecordField("id")->GetLong().value_or(-1), seen);
+      ++seen;
+    }
+  }
+  ASSERT_TRUE(reader.CloseInput().ok());
+  EXPECT_FALSE(reader.NextReady().value_or(true));
+  EXPECT_TRUE(reader.AtEnd());
+  EXPECT_EQ(seen, 50);
+}
+
+TEST(ContainerTest, TruncatedStreamErrorsAndFuses) {
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  std::string bytes =
+      WriteFile(*schema, Codec::kNull, {MakeUser(1, "a"), MakeUser(2, "b")});
+
+  DataFileReader reader = DataFileReader::Create();
+  ASSERT_TRUE(reader.Feed(bytes.substr(0, bytes.size() - 8)).ok());
+  ASSERT_TRUE(reader.CloseInput().ok());
+  bool errored = false;
+  for (int i = 0; i < 100; ++i) {
+    auto ready = reader.NextReady();
+    if (!ready.ok()) {
+      errored = true;
+      break;
+    }
+    if (!*ready) break;
+    if (!reader.NextValue().ok()) {
+      errored = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(errored);
+  // Fatal errors are sticky: everything keeps failing, and the stream never
+  // reports a clean end. NextValue reports the fused error as
+  // kInvalidArgument, distinct from the benign kOutOfRange.
+  EXPECT_TRUE(reader.HasFailed());
+  EXPECT_FALSE(reader.NextReady().ok());
+  EXPECT_EQ(reader.NextValue().status().code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_FALSE(reader.Feed("more").ok());
+  EXPECT_FALSE(reader.AtEnd());
+}
+
+TEST(ContainerTest, NextValueBeforeDataIsBenign) {
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  AvroValue value = MakeUser(7, "later");
+  std::string bytes = WriteFile(*schema, Codec::kNull, {value});
+
+  DataFileReader reader = DataFileReader::Create();
+  ASSERT_TRUE(reader.Feed(bytes.substr(0, 10)).ok());
+  // Nothing decodable yet; the error is kOutOfRange and NOT fatal.
+  EXPECT_EQ(reader.NextValue().status().code(), absl::StatusCode::kOutOfRange);
+  ASSERT_TRUE(reader.Feed(bytes.substr(10)).ok());
+  ASSERT_TRUE(reader.CloseInput().ok());
+  EXPECT_TRUE(*reader.NextValue() == value);
+  EXPECT_TRUE(reader.AtEnd());
+}
+
+TEST(ContainerTest, WriterSchemaBeforeHeaderFails) {
+  DataFileReader reader = DataFileReader::Create();
+  EXPECT_FALSE(reader.HeaderReady());
+  EXPECT_EQ(reader.WriterSchema().status().code(),
+            absl::StatusCode::kFailedPrecondition);
+}
+
+TEST(ContainerTest, SetMaxBlockSizeValidation) {
+  DataFileReader reader = DataFileReader::Create();
+  EXPECT_FALSE(reader.SetMaxBlockSize(0).ok());
+  EXPECT_TRUE(reader.SetMaxBlockSize(1024 * 1024).ok());
+}
+
+TEST(ContainerTest, WriterFinishConsumes) {
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  auto writer = DataFileWriter::Create(*schema, Codec::kNull);
+  ASSERT_TRUE(writer.ok());
+  ASSERT_TRUE(writer->Append(MakeUser(1, "a")).ok());
+  EXPECT_FALSE(writer->IsFinished());
+  ASSERT_TRUE(writer->Finish().ok());
+  EXPECT_TRUE(writer->IsFinished());
+  EXPECT_FALSE(writer->Append(MakeUser(2, "b")).ok());
+  EXPECT_FALSE(writer->TakeBytes().ok());
+  EXPECT_FALSE(writer->Finish().ok());
+  // The schema stays queryable after Finish.
+  EXPECT_TRUE(writer->Schema() == *schema);
+}
+
+TEST(ContainerTest, TakeBytesIncremental) {
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  auto writer = DataFileWriter::Create(*schema, Codec::kNull);
+  ASSERT_TRUE(writer.ok());
+  std::string file;
+  const int n = 4000;
+  for (int i = 0; i < n; ++i) {
+    ASSERT_TRUE(writer->Append(MakeUser(i, "sensor")).ok());
+    auto chunk = writer->TakeBytes();
+    ASSERT_TRUE(chunk.ok());
+    file += *chunk;
+  }
+  // Batches were flushed and drained before finish.
+  EXPECT_FALSE(file.empty());
+  auto tail = writer->Finish();
+  ASSERT_TRUE(tail.ok());
+  file += *tail;
+
+  auto reader = DataFileReader::FromBytes(file);
+  ASSERT_TRUE(reader.ok());
+  int count = 0;
+  while (reader->NextReady().value_or(false)) {
+    auto value = reader->NextValue();
+    ASSERT_TRUE(value.ok());
+    EXPECT_EQ(value->GetRecordField("id")->GetLong().value_or(-1), count);
+    ++count;
+  }
+  EXPECT_EQ(count, n);
+  EXPECT_TRUE(reader->AtEnd());
+}
+
+TEST(ContainerTest, AppendInvalidValueFailsAndWriterStaysUsable) {
   auto schema = AvroSchema::Parse(kRecordSchema);
   ASSERT_TRUE(schema.ok());
   auto writer = DataFileWriter::Create(*schema, Codec::kNull);
   ASSERT_TRUE(writer.ok());
   EXPECT_EQ(writer->Append(AvroValue::CreateLong(1)).code(),
             absl::StatusCode::kInvalidArgument);
-  EXPECT_EQ(writer->Count(), 0);
+  EXPECT_FALSE(writer->IsFinished());
+  AvroValue value = MakeUser(1, "ok");
+  ASSERT_TRUE(writer->Append(value).ok());
+  auto bytes = writer->Finish();
+  ASSERT_TRUE(bytes.ok());
+  auto reader = DataFileReader::FromBytes(*bytes);
+  ASSERT_TRUE(reader.ok());
+  EXPECT_TRUE(*reader->NextValue() == value);
+  EXPECT_FALSE(reader->NextReady().value_or(true));
 }
 
 TEST(ContainerTest, CreateWithCrossReferencingSchemaFails) {
@@ -418,6 +599,10 @@ TEST(ContainerTest, GarbageInputFails) {
             absl::StatusCode::kInvalidArgument);
   EXPECT_EQ(DataFileReader::FromBytes("").status().code(),
             absl::StatusCode::kInvalidArgument);
+  // The streaming path fails as soon as the magic bytes mismatch.
+  DataFileReader reader = DataFileReader::Create();
+  ASSERT_TRUE(reader.Feed("XXXX").ok());
+  EXPECT_FALSE(reader.NextReady().ok());
 }
 
 TEST(ContainerTest, ReaderSchemaResolution) {
@@ -432,19 +617,284 @@ TEST(ContainerTest, ReaderSchemaResolution) {
 
   AvroValue record = AvroValue::CreateRecord();
   ASSERT_TRUE(record.RecordPut("a", AvroValue::CreateInt(12)).ok());
-  auto writer = DataFileWriter::Create(*writer_schema, Codec::kNull);
-  ASSERT_TRUE(writer.ok());
-  ASSERT_TRUE(writer->Append(record).ok());
-  auto bytes = writer->ToBytes();
-  ASSERT_TRUE(bytes.ok());
+  std::string bytes = WriteFile(*writer_schema, Codec::kNull, {record});
 
-  auto reader = DataFileReader::FromBytesWithSchema(*reader_schema, *bytes);
+  auto reader = DataFileReader::FromBytesWithSchema(*reader_schema, bytes);
   ASSERT_TRUE(reader.ok());
   auto value = reader->NextValue();
   ASSERT_TRUE(value.ok());
   EXPECT_EQ(value->GetRecordField("a")->GetLong().value_or(0), 12);
   EXPECT_EQ(value->GetRecordField("b")->GetString().value_or(""), "d");
-  EXPECT_TRUE(reader->WriterSchema() == *writer_schema);
+  EXPECT_TRUE(*reader->WriterSchema() == *writer_schema);
+}
+
+// -- Zero-copy stream reader --------------------------------------------------
+
+// Test stream that yields a string in fixed-size chunks and records whether
+// the reader ever calls BackUp (it must not; see ZeroCopyInputStream docs).
+class ChunkedStream final : public ZeroCopyInputStream {
+ public:
+  ChunkedStream(std::string data, size_t chunk_size)
+      : data_(std::move(data)), chunk_size_(chunk_size) {}
+
+  bool Next(const void** data, int* size) override {
+    if (pos_ >= data_.size()) return false;
+    size_t n = std::min(chunk_size_, data_.size() - pos_);
+    *data = data_.data() + pos_;
+    *size = static_cast<int>(n);
+    pos_ += n;
+    return true;
+  }
+  void BackUp(int count) override {
+    backed_up_ = true;
+    pos_ -= static_cast<size_t>(count);
+  }
+  int64_t ByteCount() const override { return static_cast<int64_t>(pos_); }
+
+  bool backed_up() const { return backed_up_; }
+
+ private:
+  std::string data_;
+  size_t chunk_size_;
+  size_t pos_ = 0;
+  bool backed_up_ = false;
+};
+
+TEST(StreamReaderTest, RoundtripSingleByteChunks) {
+  // One-byte chunks hit every possible split point (mid-magic, mid-varint,
+  // mid-payload, mid-marker).
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  std::vector<AvroValue> values;
+  for (int i = 0; i < 50; ++i) values.push_back(MakeUser(i, "stream"));
+  ChunkedStream stream(WriteFile(*schema, Codec::kDeflate, values), 1);
+
+  auto reader = DataFileStreamReader::Create(&stream);
+  ASSERT_TRUE(reader.ok());
+  EXPECT_TRUE(*reader->WriterSchema() == *schema);
+  int seen = 0;
+  while (reader->HasNext().value_or(false)) {
+    auto value = reader->NextValue();
+    ASSERT_TRUE(value.ok());
+    EXPECT_EQ(value->GetRecordField("id")->GetLong().value_or(-1), seen);
+    ++seen;
+  }
+  EXPECT_EQ(seen, 50);
+  // Clean end: HasNext is false (not an error) and NextValue is benign.
+  EXPECT_FALSE(reader->HasNext().value_or(true));
+  EXPECT_EQ(reader->NextValue().status().code(),
+            absl::StatusCode::kOutOfRange);
+  EXPECT_FALSE(stream.backed_up());
+}
+
+TEST(StreamReaderTest, StreamAdapterCompilesAndDelegates) {
+  // The header-only adapter is meant for protobuf's ZeroCopyInputStream;
+  // any type with the same shape proves the delegation.
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  AvroValue value = MakeUser(3, "adapted");
+  ChunkedStream stream(WriteFile(*schema, Codec::kNull, {value}), 16);
+  StreamAdapter<ChunkedStream> adapter(&stream);
+
+  auto reader = DataFileStreamReader::Create(&adapter);
+  ASSERT_TRUE(reader.ok());
+  EXPECT_TRUE(*reader->NextValue() == value);
+  EXPECT_FALSE(reader->HasNext().value_or(true));
+}
+
+TEST(StreamReaderTest, ReaderSchemaResolution) {
+  auto writer_schema =
+      AvroSchema::Parse(R"({"type": "record", "name": "R", "fields": [
+          {"name": "a", "type": "int"}]})");
+  auto reader_schema =
+      AvroSchema::Parse(R"({"type": "record", "name": "R", "fields": [
+          {"name": "a", "type": "long"},
+          {"name": "b", "type": "string", "default": "d"}]})");
+  ASSERT_TRUE(writer_schema.ok() && reader_schema.ok());
+  AvroValue record = AvroValue::CreateRecord();
+  ASSERT_TRUE(record.RecordPut("a", AvroValue::CreateInt(12)).ok());
+  ChunkedStream stream(WriteFile(*writer_schema, Codec::kNull, {record}), 5);
+
+  auto reader = DataFileStreamReader::CreateWithReaderSchema(*reader_schema,
+                                                             &stream);
+  ASSERT_TRUE(reader.ok());
+  auto value = reader->NextValue();
+  ASSERT_TRUE(value.ok());
+  EXPECT_EQ(value->GetRecordField("a")->GetLong().value_or(0), 12);
+  EXPECT_EQ(value->GetRecordField("b")->GetString().value_or(""), "d");
+  EXPECT_TRUE(*reader->WriterSchema() == *writer_schema);
+}
+
+TEST(StreamReaderTest, EmptyFileEndsCleanly) {
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  ChunkedStream stream(WriteFile(*schema, Codec::kNull, {}), 3);
+
+  auto reader = DataFileStreamReader::Create(&stream);
+  ASSERT_TRUE(reader.ok());
+  EXPECT_TRUE(*reader->WriterSchema() == *schema);
+  EXPECT_FALSE(reader->HasNext().value_or(true));
+  EXPECT_EQ(reader->NextValue().status().code(),
+            absl::StatusCode::kOutOfRange);
+}
+
+TEST(StreamReaderTest, GarbageAndEmptyStreamsFailAtCreate) {
+  ChunkedStream garbage("not an avro file", 4);
+  EXPECT_EQ(DataFileStreamReader::Create(&garbage).status().code(),
+            absl::StatusCode::kInvalidArgument);
+
+  ChunkedStream empty("", 4);
+  EXPECT_EQ(DataFileStreamReader::Create(&empty).status().code(),
+            absl::StatusCode::kInvalidArgument);
+
+  EXPECT_EQ(DataFileStreamReader::Create(nullptr).status().code(),
+            absl::StatusCode::kInvalidArgument);
+}
+
+TEST(StreamReaderTest, TruncatedInFirstBlockFailsOnFirstRead) {
+  // Create parses only up to the header, so a stream truncated inside the
+  // first block constructs fine and fails fatally on the first read.
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  std::string bytes = WriteFile(*schema, Codec::kNull, {MakeUser(1, "t")});
+  ChunkedStream stream(bytes.substr(0, bytes.size() - 8), 7);
+
+  auto reader = DataFileStreamReader::Create(&stream);
+  ASSERT_TRUE(reader.ok());
+  auto value = reader->NextValue();
+  EXPECT_EQ(value.status().code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(std::string(value.status().message()), HasSubstr("Truncated"));
+}
+
+TEST(StreamReaderTest, SetMaxBlockSizeAppliesToFirstBlock) {
+  // Because Create stops pulling at the header, a cap set right after
+  // Create still governs the first block. One-byte chunks guarantee no
+  // block framing sneaks into the chunk that completes the header.
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  ChunkedStream stream(WriteFile(*schema, Codec::kNull, {MakeUser(1, "b")}),
+                       1);
+
+  auto reader = DataFileStreamReader::Create(&stream);
+  ASSERT_TRUE(reader.ok());
+  ASSERT_TRUE(reader->SetMaxBlockSize(1).ok());
+  auto ready = reader->HasNext();
+  ASSERT_FALSE(ready.ok());
+  EXPECT_THAT(std::string(ready.status().message()),
+              HasSubstr("exceeds the maximum"));
+}
+
+// Delegates to ChunkedStream but yields an empty (true, size 0) chunk
+// before every real one, which the interface explicitly allows.
+class EmptyChunkInterleavingStream final : public ZeroCopyInputStream {
+ public:
+  EmptyChunkInterleavingStream(std::string data, size_t chunk_size)
+      : inner_(std::move(data), chunk_size) {}
+
+  bool Next(const void** data, int* size) override {
+    yield_empty_ = !yield_empty_;
+    if (yield_empty_) {
+      *data = "";
+      *size = 0;
+      return true;
+    }
+    return inner_.Next(data, size);
+  }
+  void BackUp(int count) override { inner_.BackUp(count); }
+  int64_t ByteCount() const override { return inner_.ByteCount(); }
+
+ private:
+  ChunkedStream inner_;
+  bool yield_empty_ = false;
+};
+
+// Never ends and never yields a byte: the degenerate stream a stuck or
+// buggy implementation produces.
+class ForeverEmptyStream final : public ZeroCopyInputStream {
+ public:
+  bool Next(const void** data, int* size) override {
+    *data = "";
+    *size = 0;
+    return true;
+  }
+  void BackUp(int count) override {}
+  int64_t ByteCount() const override { return 0; }
+};
+
+class NegativeSizeStream final : public ZeroCopyInputStream {
+ public:
+  bool Next(const void** data, int* size) override {
+    *data = "";
+    *size = -1;
+    return true;
+  }
+  void BackUp(int count) override {}
+  int64_t ByteCount() const override { return 0; }
+};
+
+TEST(StreamReaderTest, OccasionalEmptyChunksAreSkipped) {
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  AvroValue value = MakeUser(9, "gappy");
+  EmptyChunkInterleavingStream stream(
+      WriteFile(*schema, Codec::kNull, {value}), 3);
+
+  auto reader = DataFileStreamReader::Create(&stream);
+  ASSERT_TRUE(reader.ok());
+  EXPECT_TRUE(*reader->NextValue() == value);
+  EXPECT_FALSE(reader->HasNext().value_or(true));
+}
+
+TEST(StreamReaderTest, ForeverEmptyStreamFailsInsteadOfLivelocking) {
+  ForeverEmptyStream stream;
+  auto reader = DataFileStreamReader::Create(&stream);
+  ASSERT_FALSE(reader.ok());
+  EXPECT_THAT(std::string(reader.status().message()),
+              HasSubstr("consecutive empty chunks"));
+}
+
+TEST(StreamReaderTest, NegativeChunkSizeFails) {
+  NegativeSizeStream stream;
+  auto reader = DataFileStreamReader::Create(&stream);
+  ASSERT_FALSE(reader.ok());
+  EXPECT_THAT(std::string(reader.status().message()),
+              HasSubstr("negative chunk size"));
+}
+
+TEST(StreamReaderTest, TruncatedInLaterBlockFailsMidIteration) {
+  // Enough values for several 1024-value flush batches, so truncating the
+  // tail leaves earlier blocks intact: Create succeeds, iteration fails
+  // partway with a fatal (kInvalidArgument) error, never a silent short
+  // read.
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  std::vector<AvroValue> values;
+  for (int i = 0; i < 3000; ++i) values.push_back(MakeUser(i, "x"));
+  std::string bytes = WriteFile(*schema, Codec::kNull, values);
+  ChunkedStream stream(bytes.substr(0, bytes.size() - 8), 4096);
+
+  auto reader = DataFileStreamReader::Create(&stream);
+  ASSERT_TRUE(reader.ok());
+  int seen = 0;
+  absl::Status error = absl::OkStatus();
+  while (true) {
+    auto ready = reader->HasNext();
+    if (!ready.ok()) {
+      error = ready.status();
+      break;
+    }
+    if (!*ready) break;
+    auto value = reader->NextValue();
+    if (!value.ok()) {
+      error = value.status();
+      break;
+    }
+    ++seen;
+  }
+  EXPECT_EQ(error.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(std::string(error.message()), HasSubstr("Truncated"));
+  EXPECT_GT(seen, 0);
+  EXPECT_LT(seen, 3000);
 }
 
 TEST(ContainerTest, PathRoundtrip) {
@@ -456,7 +906,8 @@ TEST(ContainerTest, PathRoundtrip) {
   ASSERT_TRUE(writer.ok());
   AvroValue value = MakeUser(11, "disk");
   ASSERT_TRUE(writer->Append(value).ok());
-  ASSERT_TRUE(writer->WriteToPath(path).ok());
+  ASSERT_TRUE(writer->FinishToPath(path).ok());
+  EXPECT_TRUE(writer->IsFinished());
 
   auto reader = DataFileReader::FromPath(path);
   ASSERT_TRUE(reader.ok());
@@ -467,6 +918,54 @@ TEST(ContainerTest, PathRoundtrip) {
   EXPECT_TRUE(*resolved->NextValue() == value);
 }
 
+TEST(ContainerTest, FinishToPathAfterTakeBytesFails) {
+  // TakeBytes only returns bytes once a 1024-value batch has flushed; after
+  // that, FinishToPath would write a file missing those bytes and must
+  // refuse (kFailedPrecondition) instead of reporting a bogus success.
+  std::string path =
+      ::testing::TempDir() + "/avro_bridge_test_finish_after_take.avro";
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  auto writer = DataFileWriter::Create(*schema, Codec::kNull);
+  ASSERT_TRUE(writer.ok());
+  for (int i = 0; i < 1024; ++i) {
+    ASSERT_TRUE(writer->Append(MakeUser(i, "x")).ok());
+  }
+  auto taken = writer->TakeBytes();
+  ASSERT_TRUE(taken.ok());
+  ASSERT_FALSE(taken->empty());
+
+  EXPECT_EQ(writer->FinishToPath(path).code(),
+            absl::StatusCode::kFailedPrecondition);
+  // The refusal leaves the writer usable: the caller can still assemble the
+  // complete file from the taken bytes plus Finish.
+  auto tail = writer->Finish();
+  ASSERT_TRUE(tail.ok());
+  auto reader = DataFileReader::FromBytes(*taken + *tail);
+  ASSERT_TRUE(reader.ok());
+}
+
+TEST(ContainerTest, FinishToPathAfterEmptyTakeBytesSucceeds) {
+  // A TakeBytes that returned nothing took nothing: the path convenience
+  // still writes a complete file.
+  std::string path =
+      ::testing::TempDir() + "/avro_bridge_test_finish_after_empty_take.avro";
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  auto writer = DataFileWriter::Create(*schema, Codec::kNull);
+  ASSERT_TRUE(writer.ok());
+  AvroValue value = MakeUser(1, "kept");
+  ASSERT_TRUE(writer->Append(value).ok());
+  auto taken = writer->TakeBytes();
+  ASSERT_TRUE(taken.ok());
+  ASSERT_TRUE(taken->empty());
+
+  ASSERT_TRUE(writer->FinishToPath(path).ok());
+  auto reader = DataFileReader::FromPath(path);
+  ASSERT_TRUE(reader.ok());
+  EXPECT_TRUE(*reader->NextValue() == value);
+}
+
 TEST(ContainerTest, MissingFileFails) {
   EXPECT_FALSE(DataFileReader::FromPath("/nonexistent/x.avro").ok());
 }
@@ -474,13 +973,9 @@ TEST(ContainerTest, MissingFileFails) {
 TEST(ContainerTest, OcfMagicPresent) {
   auto schema = AvroSchema::Parse(kRecordSchema);
   ASSERT_TRUE(schema.ok());
-  auto writer = DataFileWriter::Create(*schema, Codec::kNull);
-  ASSERT_TRUE(writer.ok());
-  ASSERT_TRUE(writer->Append(MakeUser(1, "m")).ok());
-  auto bytes = writer->ToBytes();
-  ASSERT_TRUE(bytes.ok());
-  ASSERT_GE(bytes->size(), 4);
-  EXPECT_EQ(bytes->substr(0, 4), std::string("Obj\x01", 4));
+  std::string bytes = WriteFile(*schema, Codec::kNull, {MakeUser(1, "m")});
+  ASSERT_GE(bytes.size(), 4);
+  EXPECT_EQ(bytes.substr(0, 4), std::string("Obj\x01", 4));
 }
 
 // -- Coverage backfill ------------------------------------------------------
@@ -566,13 +1061,13 @@ TEST(ContainerTest, EmptyFileRoundtrips) {
   ASSERT_TRUE(schema.ok());
   auto writer = DataFileWriter::Create(*schema, Codec::kNull);
   ASSERT_TRUE(writer.ok());
-  EXPECT_EQ(writer->Count(), 0u);
-  auto bytes = writer->ToBytes();  // No Append calls: header only.
+  auto bytes = writer->Finish();  // No Append calls: header only.
   ASSERT_TRUE(bytes.ok());
   auto reader = DataFileReader::FromBytes(*bytes);
   ASSERT_TRUE(reader.ok());
-  EXPECT_EQ(reader->Count(), 0u);
-  EXPECT_FALSE(reader->HasNext());
+  EXPECT_TRUE(*reader->WriterSchema() == *schema);
+  EXPECT_FALSE(reader->NextReady().value_or(true));
+  EXPECT_TRUE(reader->AtEnd());
 }
 
 TEST(DatumTest, DecodeRejectsTrailingBytes) {
@@ -586,175 +1081,6 @@ TEST(DatumTest, DecodeRejectsTrailingBytes) {
   EXPECT_FALSE(DecodeDatum(*schema, with_trailing).ok());
 }
 
-// -- Streaming container files ----------------------------------------------
-
-// Writes `values` through the streaming writer, draining after each append,
-// and returns the complete container file.
-std::string StreamWrite(const AvroSchema& schema, Codec codec,
-                        const std::vector<AvroValue>& values) {
-  auto writer = StreamingDataFileWriter::Create(schema, codec);
-  EXPECT_TRUE(writer.ok());
-  std::string out;
-  for (const AvroValue& value : values) {
-    EXPECT_TRUE(writer->Append(value).ok());
-    auto chunk = writer->TakeBytes();
-    EXPECT_TRUE(chunk.ok());
-    out += *chunk;
-  }
-  auto tail = writer->Finish();
-  EXPECT_TRUE(tail.ok());
-  out += *tail;
-  return out;
-}
-
-class StreamingCodecTest : public ::testing::TestWithParam<Codec> {};
-
-TEST_P(StreamingCodecTest, WriteReadRoundtrip) {
-  auto schema = AvroSchema::Parse(kRecordSchema);
-  ASSERT_TRUE(schema.ok());
-  std::vector<AvroValue> values;
-  values.push_back(MakeUser(1, "a"));
-  values.push_back(MakeUser(2, "b"));
-  std::string bytes = StreamWrite(*schema, GetParam(), values);
-
-  auto reader = StreamingDataFileReader::FromBytes(bytes);
-  ASSERT_TRUE(reader.ok());
-  EXPECT_TRUE(reader->WriterSchema() == *schema);
-  ASSERT_TRUE(reader->HasNext());
-  EXPECT_TRUE(reader->HasNext());  // idempotent
-  EXPECT_TRUE(*reader->NextValue() == values[0]);
-  EXPECT_TRUE(*reader->NextValue() == values[1]);
-  EXPECT_FALSE(reader->HasNext());
-  EXPECT_EQ(reader->NextValue().status().code(), absl::StatusCode::kOutOfRange);
-}
-
-INSTANTIATE_TEST_SUITE_P(AllCodecs, StreamingCodecTest,
-                         ::testing::Values(Codec::kNull, Codec::kDeflate,
-                                           Codec::kSnappy, Codec::kZstandard));
-
-TEST(StreamingContainerTest, FinishConsumes) {
-  auto schema = AvroSchema::Parse(kRecordSchema);
-  ASSERT_TRUE(schema.ok());
-  auto writer = StreamingDataFileWriter::Create(*schema, Codec::kNull);
-  ASSERT_TRUE(writer.ok());
-  ASSERT_TRUE(writer->Append(MakeUser(1, "a")).ok());
-  EXPECT_FALSE(writer->IsFinished());
-  ASSERT_TRUE(writer->Finish().ok());
-  EXPECT_TRUE(writer->IsFinished());
-  EXPECT_FALSE(writer->Append(MakeUser(2, "b")).ok());
-  EXPECT_FALSE(writer->TakeBytes().ok());
-  EXPECT_FALSE(writer->Finish().ok());
-  EXPECT_FALSE(writer->Schema().ok());
-}
-
-TEST(StreamingContainerTest, TakeBytesIncremental) {
-  auto schema = AvroSchema::Parse(kRecordSchema);
-  ASSERT_TRUE(schema.ok());
-  auto writer = StreamingDataFileWriter::Create(*schema, Codec::kNull);
-  ASSERT_TRUE(writer.ok());
-  std::string file;
-  const int n = 4000;
-  for (int i = 0; i < n; ++i) {
-    ASSERT_TRUE(writer->Append(MakeUser(i, "sensor")).ok());
-    auto chunk = writer->TakeBytes();
-    ASSERT_TRUE(chunk.ok());
-    file += *chunk;
-  }
-  // Full blocks were flushed and drained before finish.
-  EXPECT_FALSE(file.empty());
-  auto tail = writer->Finish();
-  ASSERT_TRUE(tail.ok());
-  file += *tail;
-
-  auto reader = StreamingDataFileReader::FromBytes(file);
-  ASSERT_TRUE(reader.ok());
-  int count = 0;
-  while (reader->HasNext()) {
-    auto value = reader->NextValue();
-    ASSERT_TRUE(value.ok());
-    EXPECT_EQ(value->GetRecordField("id")->GetLong().value_or(-1), count);
-    ++count;
-  }
-  EXPECT_EQ(count, n);
-}
-
-TEST(StreamingContainerTest, GarbageFails) {
-  EXPECT_FALSE(StreamingDataFileReader::FromBytes("not an avro file").ok());
-  EXPECT_FALSE(StreamingDataFileReader::FromBytes("").ok());
-}
-
-TEST(StreamingContainerTest, ReaderSchemaResolution) {
-  auto writer_schema =
-      AvroSchema::Parse(R"({"type": "record", "name": "R", "fields": [
-          {"name": "a", "type": "int"}]})");
-  auto reader_schema =
-      AvroSchema::Parse(R"({"type": "record", "name": "R", "fields": [
-          {"name": "a", "type": "long"},
-          {"name": "b", "type": "string", "default": "d"}]})");
-  ASSERT_TRUE(writer_schema.ok() && reader_schema.ok());
-
-  AvroValue record = AvroValue::CreateRecord();
-  ASSERT_TRUE(record.RecordPut("a", AvroValue::CreateInt(12)).ok());
-  std::vector<AvroValue> values;
-  values.push_back(record);
-  std::string bytes = StreamWrite(*writer_schema, Codec::kNull, values);
-
-  auto reader = StreamingDataFileReader::FromBytesWithSchema(*reader_schema, bytes);
-  ASSERT_TRUE(reader.ok());
-  auto value = reader->NextValue();
-  ASSERT_TRUE(value.ok());
-  EXPECT_EQ(value->GetRecordField("a")->GetLong().value_or(0), 12);
-  EXPECT_EQ(value->GetRecordField("b")->GetString().value_or(""), "d");
-  EXPECT_TRUE(reader->WriterSchema() == *writer_schema);
-}
-
-TEST(StreamingContainerTest, PathRoundtrip) {
-  std::string path = ::testing::TempDir() + "/avro_streaming_test_data.avro";
-  auto schema = AvroSchema::Parse(kRecordSchema);
-  ASSERT_TRUE(schema.ok());
-  // Produce a file with the buffered writer; read it with the streaming reader.
-  auto writer = DataFileWriter::Create(*schema, Codec::kDeflate);
-  ASSERT_TRUE(writer.ok());
-  AvroValue value = MakeUser(11, "disk");
-  ASSERT_TRUE(writer->Append(value).ok());
-  ASSERT_TRUE(writer->WriteToPath(path).ok());
-
-  auto reader = StreamingDataFileReader::FromPath(path);
-  ASSERT_TRUE(reader.ok());
-  ASSERT_TRUE(reader->HasNext());
-  EXPECT_TRUE(*reader->NextValue() == value);
-}
-
-TEST(StreamingContainerTest, CrossParityWithBuffered) {
-  auto schema = AvroSchema::Parse(kRecordSchema);
-  ASSERT_TRUE(schema.ok());
-  AvroValue a = MakeUser(1, "a");
-  AvroValue b = MakeUser(2, "b");
-
-  // Streaming output is read by the buffered reader.
-  std::vector<AvroValue> values;
-  values.push_back(a);
-  values.push_back(b);
-  std::string streamed = StreamWrite(*schema, Codec::kSnappy, values);
-  auto buffered_reader = DataFileReader::FromBytes(streamed);
-  ASSERT_TRUE(buffered_reader.ok());
-  EXPECT_EQ(buffered_reader->Count(), 2);
-  EXPECT_TRUE(*buffered_reader->NextValue() == a);
-  EXPECT_TRUE(*buffered_reader->NextValue() == b);
-
-  // Buffered output is read by the streaming reader.
-  auto writer = DataFileWriter::Create(*schema, Codec::kDeflate);
-  ASSERT_TRUE(writer.ok());
-  ASSERT_TRUE(writer->Append(a).ok());
-  ASSERT_TRUE(writer->Append(b).ok());
-  auto bytes = writer->ToBytes();
-  ASSERT_TRUE(bytes.ok());
-  auto streaming_reader = StreamingDataFileReader::FromBytes(*bytes);
-  ASSERT_TRUE(streaming_reader.ok());
-  EXPECT_TRUE(*streaming_reader->NextValue() == a);
-  EXPECT_TRUE(*streaming_reader->NextValue() == b);
-  EXPECT_FALSE(streaming_reader->HasNext());
-}
 
 }  // namespace
 }  // namespace security::avro

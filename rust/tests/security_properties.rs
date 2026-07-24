@@ -56,7 +56,7 @@ fn compression_amplifies_small_input_into_large_memory() {
 
     let mut writer = DataFileWriter::create(&schema, AvroCodec::Deflate).unwrap();
     writer.append(&record).unwrap();
-    let compressed = writer.to_bytes().unwrap();
+    let compressed = writer.finish().unwrap();
 
     // Deflate collapses 4 MiB of repeated bytes to a few KiB on disk.
     assert!(

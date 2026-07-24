@@ -32,6 +32,12 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(absl)
 
 add_library(avro_bridge avro_bridge.cc avro_bridge.h)
+# Crubit's runtime mutable-aliasing guards call a function defined in a .cc
+# that its generated INTERFACE support library never compiles; build it into
+# the bridge so the generated thunks link.
+FetchContent_GetProperties(Crubit)
+target_sources(avro_bridge PRIVATE
+  ${crubit_SOURCE_DIR}/support/internal/check_no_mutable_aliasing.cc)
 target_link_libraries(avro_bridge PUBLIC
   absl::status
   absl::statusor

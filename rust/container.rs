@@ -1,19 +1,31 @@
 //! Object Container File (OCF) reading and writing. Replaces avrocpp's
 //! `DataFileWriter<GenericDatum>` / `DataFileReader<GenericDatum>`.
 //!
-//! Both types are buffer-oriented: the writer accumulates values and
-//! produces the complete file on `to_bytes`/`write_to_path`; the reader
-//! decodes the whole file eagerly at construction time. This sidesteps
-//! apache-avro's borrowed-schema `Writer`/`Reader` types, which Crubit
-//! cannot bridge, at the cost of holding the file contents in memory.
+//! Both types stream and never require a whole file in memory:
+//!
+//! - `DataFileWriter` buffers at most one batch of values and emits encoded
+//!   bytes incrementally through `take_bytes`/`finish`. Each batch is written
+//!   by a short-lived `apache_avro::Writer` created inside `flush_block`, so
+//!   the schema borrow in `Writer<'a, W>` never outlives a single method call
+//!   and no self-referential type is needed.
+//! - `DataFileReader` is a push parser: callers `feed` bytes as they arrive
+//!   (from disk, sockets, any transport) and drain decoded values with
+//!   `next_ready`/`next_value`. The binding parses only the container
+//!   *framing* (magic, header metadata map, block headers, sync markers),
+//!   which is a small frozen part of the Avro 1.x spec; schema parsing,
+//!   block decompression and datum decoding are delegated to apache-avro's
+//!   public API (`Schema::parse_str`, `Codec::decompress`,
+//!   `from_avro_datum_schemata`).
+//!
+//! See doc/specs/AvroStreamingIO.md for the design discussion.
 
 use crate::schema::AvroSchema;
 use crate::value::AvroValue;
 use crate::vec_u8::{catch_panic, utf8, Status, VecU8};
+use apache_avro::from_avro_datum_schemata;
 use apache_avro::schema::ResolvedSchema;
 use apache_avro::types::Value;
-use apache_avro::{Codec, Reader, Schema, Writer};
-use self_cell::self_cell;
+use apache_avro::{Codec, Schema, Writer};
 use std::io::Cursor;
 
 /// Compression codec for object container files.
@@ -48,6 +60,22 @@ impl AvroCodec {
             _ => Err(format!("Invalid codec discriminant: {}", value).into()),
         }
     }
+
+    /// Maps the `avro.codec` name from a container file header to a codec.
+    /// Names outside the supported set (including bzip2 and xz) are errors.
+    fn from_name(name: &[u8]) -> Result<AvroCodec, VecU8> {
+        match name {
+            b"null" => Ok(AvroCodec::Null),
+            b"deflate" => Ok(AvroCodec::Deflate),
+            b"snappy" => Ok(AvroCodec::Snappy),
+            b"zstandard" => Ok(AvroCodec::Zstandard),
+            other => Err(format!(
+                "Unsupported container codec: {}",
+                String::from_utf8_lossy(other)
+            )
+            .into()),
+        }
+    }
 }
 
 impl From<AvroCodec> for Codec {
@@ -61,20 +89,50 @@ impl From<AvroCodec> for Codec {
     }
 }
 
-/// Writes Avro object container files.
+/// How many values `DataFileWriter` buffers before encoding them as blocks.
+/// Bounds the writer's working set; within one batch apache-avro still cuts
+/// blocks by encoded size (~16 KiB), so on-disk block sizes stay normal.
+const VALUES_PER_BLOCK: usize = 1024;
+
+/// Streaming Avro object container file writer.
 ///
-/// Values are validated and buffered by `append`; the encoded file is
-/// produced by `to_bytes` or `write_to_path`.
-#[derive(Debug, Clone)]
+/// `append` validates and buffers values; every `VALUES_PER_BLOCK` values the
+/// batch is encoded into container blocks by a short-lived
+/// `apache_avro::Writer` (see `flush_block`). `take_bytes` drains the encoded
+/// bytes produced so far (header plus completed blocks) without forcing a
+/// partial block. `finish` encodes any remaining values, returns the last
+/// bytes, and consumes the writer. The concatenation of every `take_bytes`
+/// result followed by the `finish` result is a complete container file.
+#[derive(Debug)]
 pub struct DataFileWriter {
     schema: Schema,
     codec: AvroCodec,
-    values: Vec<Value>,
+    /// One random sync marker for the whole file. Every per-batch
+    /// `apache_avro::Writer` is created with this same marker so the blocks
+    /// they emit concatenate into one valid file.
+    marker: [u8; 16],
+    /// Values buffered since the last block flush (at most VALUES_PER_BLOCK).
+    pending: Vec<Value>,
+    /// Encoded bytes not yet drained by `take_bytes`/`finish`.
+    out: Vec<u8>,
+    header_written: bool,
+    finished: bool,
 }
 
 impl Default for DataFileWriter {
     fn default() -> Self {
-        DataFileWriter { schema: Schema::Null, codec: AvroCodec::Null, values: Vec::new() }
+        // The default/moved-from state behaves like an already-finished
+        // writer: every fallible method errors. (The infallible `schema`
+        // accessor returns the placeholder null schema.)
+        DataFileWriter {
+            schema: Schema::Null,
+            codec: AvroCodec::Null,
+            marker: [0; 16],
+            pending: Vec::new(),
+            out: Vec::new(),
+            header_written: false,
+            finished: true,
+        }
     }
 }
 
@@ -99,7 +157,15 @@ impl DataFileWriter {
             )
             .into());
         }
-        Ok(DataFileWriter { schema: schema.schema.clone(), codec, values: Vec::new() })
+        Ok(DataFileWriter {
+            schema: schema.schema.clone(),
+            codec,
+            marker: rand::random::<[u8; 16]>(),
+            pending: Vec::new(),
+            out: Vec::new(),
+            header_written: false,
+            finished: false,
+        })
     }
 
     /// Returns the schema this writer was created with.
@@ -107,92 +173,219 @@ impl DataFileWriter {
         AvroSchema { schema: self.schema.clone() }
     }
 
-    /// Validates `value` against the writer schema and buffers it for
-    /// writing. This is best-effort early feedback; `to_bytes` performs the
-    /// authoritative validation while encoding.
+    /// Validates `value` against the writer schema and buffers it. A
+    /// rejected value leaves the writer usable; an encoding failure while
+    /// flushing a full batch tears the stream and consumes the writer.
     pub fn append(&mut self, value: &AvroValue) -> Status {
+        self.ensure_active()?;
         // Safe from panics: `create` proved that this schema resolves.
-        if !value.value.validate(&self.schema) {
+        let valid = catch_panic(|| Ok(value.value.validate(&self.schema)))?;
+        if !valid {
             return Err(format!(
                 "Value of type {} does not conform to the writer schema",
                 String::from_utf8_lossy(value.type_name().as_slice())
             )
             .into());
         }
-        self.values.push(value.value.clone());
+        self.pending.push(value.value.clone());
+        if self.pending.len() < VALUES_PER_BLOCK {
+            return Ok(0);
+        }
+        self.flush_block_or_tear()
+    }
+
+    /// Drains the encoded bytes produced so far (header plus completed
+    /// blocks) without forcing a partial block. May return empty.
+    pub fn take_bytes(&mut self) -> Result<VecU8, VecU8> {
+        self.ensure_active()?;
+        Ok(std::mem::take(&mut self.out).into())
+    }
+
+    /// Encodes any remaining buffered values, returns all undrained bytes,
+    /// and consumes the writer. Subsequent calls to any method error. With
+    /// no appended values the result is a valid header-only file.
+    pub fn finish(&mut self) -> Result<VecU8, VecU8> {
+        self.ensure_active()?;
+        let result = catch_panic(|| {
+            self.flush_block()?;
+            Ok(std::mem::take(&mut self.out).into())
+        });
+        self.finished = true;
+        result
+    }
+
+    /// Returns true once `finish` has consumed the writer (or a flush
+    /// failure tore the stream).
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    fn ensure_active(&self) -> Status {
+        if self.finished {
+            return Err("Writer already finished".into());
+        }
         Ok(0)
     }
 
-    /// Returns the number of buffered values.
-    pub fn count(&self) -> usize {
-        self.values.len()
+    /// Encodes the pending values (and the header, the first time) into
+    /// `out` as container blocks.
+    ///
+    /// The `apache_avro::Writer` created here lives only for this call:
+    /// its `&Schema` borrow starts and ends inside the method, so the
+    /// surrounding struct holds no self-reference and stays freely movable
+    /// (which Crubit requires). Reusing the file's sync marker and skipping
+    /// the header via `has_header` makes the batches concatenate into one
+    /// valid container file; upstream still produces every wire byte.
+    fn flush_block(&mut self) -> Result<(), VecU8> {
+        let nothing_to_do = self.pending.is_empty() && self.header_written;
+        if nothing_to_do {
+            return Ok(());
+        }
+        let mut writer = Writer::builder()
+            .schema(&self.schema)
+            .writer(std::mem::take(&mut self.out))
+            .codec(self.codec.into())
+            .marker(self.marker)
+            .has_header(self.header_written)
+            .build();
+        for value in self.pending.drain(..) {
+            writer.append_value_ref(&value).map_err(|err| VecU8::from(err.to_string()))?;
+        }
+        self.out = writer.into_inner().map_err(|err| VecU8::from(err.to_string()))?;
+        self.header_written = true;
+        Ok(())
     }
 
-    /// Encodes all buffered values into a complete object container file.
-    pub fn to_bytes(&self) -> Result<VecU8, VecU8> {
-        catch_panic(|| {
-            let mut writer = Writer::with_codec(&self.schema, Vec::new(), self.codec.into());
-            for value in &self.values {
-                if let Err(err) = writer.append_value_ref(value) {
-                    return Err(err.to_string().into());
-                }
+    /// `flush_block`, but a failure consumes the writer: bytes already
+    /// handed to the temporary `Writer` are lost on error, so the stream is
+    /// torn and continuing would silently produce a corrupt file.
+    fn flush_block_or_tear(&mut self) -> Status {
+        match catch_panic(|| {
+            self.flush_block()?;
+            Ok(0)
+        }) {
+            Ok(ok) => Ok(ok),
+            Err(err) => {
+                self.finished = true;
+                Err(err)
             }
-            match writer.into_inner() {
-                Ok(bytes) => Ok(bytes.into()),
-                Err(err) => Err(err.to_string().into()),
-            }
-        })
-    }
-
-    /// Encodes all buffered values and writes the container file to `path`.
-    pub fn write_to_path(&self, raw_path: &[u8]) -> Status {
-        let path = utf8(raw_path)?;
-        let bytes = self.to_bytes()?;
-        match std::fs::write(path, bytes.as_slice()) {
-            Ok(()) => Ok(0),
-            Err(err) => Err(err.to_string().into()),
         }
     }
 }
 
-/// Reads Avro object container files.
+// ---------------------------------------------------------------------------
+// Push-parser reader
+// ---------------------------------------------------------------------------
+
+/// Cap on the container header (magic + metadata map + sync marker). A
+/// hostile stream cannot make us buffer more than this while hunting for
+/// the end of the header. 16 MiB comfortably fits any real schema.
+const MAX_HEADER_BYTES: usize = 16 * 1024 * 1024;
+
+/// Default cap on a block's declared compressed size; adjustable per reader
+/// with `set_max_block_size`. Enforced before any buffering or allocation
+/// for the block's payload is attempted.
+const DEFAULT_MAX_BLOCK_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Parsed container file header.
+#[derive(Debug)]
+struct Header {
+    schema: Schema,
+    codec: AvroCodec,
+    marker: [u8; 16],
+}
+
+/// Streaming Avro object container file reader (push parser).
 ///
-/// The whole file is decoded eagerly at construction; values are then
-/// consumed with `has_next` / `next_value`.
-#[derive(Debug, Clone)]
+/// Feed input bytes incrementally with `feed` (chunk boundaries are
+/// arbitrary; mid-varint splits are fine), declare end of input with
+/// `close_input`, and drain decoded values with `next_ready`/`next_value`.
+/// The `from_bytes`/`from_path` constructors are conveniences that feed
+/// everything at once and close.
+///
+/// Peak memory is one compressed block plus its decompressed form plus one
+/// decoded value; the whole file is never required in memory, and total
+/// parse time is linear in the input (progress is committed between calls,
+/// so hostile chunking cannot force re-parsing). Any framing or decode
+/// error is fatal and fuses the reader (every later call returns the same
+/// error), so a torn stream can never silently truncate.
+#[derive(Debug)]
 pub struct DataFileReader {
-    writer_schema: Schema,
-    values: Vec<Value>,
-    position: usize,
+    /// Bytes fed but not yet compacted away. The parsed prefix is tracked by
+    /// `consumed` and removed with amortized O(1) cost per byte (`compact`),
+    /// never per block.
+    input: Vec<u8>,
+    /// How many bytes of `input` the parser has consumed.
+    consumed: usize,
+    input_closed: bool,
+    /// Incremental header parser; replaced by `header` once complete.
+    header_parser: HeaderParser,
+    header: Option<Header>,
+    /// When set, every value is resolved to this schema (schema evolution).
+    reader_schema: Option<Schema>,
+    max_block_bytes: u64,
+    /// Decompressed payload of the block currently being drained, with the
+    /// decode position and the number of values left in it.
+    block: Vec<u8>,
+    block_pos: usize,
+    block_remaining: u64,
+    /// Fatal error; sticky. Every subsequent call returns a copy.
+    error: Option<VecU8>,
 }
 
 impl Default for DataFileReader {
     fn default() -> Self {
-        DataFileReader { writer_schema: Schema::Null, values: Vec::new(), position: 0 }
+        // The default state exists for Crubit's move semantics: C++ moves
+        // replace the moved-from object with Default::default(). Fuse it so
+        // a C++ use-after-move errors loudly instead of behaving like a
+        // fresh, working reader.
+        let mut reader = Self::create();
+        reader.error = Some("Reader is in an invalid, moved-out state".into());
+        reader
     }
 }
 
 impl DataFileReader {
-    /// Opens a container file from a byte buffer. The writer schema is read
-    /// from the file header.
-    pub fn from_bytes(data: &[u8]) -> Result<DataFileReader, VecU8> {
-        catch_panic(|| {
-            let reader = Reader::new(data).map_err(|err| VecU8::from(err.to_string()))?;
-            Self::drain(reader)
-        })
+    /// Creates an empty reader; the writer schema is taken from the stream
+    /// header once enough bytes have been fed. (Named `create` rather than
+    /// `new` because `new` is a reserved word in the generated C++.)
+    pub fn create() -> DataFileReader {
+        DataFileReader {
+            input: Vec::new(),
+            consumed: 0,
+            input_closed: false,
+            header_parser: HeaderParser::start(),
+            header: None,
+            reader_schema: None,
+            max_block_bytes: DEFAULT_MAX_BLOCK_BYTES,
+            block: Vec::new(),
+            block_pos: 0,
+            block_remaining: 0,
+            error: None,
+        }
     }
 
-    /// Opens a container file from a byte buffer and resolves every value
-    /// to `reader_schema` (schema evolution).
+    /// Creates an empty reader that additionally resolves every value to
+    /// `reader_schema` (schema evolution).
+    pub fn with_reader_schema(reader_schema: &AvroSchema) -> DataFileReader {
+        let mut reader = Self::create();
+        reader.reader_schema = Some(reader_schema.schema.clone());
+        reader
+    }
+
+    /// Opens a container file from a complete byte buffer. The writer schema
+    /// is read from the header. Errors on garbage or a truncated first block.
+    pub fn from_bytes(data: &[u8]) -> Result<DataFileReader, VecU8> {
+        Self::build_from_bytes(None, data)
+    }
+
+    /// Opens a container file from a complete byte buffer and resolves every
+    /// value to `reader_schema`.
     pub fn from_bytes_with_schema(
         reader_schema: &AvroSchema,
         data: &[u8],
     ) -> Result<DataFileReader, VecU8> {
-        catch_panic(|| {
-            let reader = Reader::with_schema(&reader_schema.schema, data)
-                .map_err(|err| VecU8::from(err.to_string()))?;
-            Self::drain(reader)
-        })
+        Self::build_from_bytes(Some(reader_schema), data)
     }
 
     /// Opens a container file from the filesystem.
@@ -213,379 +406,486 @@ impl DataFileReader {
         Self::from_bytes_with_schema(reader_schema, &data)
     }
 
-    fn drain(reader: Reader<'_, &[u8]>) -> Result<DataFileReader, VecU8> {
-        let writer_schema = reader.writer_schema().clone();
-        let mut values = Vec::new();
-        for item in reader {
-            match item {
-                Ok(value) => values.push(value),
-                Err(err) => return Err(err.to_string().into()),
+    fn build_from_bytes(
+        reader_schema: Option<&AvroSchema>,
+        data: &[u8],
+    ) -> Result<DataFileReader, VecU8> {
+        let mut reader = match reader_schema {
+            Some(schema) => Self::with_reader_schema(schema),
+            None => Self::create(),
+        };
+        reader.feed(data)?;
+        reader.close_input()?;
+        // Parse eagerly up to the first value so garbage and files truncated
+        // in the header or first block fail at construction.
+        reader.next_ready()?;
+        if reader.header.is_none() {
+            return Err("Container file ended before a complete header".into());
+        }
+        Ok(reader)
+    }
+
+    /// Appends input bytes. Chunk boundaries are arbitrary. Errors once the
+    /// input was closed or after a fatal error.
+    pub fn feed(&mut self, data: &[u8]) -> Status {
+        self.ensure_not_failed()?;
+        if self.input_closed {
+            return Err("Input already closed".into());
+        }
+        self.input.extend_from_slice(data);
+        Ok(0)
+    }
+
+    /// Declares end of input. After this, data ending mid-header or
+    /// mid-block surfaces as an error from `next_ready`/`next_value`
+    /// instead of waiting for more bytes forever. Idempotent.
+    pub fn close_input(&mut self) -> Status {
+        self.ensure_not_failed()?;
+        self.input_closed = true;
+        Ok(0)
+    }
+
+    /// Drives the parser as far as the fed bytes allow. Returns true iff
+    /// `next_value` would return a value right now; false means more input
+    /// is needed or the file ended cleanly (disambiguate with `at_end`).
+    pub fn next_ready(&mut self) -> Result<bool, VecU8> {
+        self.ensure_not_failed()?;
+        match catch_panic(|| {
+            self.pump()?;
+            Ok(0u8)
+        }) {
+            Ok(_) => Ok(self.block_remaining > 0),
+            Err(err) => {
+                self.error = Some(err.clone());
+                Err(err)
             }
         }
-        Ok(DataFileReader { writer_schema, values, position: 0 })
     }
 
-    /// Returns the schema the file was written with.
-    pub fn writer_schema(&self) -> AvroSchema {
-        AvroSchema { schema: self.writer_schema.clone() }
-    }
-
-    /// Returns the total number of values in the file.
-    pub fn count(&self) -> usize {
-        self.values.len()
-    }
-
-    /// Returns true if `next_value` has more values to return.
-    pub fn has_next(&self) -> bool {
-        self.position < self.values.len()
-    }
-
-    /// Returns the next value. Returns an error once all values have been
-    /// consumed.
+    /// Returns the next decoded value. Errors (benignly, without fusing) if
+    /// no value is ready; decode failures are fatal.
     pub fn next_value(&mut self) -> Result<AvroValue, VecU8> {
-        match self.values.get(self.position) {
-            Some(value) => {
-                self.position += 1;
-                Ok(AvroValue { value: value.clone() })
+        if !self.next_ready()? {
+            if self.at_end() {
+                return Err("No more values in the container file".into());
             }
-            None => Err("No more values in the container file".into()),
+            return Err("No value ready: feed more input or close_input".into());
+        }
+        match catch_panic(|| self.decode_one()) {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                self.error = Some(err.clone());
+                Err(err)
+            }
         }
     }
 
-    /// Resets the read position to the first value.
-    pub fn rewind(&mut self) {
-        self.position = 0;
+    /// True once the file ended cleanly: header parsed, input closed and
+    /// fully consumed, all values drained, no error. Reflects parse progress
+    /// as of the last `next_ready`/`next_value` call.
+    pub fn at_end(&self) -> bool {
+        self.error.is_none()
+            && self.header.is_some()
+            && self.input_closed
+            && self.consumed == self.input.len()
+            && self.block_remaining == 0
     }
-}
 
-// ---------------------------------------------------------------------------
-// Streaming (Tier 1: in-memory / incremental) container IO.
-//
-// Unlike the buffered types above, these do not hold every value in memory:
-// the writer emits encoded bytes block-by-block for the caller to drain, and
-// the reader decodes one value per `next_value` instead of draining the whole
-// file at construction. They bound the working set for large files.
-//
-// apache-avro's `Writer<'a, W>` and `Reader::with_schema` borrow the schema,
-// so the writer and the reader-with-schema hold a `self_cell` that owns the
-// `Schema` and the borrowing `Writer`/`Reader` together. (`Reader::new`
-// borrows nothing, so the plain reader stores an owned `Reader<'static, _>`
-// directly.) The `self_cell` Box-backs its dependent, so the outer wrapper is
-// freely movable -- which is what Crubit requires to pass it by value.
-//
-// NOTE: Tier 1 fixes the codecs to in-memory `Cursor<Vec<u8>>` / `Vec<u8>`.
-// Tier 2 (true external streams) would generalize these over `R: Read` /
-// `W: Write` and add callback-backed IO types; see the README.
-// ---------------------------------------------------------------------------
-
-self_cell!(
-    struct WriterCell {
-        owner: Schema,
-        #[covariant]
-        dependent: WriterDep,
+    /// True once a fatal error has fused the reader (every call returns the
+    /// same error). Lets the C++ bridge distinguish a fatally corrupt stream
+    /// from the benign "no value ready yet" state.
+    pub fn has_failed(&self) -> bool {
+        self.error.is_some()
     }
-);
 
-struct WriterDep<'a> {
-    writer: Writer<'a, Vec<u8>>,
-}
-
-/// Streaming Avro object container file writer.
-///
-/// `append` encodes into apache-avro's internal block buffer, which
-/// auto-flushes a full block (~16 KiB) into an internal byte buffer once it
-/// fills. `take_bytes` drains the already-flushed bytes (header + full
-/// blocks) without forcing a partial flush, so blocks stay full-size.
-/// `finish` flushes the final partial block, returns the remaining bytes, and
-/// consumes the writer. The concatenation of every `take_bytes` result
-/// followed by the `finish` result is a complete container file.
-pub struct StreamingDataFileWriter {
-    // `None` once `finish` has consumed the writer (moved-out guard).
-    cell: Option<WriterCell>,
-}
-
-impl Default for StreamingDataFileWriter {
-    fn default() -> Self {
-        StreamingDataFileWriter { cell: None }
+    /// True once the header has been parsed and `writer_schema` is available.
+    pub fn header_ready(&self) -> bool {
+        self.header.is_some()
     }
-}
 
-impl std::fmt::Debug for StreamingDataFileWriter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "StreamingDataFileWriter")
+    /// Returns the schema the file was written with. Errors until enough
+    /// input has been fed and parsed (drive with `next_ready`).
+    pub fn writer_schema(&self) -> Result<AvroSchema, VecU8> {
+        match &self.header {
+            Some(header) => Ok(AvroSchema { schema: header.schema.clone() }),
+            None => Err("Header not parsed yet: feed more input and call next_ready".into()),
+        }
     }
-}
 
-impl StreamingDataFileWriter {
-    /// Creates a streaming writer for the given self-contained schema and
-    /// codec. Rejects cross-referencing schemas for the same reason as
-    /// [`DataFileWriter::create`].
-    pub fn create(
-        schema: &AvroSchema,
-        codec: AvroCodec,
-    ) -> Result<StreamingDataFileWriter, VecU8> {
-        if let Err(err) = ResolvedSchema::try_from(&schema.schema) {
+    /// Adjusts the cap on a block's declared compressed size (default
+    /// 128 MiB). Applies to blocks parsed after the call.
+    pub fn set_max_block_size(&mut self, bytes: u64) -> Status {
+        self.ensure_not_failed()?;
+        if bytes == 0 {
+            return Err("Max block size must be positive".into());
+        }
+        // Clamp to addressable memory so the u64 -> usize conversion of a
+        // declared block size below the cap can never truncate (relevant on
+        // 32-bit targets).
+        self.max_block_bytes = bytes.min(usize::MAX as u64);
+        Ok(0)
+    }
+
+    fn ensure_not_failed(&self) -> Status {
+        match &self.error {
+            Some(err) => Err(err.clone()),
+            None => Ok(0),
+        }
+    }
+
+    /// Advances the parser as far as the buffered input allows: parses the
+    /// header if still pending, then complete blocks until one with values
+    /// is loaded. Returns without error when it simply needs more input.
+    fn pump(&mut self) -> Result<(), VecU8> {
+        // Phase 1: header. The parser commits progress between calls, so a
+        // header arriving in many small chunks is parsed in linear total
+        // time (nothing is re-walked on later calls).
+        if self.header.is_none() {
+            let (consumed, header) =
+                self.header_parser.advance(&self.input[self.consumed..])?;
+            self.consumed += consumed;
+            self.compact();
+            match header {
+                Some(header) => self.header = Some(header),
+                None => return self.need_more_input("header"),
+            }
+        }
+        let (codec, expected_marker) = match &self.header {
+            Some(header) => (header.codec, header.marker),
+            None => return Err("Internal error: header missing after parse".into()),
+        };
+
+        loop {
+            // Phase 2: drain the current block before parsing the next one.
+            if self.block_remaining > 0 {
+                return Ok(());
+            }
+            let block_has_trailing_junk = self.block_pos < self.block.len();
+            if block_has_trailing_junk {
+                return Err("Corrupt block: trailing bytes after the last value".into());
+            }
+            let unparsed = &self.input[self.consumed..];
+            if unparsed.is_empty() {
+                // Clean end of file (if closed) or waiting for more input.
+                return Ok(());
+            }
+
+            // Phase 3: parse the next block: count, size, payload, marker.
+            let mut pos = 0;
+            let Some(count) = parse_long(unparsed, &mut pos)? else {
+                return self.need_more_input("block header");
+            };
+            if count < 0 {
+                return Err("Corrupt block: negative object count".into());
+            }
+            let Some(declared_size) = parse_long(unparsed, &mut pos)? else {
+                return self.need_more_input("block header");
+            };
+            if declared_size < 0 {
+                return Err("Corrupt block: negative block size".into());
+            }
+            if declared_size as u64 > self.max_block_bytes {
+                return Err(format!(
+                    "Block size {} exceeds the maximum of {} bytes",
+                    declared_size, self.max_block_bytes
+                )
+                .into());
+            }
+            // Cannot truncate: set_max_block_size clamps the cap to
+            // usize::MAX, and declared_size passed the cap check above.
+            let Ok(size) = usize::try_from(declared_size) else {
+                return Err("Block size exceeds addressable memory".into());
+            };
+            let block_end = pos + size;
+            let after_marker = block_end + 16;
+            if unparsed.len() < after_marker {
+                return self.need_more_input("block payload");
+            }
+            if unparsed[block_end..after_marker] != expected_marker {
+                return Err("Corrupt block: sync marker mismatch".into());
+            }
+            let mut payload = unparsed[pos..block_end].to_vec();
+            self.consumed += after_marker;
+            self.compact();
+            Codec::from(codec)
+                .decompress(&mut payload)
+                .map_err(|err| VecU8::from(err.to_string()))?;
+            if count == 0 {
+                // An empty block is legal only if it is truly empty.
+                if !payload.is_empty() {
+                    return Err("Corrupt block: zero-count block with payload".into());
+                }
+                continue;
+            }
+            self.block = payload;
+            self.block_pos = 0;
+            self.block_remaining = count as u64;
+            return Ok(());
+        }
+    }
+
+    /// Removes the consumed prefix of the input buffer once it makes up at
+    /// least half of it. Amortized O(1) per byte, so a file with many small
+    /// blocks parses in linear time (a per-block drain would be quadratic).
+    fn compact(&mut self) {
+        if self.consumed > 0 && self.consumed * 2 >= self.input.len() {
+            self.input.drain(..self.consumed);
+            self.consumed = 0;
+        }
+    }
+
+    /// Whether running out of buffered bytes is fine (more may be fed) or a
+    /// truncation error (the input was closed).
+    fn need_more_input(&self, while_parsing: &str) -> Result<(), VecU8> {
+        if self.input_closed {
             return Err(format!(
-                "Schema is not self-contained and cannot be used for a container file \
-                 (inline the referenced types in a single schema document): {}",
-                err
+                "Truncated container file: input ended inside a {}",
+                while_parsing
             )
             .into());
         }
-        let cell = WriterCell::new(schema.schema.clone(), |schema| WriterDep {
-            writer: Writer::with_codec(schema, Vec::new(), codec.into()),
-        });
-        Ok(StreamingDataFileWriter { cell: Some(cell) })
+        Ok(())
     }
 
-    /// Returns the schema this writer was created with. Errors once finished.
-    pub fn schema(&self) -> Result<AvroSchema, VecU8> {
-        let cell = self.cell.as_ref().ok_or_else(|| VecU8::from("Writer already finished"))?;
-        Ok(AvroSchema { schema: cell.borrow_owner().clone() })
-    }
-
-    /// Validates `value` against the writer schema and encodes it. May
-    /// auto-flush a full block into the internal buffer. Errors once finished.
-    pub fn append(&mut self, value: &AvroValue) -> Status {
-        catch_panic(|| {
-            let cell = self.cell.as_mut().ok_or_else(|| VecU8::from("Writer already finished"))?;
-            cell.with_dependent_mut(|schema, dep| {
-                // Validate first so an invalid value cannot corrupt the
-                // in-progress block buffer (matches DataFileWriter::append).
-                if !value.value.validate(schema) {
-                    return Err(VecU8::from(format!(
-                        "Value of type {} does not conform to the writer schema",
-                        String::from_utf8_lossy(value.type_name().as_slice())
-                    )));
-                }
-                match dep.writer.append_value_ref(&value.value) {
-                    Ok(_) => Ok(0),
-                    Err(err) => Err(err.to_string().into()),
-                }
-            })
-        })
-    }
-
-    /// Drains the bytes already flushed to the internal buffer (header plus
-    /// any full blocks) without forcing a partial flush. May return empty.
-    /// Errors once finished.
-    pub fn take_bytes(&mut self) -> Result<VecU8, VecU8> {
-        catch_panic(|| {
-            let cell = self.cell.as_mut().ok_or_else(|| VecU8::from("Writer already finished"))?;
-            let bytes = cell.with_dependent_mut(|_schema, dep| {
-                std::mem::take(dep.writer.get_mut())
-            });
-            Ok(bytes.into())
-        })
-    }
-
-    /// Flushes any pending block, returns all remaining bytes, and consumes
-    /// the writer. Subsequent calls to any method error. (With no buffered
-    /// values -- e.g. an empty file -- no block is written; the result is
-    /// just the header plus whatever was already flushed.)
-    pub fn finish(&mut self) -> Result<VecU8, VecU8> {
-        catch_panic(|| {
-            let cell = self.cell.as_mut().ok_or_else(|| VecU8::from("Writer already finished"))?;
-            let bytes = cell.with_dependent_mut(|_schema, dep| {
-                dep.writer.flush().map_err(|err| VecU8::from(err.to_string()))?;
-                Ok::<Vec<u8>, VecU8>(std::mem::take(dep.writer.get_mut()))
-            })?;
-            // Drop the writer (and its borrowed schema) by clearing the cell.
-            // We deliberately avoid `Writer::into_inner` (which consumes by
-            // value) because self_cell does not let us move the dependent out;
-            // an explicit flush + drain produces the identical bytes, and the
-            // final flush leaves num_values == 0 so the Writer's own Drop does
-            // not re-emit anything.
-            self.cell = None;
-            Ok(bytes.into())
-        })
-    }
-
-    /// Returns true once `finish` has consumed the writer.
-    pub fn is_finished(&self) -> bool {
-        self.cell.is_none()
-    }
-}
-
-type PlainReader = Reader<'static, Cursor<Vec<u8>>>;
-
-self_cell!(
-    struct ResolvingReaderCell {
-        owner: Schema,
-        #[covariant]
-        dependent: ReaderDep,
-    }
-);
-
-struct ReaderDep<'a> {
-    reader: Reader<'a, Cursor<Vec<u8>>>,
-}
-
-enum ReaderInner {
-    /// `Reader::new` borrows nothing, so this is fully owned ('static).
-    Plain(PlainReader),
-    /// `Reader::with_schema` borrows the reader schema; the cell owns both.
-    Resolving(ResolvingReaderCell),
-}
-
-/// Streaming Avro object container file reader.
-///
-/// Decodes one value per `next_value` instead of draining the whole file at
-/// construction. A single-value lookahead backs `has_next`. There is no
-/// `count` (unknown without consuming the file) and no `rewind` (a consumed
-/// stream cannot be rewound); use [`DataFileReader`] when you need either.
-pub struct StreamingDataFileReader {
-    // `None` only in the Default / moved-out state.
-    inner: Option<ReaderInner>,
-    writer_schema: Schema,
-    // Single-value lookahead populated by `has_next`/`next_value`.
-    lookahead: Option<Value>,
-    // A decode error observed while peeking, surfaced on the next
-    // `next_value` so streaming never silently truncates on a bad record.
-    pending_error: Option<VecU8>,
-    // The underlying iterator returned None (clean end of file) or the reader
-    // is in a moved-out/panicked state; no further values will be pulled.
-    exhausted: bool,
-}
-
-impl Default for StreamingDataFileReader {
-    fn default() -> Self {
-        StreamingDataFileReader {
-            inner: None,
-            writer_schema: Schema::Null,
-            lookahead: None,
-            pending_error: None,
-            exhausted: true,
-        }
-    }
-}
-
-impl std::fmt::Debug for StreamingDataFileReader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "StreamingDataFileReader")
-    }
-}
-
-impl StreamingDataFileReader {
-    /// Opens a container file from a byte buffer. The writer schema is read
-    /// from the header. The bytes are copied into an owned buffer (lifetimes
-    /// over FFI are hard; mirrors the other readers in this crate).
-    pub fn from_bytes(data: &[u8]) -> Result<StreamingDataFileReader, VecU8> {
-        catch_panic(|| {
-            let reader: PlainReader = Reader::new(Cursor::new(data.to_vec()))
-                .map_err(|err| VecU8::from(err.to_string()))?;
-            let writer_schema = reader.writer_schema().clone();
-            Ok(StreamingDataFileReader {
-                inner: Some(ReaderInner::Plain(reader)),
-                writer_schema,
-                lookahead: None,
-                pending_error: None,
-                exhausted: false,
-            })
-        })
-    }
-
-    /// Opens a container file and resolves every value to `reader_schema`.
-    pub fn from_bytes_with_schema(
-        reader_schema: &AvroSchema,
-        data: &[u8],
-    ) -> Result<StreamingDataFileReader, VecU8> {
-        catch_panic(|| {
-            let bytes = data.to_vec();
-            let cell = ResolvingReaderCell::try_new(reader_schema.schema.clone(), |schema| {
-                Reader::with_schema(schema, Cursor::new(bytes))
-                    .map(|reader| ReaderDep { reader })
-                    .map_err(|err| VecU8::from(err.to_string()))
-            })?;
-            let writer_schema = cell.borrow_dependent().reader.writer_schema().clone();
-            Ok(StreamingDataFileReader {
-                inner: Some(ReaderInner::Resolving(cell)),
-                writer_schema,
-                lookahead: None,
-                pending_error: None,
-                exhausted: false,
-            })
-        })
-    }
-
-    /// Opens a container file from the filesystem.
-    pub fn from_path(raw_path: &[u8]) -> Result<StreamingDataFileReader, VecU8> {
-        let path = utf8(raw_path)?;
-        let data = std::fs::read(path).map_err(|err| VecU8::from(err.to_string()))?;
-        Self::from_bytes(&data)
-    }
-
-    /// Opens a container file from the filesystem, resolving every value to
-    /// `reader_schema`.
-    pub fn from_path_with_schema(
-        reader_schema: &AvroSchema,
-        raw_path: &[u8],
-    ) -> Result<StreamingDataFileReader, VecU8> {
-        let path = utf8(raw_path)?;
-        let data = std::fs::read(path).map_err(|err| VecU8::from(err.to_string()))?;
-        Self::from_bytes_with_schema(reader_schema, &data)
-    }
-
-    /// Returns the schema the file was written with.
-    pub fn writer_schema(&self) -> AvroSchema {
-        AvroSchema { schema: self.writer_schema.clone() }
-    }
-
-    /// Returns true if a subsequent `next_value` would return a value or
-    /// surface a decode error. Fills the single-value lookahead if needed.
-    pub fn has_next(&mut self) -> bool {
-        self.fill();
-        self.lookahead.is_some() || self.pending_error.is_some()
-    }
-
-    /// Returns the next value, decoding it lazily. Errors once all values are
-    /// consumed, or surfaces a decode error observed while peeking.
-    pub fn next_value(&mut self) -> Result<AvroValue, VecU8> {
-        self.fill();
-        if let Some(value) = self.lookahead.take() {
-            return Ok(AvroValue { value });
-        }
-        if let Some(err) = self.pending_error.take() {
-            return Err(err);
-        }
-        Err("No more values in the container file".into())
-    }
-
-    /// Ensures the lookahead is populated (with a value, a pending error, or
-    /// the exhausted flag) by pulling at most one item from the iterator.
-    /// The pull decodes a value, so it runs inside `catch_panic`.
-    fn fill(&mut self) {
-        if self.lookahead.is_some() || self.pending_error.is_some() || self.exhausted {
-            return;
-        }
-        match catch_panic(|| Ok::<_, VecU8>(self.pull_raw())) {
-            Ok(Some(Ok(value))) => self.lookahead = Some(value),
-            Ok(Some(Err(err))) => self.pending_error = Some(err),
-            Ok(None) => self.exhausted = true,
-            Err(panic_err) => {
-                // A panic may leave the reader torn; fuse it so we never pull
-                // again, and surface the panic as the next error.
-                self.pending_error = Some(panic_err);
-                self.exhausted = true;
-            }
-        }
-    }
-
-    fn pull_raw(&mut self) -> Option<Result<Value, VecU8>> {
-        let item = match self.inner.as_mut() {
-            Some(ReaderInner::Plain(reader)) => reader.next(),
-            Some(ReaderInner::Resolving(cell)) => {
-                cell.with_dependent_mut(|_schema, dep| dep.reader.next())
-            }
-            None => None,
+    /// Decodes one value from the current block. Only called with
+    /// `block_remaining > 0`.
+    fn decode_one(&mut self) -> Result<AvroValue, VecU8> {
+        let Some(header) = &self.header else {
+            return Err("Internal error: no header while decoding".into());
         };
-        item.map(|res| res.map_err(|err| VecU8::from(err.to_string())))
+        let mut cursor = Cursor::new(&self.block[self.block_pos..]);
+        // The writer schema is passed as its own schemata so named-type
+        // references inside a self-contained (e.g. recursive) schema resolve.
+        let value = from_avro_datum_schemata(
+            &header.schema,
+            vec![&header.schema],
+            &mut cursor,
+            self.reader_schema.as_ref(),
+        )
+        .map_err(|err| VecU8::from(err.to_string()))?;
+        self.block_pos += cursor.position() as usize;
+        self.block_remaining -= 1;
+        Ok(AvroValue { value })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Incremental framing parsers. Each returns Ok(None) when the buffered input
+// does not yet contain a complete unit ("need more bytes", detected purely by
+// length checks, never by sniffing EOF errors), Ok(Some(..)) on success, and
+// Err on definitely-corrupt input.
+// ---------------------------------------------------------------------------
+
+/// Parses one zigzag-encoded Avro long starting at `*pos`, advancing `*pos`
+/// past it on success. Strict: at most 10 bytes, no overflow.
+fn parse_long(buf: &[u8], pos: &mut usize) -> Result<Option<i64>, VecU8> {
+    let mut value: u64 = 0;
+    let mut shift: u32 = 0;
+    let mut i = *pos;
+    loop {
+        let Some(&byte) = buf.get(i) else {
+            return Ok(None);
+        };
+        i += 1;
+        // The 10th byte (shift 63) may only carry the final bit.
+        if shift == 63 && (byte & 0x7f) > 1 {
+            return Err("Corrupt varint: overflows a 64-bit long".into());
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            *pos = i;
+            let decoded = ((value >> 1) as i64) ^ -((value & 1) as i64);
+            return Ok(Some(decoded));
+        }
+        shift += 7;
+        if shift > 63 {
+            return Err("Corrupt varint: longer than 10 bytes".into());
+        }
+    }
+}
+
+/// Parses a length prefix for a header map key or value, enforcing the
+/// header cap so absurd declared lengths fail fast.
+fn parse_header_len(buf: &[u8], pos: &mut usize, what: &str) -> Result<Option<usize>, VecU8> {
+    let Some(len) = parse_long(buf, pos)? else {
+        return Ok(None);
+    };
+    if len < 0 {
+        return Err(format!("Corrupt header: negative length for {}", what).into());
+    }
+    if len as u64 > MAX_HEADER_BYTES as u64 {
+        return Err(
+            format!("Corrupt header: {} length {} exceeds the header cap", what, len).into(),
+        );
+    }
+    Ok(Some(len as usize))
+}
+
+/// The header metadata keys the binding cares about; everything else (user
+/// metadata, avro.codec.compression_level) is skipped, matching
+/// apache-avro's reader.
+#[derive(Debug, Clone, Copy)]
+enum MetaKey {
+    Schema,
+    Codec,
+    Other,
+}
+
+/// Position inside the container header. The metadata is an Avro
+/// map<bytes>: repeated groups of a pair count then that many key/value
+/// pairs, terminated by a zero count; a negative count means |count| pairs
+/// preceded by the group's byte size.
+#[derive(Debug, Clone, Copy)]
+enum HeaderState {
+    Magic,
+    GroupCount,
+    GroupSize { pairs_left: u64 },
+    KeyLen { pairs_left: u64 },
+    KeyBytes { pairs_left: u64, len: usize },
+    ValueLen { pairs_left: u64, key: MetaKey },
+    ValueBytes { pairs_left: u64, key: MetaKey, len: usize },
+    Marker,
+}
+
+/// Incremental parser for the container header (magic, metadata map, sync
+/// marker). Progress is committed after every completed token, so a header
+/// fed in many small chunks parses in linear total time: each `advance`
+/// call re-examines at most the one incomplete token at the buffer front
+/// (a varint of <= 10 bytes, or an O(1) length check for byte strings).
+#[derive(Debug)]
+struct HeaderParser {
+    state: HeaderState,
+    schema_json: Option<Vec<u8>>,
+    codec_name: Vec<u8>,
+    /// Header bytes consumed so far, enforced against MAX_HEADER_BYTES.
+    bytes_consumed: usize,
+}
+
+impl HeaderParser {
+    fn start() -> HeaderParser {
+        HeaderParser {
+            state: HeaderState::Magic,
+            schema_json: None,
+            codec_name: b"null".to_vec(),
+            bytes_consumed: 0,
+        }
+    }
+
+    /// Consumes as many complete header tokens from `input` as possible.
+    /// Returns the number of bytes consumed (the caller must not re-feed
+    /// them) and the finished header once the sync marker has been read.
+    fn advance(&mut self, input: &[u8]) -> Result<(usize, Option<Header>), VecU8> {
+        let mut pos = 0;
+        loop {
+            if self.bytes_consumed.saturating_add(pos) > MAX_HEADER_BYTES {
+                return Err(format!(
+                    "Container header exceeds the maximum of {} bytes",
+                    MAX_HEADER_BYTES
+                )
+                .into());
+            }
+            match self.state {
+                HeaderState::Magic => {
+                    if input.len() - pos < 4 {
+                        break;
+                    }
+                    if &input[pos..pos + 4] != b"Obj\x01" {
+                        return Err("Not an Avro object container file (bad magic)".into());
+                    }
+                    pos += 4;
+                    self.state = HeaderState::GroupCount;
+                }
+                HeaderState::GroupCount => {
+                    let Some(count) = parse_long(input, &mut pos)? else {
+                        break;
+                    };
+                    self.state = if count == 0 {
+                        HeaderState::Marker
+                    } else if count < 0 {
+                        HeaderState::GroupSize { pairs_left: count.unsigned_abs() }
+                    } else {
+                        HeaderState::KeyLen { pairs_left: count as u64 }
+                    };
+                }
+                HeaderState::GroupSize { pairs_left } => {
+                    let Some(_group_byte_size) = parse_long(input, &mut pos)? else {
+                        break;
+                    };
+                    self.state = HeaderState::KeyLen { pairs_left };
+                }
+                HeaderState::KeyLen { pairs_left } => {
+                    let Some(len) = parse_header_len(input, &mut pos, "metadata key")? else {
+                        break;
+                    };
+                    self.state = HeaderState::KeyBytes { pairs_left, len };
+                }
+                HeaderState::KeyBytes { pairs_left, len } => {
+                    if input.len() - pos < len {
+                        break;
+                    }
+                    let key = match &input[pos..pos + len] {
+                        b"avro.schema" => MetaKey::Schema,
+                        b"avro.codec" => MetaKey::Codec,
+                        _ => MetaKey::Other,
+                    };
+                    pos += len;
+                    self.state = HeaderState::ValueLen { pairs_left, key };
+                }
+                HeaderState::ValueLen { pairs_left, key } => {
+                    let Some(len) = parse_header_len(input, &mut pos, "metadata value")? else {
+                        break;
+                    };
+                    self.state = HeaderState::ValueBytes { pairs_left, key, len };
+                }
+                HeaderState::ValueBytes { pairs_left, key, len } => {
+                    if input.len() - pos < len {
+                        break;
+                    }
+                    let value = &input[pos..pos + len];
+                    match key {
+                        MetaKey::Schema => self.schema_json = Some(value.to_vec()),
+                        MetaKey::Codec => self.codec_name = value.to_vec(),
+                        MetaKey::Other => {}
+                    }
+                    pos += len;
+                    let pairs_left = pairs_left - 1;
+                    self.state = if pairs_left == 0 {
+                        HeaderState::GroupCount
+                    } else {
+                        HeaderState::KeyLen { pairs_left }
+                    };
+                }
+                HeaderState::Marker => {
+                    if input.len() - pos < 16 {
+                        break;
+                    }
+                    let mut marker = [0u8; 16];
+                    marker.copy_from_slice(&input[pos..pos + 16]);
+                    pos += 16;
+                    self.bytes_consumed = self.bytes_consumed.saturating_add(pos);
+                    return Ok((pos, Some(self.build(marker)?)));
+                }
+            }
+        }
+        self.bytes_consumed = self.bytes_consumed.saturating_add(pos);
+        Ok((pos, None))
+    }
+
+    fn build(&self, marker: [u8; 16]) -> Result<Header, VecU8> {
+        let Some(schema_json) = &self.schema_json else {
+            return Err("Corrupt header: missing avro.schema metadata".into());
+        };
+        let schema =
+            Schema::parse_str(utf8(schema_json)?).map_err(|err| VecU8::from(err.to_string()))?;
+        let codec = AvroCodec::from_name(&self.codec_name)?;
+        Ok(Header { schema, codec, marker })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use apache_avro::{to_avro_datum, Reader as UpstreamReader, Writer as UpstreamWriter};
 
     const RECORD_SCHEMA: &str = r#"{
         "type": "record",
@@ -605,27 +905,48 @@ mod tests {
         record
     }
 
+    /// Writes `values` through the writer, draining after every append, and
+    /// returns the complete container file bytes.
+    fn write_file(schema: &AvroSchema, codec: AvroCodec, values: &[AvroValue]) -> Vec<u8> {
+        let mut writer = DataFileWriter::create(schema, codec).unwrap();
+        let mut out = Vec::new();
+        for value in values {
+            writer.append(value).unwrap();
+            out.extend_from_slice(writer.take_bytes().unwrap().as_slice());
+        }
+        out.extend_from_slice(writer.finish().unwrap().as_slice());
+        out
+    }
+
+    /// Reads every value from a complete file through the push reader.
+    fn read_all(bytes: &[u8]) -> Vec<AvroValue> {
+        let mut reader = DataFileReader::from_bytes(bytes).unwrap();
+        let mut values = Vec::new();
+        while reader.next_ready().unwrap() {
+            values.push(reader.next_value().unwrap());
+        }
+        assert!(reader.at_end());
+        values
+    }
+
     fn roundtrip_with_codec(codec: AvroCodec) {
         let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
-        let mut writer = DataFileWriter::create(&schema, codec).unwrap();
         let first = measurement("a", 1.5);
         let second = measurement("b", -2.25);
-        writer.append(&first).unwrap();
-        writer.append(&second).unwrap();
-        assert_eq!(writer.count(), 2);
+        let bytes = write_file(&schema, codec, &[first.clone(), second.clone()]);
 
-        let bytes = writer.to_bytes().unwrap();
-        let mut reader = DataFileReader::from_bytes(bytes.as_slice()).unwrap();
-        assert_eq!(reader.count(), 2);
-        assert!(reader.writer_schema().equals(&schema));
-        assert!(reader.has_next());
+        let mut reader = DataFileReader::from_bytes(&bytes).unwrap();
+        assert!(reader.header_ready());
+        assert!(reader.writer_schema().unwrap().equals(&schema));
+        assert!(reader.next_ready().unwrap());
+        // next_ready is idempotent: it does not consume.
+        assert!(reader.next_ready().unwrap());
         assert!(reader.next_value().unwrap().equals(&first));
         assert!(reader.next_value().unwrap().equals(&second));
-        assert!(!reader.has_next());
-        assert!(reader.next_value().is_err());
-
-        reader.rewind();
-        assert!(reader.next_value().unwrap().equals(&first));
+        assert!(!reader.next_ready().unwrap());
+        assert!(reader.at_end());
+        let message = String::from_utf8(reader.next_value().unwrap_err().into_vec()).unwrap();
+        assert!(message.contains("No more values"), "unexpected error: {message}");
     }
 
     #[test]
@@ -646,6 +967,71 @@ mod tests {
     #[test]
     fn roundtrip_zstandard_codec() {
         roundtrip_with_codec(AvroCodec::Zstandard);
+    }
+
+    #[test]
+    fn byte_at_a_time_feeding_hits_every_split_point() {
+        // Feeding one byte at a time exercises every possible chunk split:
+        // mid-magic, mid-varint, mid-key, mid-payload, mid-sync-marker.
+        // Enough values to span several flush batches and many blocks.
+        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
+        let n = 3000usize;
+        let values: Vec<AvroValue> =
+            (0..n).map(|i| measurement("sensor", i as f64)).collect();
+        let bytes = write_file(&schema, AvroCodec::Deflate, &values);
+
+        let mut reader = DataFileReader::create();
+        let mut seen = 0usize;
+        for byte in &bytes {
+            reader.feed(std::slice::from_ref(byte)).unwrap();
+            while reader.next_ready().unwrap() {
+                let value = reader.next_value().unwrap();
+                let got =
+                    value.get_record_field(b"value").unwrap().get_double().unwrap();
+                assert_eq!(got, seen as f64);
+                seen += 1;
+            }
+        }
+        reader.close_input().unwrap();
+        assert!(!reader.next_ready().unwrap());
+        assert_eq!(seen, n);
+        assert!(reader.at_end());
+    }
+
+    #[test]
+    fn interop_upstream_writer_to_push_reader() {
+        // A file written by apache-avro's own Writer decodes with our push
+        // reader (wire-format compatibility in the read direction).
+        let schema = Schema::parse_str(RECORD_SCHEMA).unwrap();
+        let mut upstream =
+            UpstreamWriter::with_codec(&schema, Vec::new(), Codec::Deflate(Default::default()));
+        for i in 0..100 {
+            let value = measurement("s", i as f64);
+            upstream.append_value_ref(&value.value).unwrap();
+        }
+        let bytes = upstream.into_inner().unwrap();
+
+        let values = read_all(&bytes);
+        assert_eq!(values.len(), 100);
+        assert_eq!(
+            values[99].get_record_field(b"value").unwrap().get_double().unwrap(),
+            99.0
+        );
+    }
+
+    #[test]
+    fn interop_push_writer_to_upstream_reader() {
+        // A file written by our writer decodes with apache-avro's own Reader
+        // (wire-format compatibility in the write direction).
+        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
+        let values: Vec<AvroValue> =
+            (0..100).map(|i| measurement("s", i as f64)).collect();
+        let bytes = write_file(&schema, AvroCodec::Snappy, &values);
+
+        let upstream = UpstreamReader::new(bytes.as_slice()).unwrap();
+        let decoded: Vec<Value> = upstream.map(|item| item.unwrap()).collect();
+        assert_eq!(decoded.len(), 100);
+        assert!(values[7].equals(&AvroValue { value: decoded[7].clone() }));
     }
 
     fn cross_referencing_schemas() -> Vec<AvroSchema> {
@@ -690,11 +1076,31 @@ mod tests {
         let mut person = AvroValue::create_record();
         person.record_put(b"address", &address).unwrap();
 
-        let mut writer = DataFileWriter::create(&schema, AvroCodec::Null).unwrap();
-        writer.append(&person).unwrap();
-        let bytes = writer.to_bytes().unwrap();
-        let mut reader = DataFileReader::from_bytes(bytes.as_slice()).unwrap();
-        assert!(reader.next_value().unwrap().equals(&person));
+        let bytes = write_file(&schema, AvroCodec::Null, &[person.clone()]);
+        let values = read_all(&bytes);
+        assert!(values[0].equals(&person));
+    }
+
+    #[test]
+    fn recursive_schema_roundtrip() {
+        // A self-referential schema exercises named-type resolution in the
+        // push reader's from_avro_datum_schemata path.
+        let schema = AvroSchema::parse(
+            br#"{"type": "record", "name": "Node", "fields": [
+                {"name": "next", "type": ["null", "Node"]}]}"#,
+        )
+        .unwrap();
+
+        let mut inner = AvroValue::create_record();
+        inner
+            .record_put(b"next", &AvroValue::create_union(0, &AvroValue::create_null()))
+            .unwrap();
+        let mut outer = AvroValue::create_record();
+        outer.record_put(b"next", &AvroValue::create_union(1, &inner)).unwrap();
+
+        let bytes = write_file(&schema, AvroCodec::Null, &[outer.clone()]);
+        let values = read_all(&bytes);
+        assert!(values[0].equals(&outer));
     }
 
     #[test]
@@ -708,17 +1114,80 @@ mod tests {
     }
 
     #[test]
-    fn append_rejects_invalid_value() {
+    fn codec_from_name_rejects_unsupported() {
+        assert_eq!(AvroCodec::from_name(b"null").unwrap(), AvroCodec::Null);
+        assert_eq!(AvroCodec::from_name(b"zstandard").unwrap(), AvroCodec::Zstandard);
+        assert!(AvroCodec::from_name(b"bzip2").is_err());
+        assert!(AvroCodec::from_name(b"xz").is_err());
+        assert!(AvroCodec::from_name(b"lz4").is_err());
+    }
+
+    #[test]
+    fn append_rejects_invalid_value_and_writer_stays_usable() {
         let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
         let mut writer = DataFileWriter::create(&schema, AvroCodec::Null).unwrap();
         assert!(writer.append(&AvroValue::create_long(1)).is_err());
-        assert_eq!(writer.count(), 0);
+        assert!(!writer.is_finished());
+        // The writer still works after a rejected value.
+        let value = measurement("ok", 1.0);
+        writer.append(&value).unwrap();
+        let bytes = writer.finish().unwrap();
+        let values = read_all(bytes.as_slice());
+        assert_eq!(values.len(), 1);
+        assert!(values[0].equals(&value));
+    }
+
+    #[test]
+    fn writer_finish_consumes_writer() {
+        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
+        let mut writer = DataFileWriter::create(&schema, AvroCodec::Null).unwrap();
+        writer.append(&measurement("x", 1.0)).unwrap();
+        assert!(!writer.is_finished());
+        let _ = writer.finish().unwrap();
+        assert!(writer.is_finished());
+        assert!(writer.append(&measurement("y", 2.0)).is_err());
+        assert!(writer.take_bytes().is_err());
+        assert!(writer.finish().is_err());
+        // The schema stays queryable after finish.
+        assert!(writer.schema().equals(&schema));
+    }
+
+    #[test]
+    fn writer_take_bytes_drains_full_batches_before_finish() {
+        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
+        let mut writer = DataFileWriter::create(&schema, AvroCodec::Null).unwrap();
+        let n = 4000;
+        let mut drained = Vec::new();
+        let mut max_chunk = 0usize;
+        for i in 0..n {
+            writer.append(&measurement("sensor", i as f64)).unwrap();
+            let chunk = writer.take_bytes().unwrap();
+            max_chunk = max_chunk.max(chunk.len());
+            drained.extend_from_slice(chunk.as_slice());
+        }
+        // Batches were flushed and drained before finish: the writer is not
+        // accumulating the whole file, and no single drain approaches it.
+        assert!(!drained.is_empty(), "expected batches drained before finish");
+        assert!(max_chunk < 128 * 1024, "drain chunk grew to {max_chunk} bytes");
+        drained.extend_from_slice(writer.finish().unwrap().as_slice());
+
+        let values = read_all(&drained);
+        assert_eq!(values.len(), n);
+        assert_eq!(
+            values[n - 1].get_record_field(b"value").unwrap().get_double().unwrap(),
+            (n - 1) as f64
+        );
     }
 
     #[test]
     fn reader_rejects_garbage() {
         assert!(DataFileReader::from_bytes(b"not an avro file").is_err());
         assert!(DataFileReader::from_bytes(b"").is_err());
+        // A stream fed garbage fails fast, before 4 full magic bytes worth
+        // of parsing state could matter.
+        let mut reader = DataFileReader::create();
+        reader.feed(b"XXXX").unwrap();
+        assert!(reader.next_ready().is_err());
     }
 
     #[test]
@@ -737,12 +1206,10 @@ mod tests {
 
         let mut record = AvroValue::create_record();
         record.record_put(b"a", &AvroValue::create_int(12)).unwrap();
-        let mut writer = DataFileWriter::create(&writer_schema, AvroCodec::Null).unwrap();
-        writer.append(&record).unwrap();
-        let bytes = writer.to_bytes().unwrap();
+        let bytes = write_file(&writer_schema, AvroCodec::Null, &[record]);
 
         let mut reader =
-            DataFileReader::from_bytes_with_schema(&reader_schema, bytes.as_slice()).unwrap();
+            DataFileReader::from_bytes_with_schema(&reader_schema, &bytes).unwrap();
         let value = reader.next_value().unwrap();
         assert_eq!(value.get_record_field(b"a").unwrap().get_long().unwrap(), 12);
         assert_eq!(
@@ -750,7 +1217,7 @@ mod tests {
             b"d"
         );
         // The writer schema reported by the file stays the original one.
-        assert!(reader.writer_schema().equals(&writer_schema));
+        assert!(reader.writer_schema().unwrap().equals(&writer_schema));
     }
 
     #[test]
@@ -760,10 +1227,9 @@ mod tests {
         let path_bytes = path.to_str().unwrap().as_bytes();
 
         let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
-        let mut writer = DataFileWriter::create(&schema, AvroCodec::Deflate).unwrap();
         let value = measurement("temp", 21.5);
-        writer.append(&value).unwrap();
-        writer.write_to_path(path_bytes).unwrap();
+        let bytes = write_file(&schema, AvroCodec::Deflate, &[value.clone()]);
+        std::fs::write(&path, &bytes).unwrap();
 
         let mut reader = DataFileReader::from_path(path_bytes).unwrap();
         assert!(reader.next_value().unwrap().equals(&value));
@@ -779,11 +1245,9 @@ mod tests {
     }
 
     #[test]
-    fn golden_container_file_decodes() {
-        // A minimal OCF written by apache-avro itself, pinned as a byte
-        // vector to guard against silent wire-format drift: header magic,
-        // schema {"type":"record","name":"G","fields":[{"name":"v","type":"long"}]},
-        // null codec, one record {v: 42}.
+    fn golden_container_file_layout() {
+        // A minimal OCF pinned against silent wire-format drift: header
+        // magic, one record {v: 42} under a null codec.
         let schema = AvroSchema::parse(
             br#"{"type": "record", "name": "G", "fields": [
                 {"name": "v", "type": "long"}]}"#,
@@ -791,234 +1255,340 @@ mod tests {
         .unwrap();
         let mut record = AvroValue::create_record();
         record.record_put(b"v", &AvroValue::create_long(42)).unwrap();
-        let mut writer = DataFileWriter::create(&schema, AvroCodec::Null).unwrap();
-        writer.append(&record).unwrap();
-        let bytes = writer.to_bytes().unwrap();
+        let bytes = write_file(&schema, AvroCodec::Null, &[record.clone()]);
 
         // Magic per the Avro 1.x specification.
-        assert_eq!(&bytes.as_slice()[..4], b"Obj\x01");
+        assert_eq!(&bytes[..4], b"Obj\x01");
         // The single record (long 42, zigzag encoded as 0x54) is the last
         // data byte before the trailing 16-byte sync marker.
         let payload_end = bytes.len() - 16;
-        assert_eq!(bytes.as_slice()[payload_end - 1], 0x54);
+        assert_eq!(bytes[payload_end - 1], 0x54);
+        assert!(read_all(&bytes)[0].equals(&record));
     }
 
-    // -- Streaming -----------------------------------------------------------
+    #[test]
+    fn empty_file_roundtrips() {
+        // create then finish with zero appends yields a valid header-only
+        // file that both our reader and upstream's accept.
+        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
+        let bytes = write_file(&schema, AvroCodec::Null, &[]);
 
-    /// Writes `values` through the streaming writer, draining after every
-    /// append, and returns the complete container file bytes.
-    fn stream_write(schema: &AvroSchema, codec: AvroCodec, values: &[AvroValue]) -> Vec<u8> {
-        let mut writer = StreamingDataFileWriter::create(schema, codec).unwrap();
-        let mut out = Vec::new();
-        for value in values {
-            writer.append(value).unwrap();
-            out.extend_from_slice(writer.take_bytes().unwrap().as_slice());
+        let mut reader = DataFileReader::from_bytes(&bytes).unwrap();
+        assert!(reader.writer_schema().unwrap().equals(&schema));
+        assert!(!reader.next_ready().unwrap());
+        assert!(reader.at_end());
+        assert!(reader.next_value().is_err());
+
+        let upstream = UpstreamReader::new(bytes.as_slice()).unwrap();
+        assert_eq!(upstream.count(), 0);
+    }
+
+    #[test]
+    fn next_value_before_data_is_benign() {
+        // "No value ready" is not fatal: feeding the rest of the file after
+        // the error must still work.
+        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
+        let value = measurement("a", 1.0);
+        let bytes = write_file(&schema, AvroCodec::Null, &[value.clone()]);
+
+        let mut reader = DataFileReader::create();
+        reader.feed(&bytes[..10]).unwrap();
+        let message = String::from_utf8(reader.next_value().unwrap_err().into_vec()).unwrap();
+        assert!(message.contains("No value ready"), "unexpected error: {message}");
+
+        reader.feed(&bytes[10..]).unwrap();
+        reader.close_input().unwrap();
+        assert!(reader.next_value().unwrap().equals(&value));
+        assert!(!reader.next_ready().unwrap());
+        assert!(reader.at_end());
+    }
+
+    #[test]
+    fn truncated_stream_errors_and_fuses() {
+        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
+        let bytes =
+            write_file(&schema, AvroCodec::Null, &[measurement("a", 1.0), measurement("b", 2.0)]);
+        let truncated = &bytes[..bytes.len() - 8];
+
+        let mut reader = DataFileReader::create();
+        reader.feed(truncated).unwrap();
+        reader.close_input().unwrap();
+        let mut errored = false;
+        for _ in 0..100 {
+            match reader.next_ready() {
+                Ok(true) => {
+                    if reader.next_value().is_err() {
+                        errored = true;
+                        break;
+                    }
+                }
+                Ok(false) => break,
+                Err(_) => {
+                    errored = true;
+                    break;
+                }
+            }
         }
-        out.extend_from_slice(writer.finish().unwrap().as_slice());
+        assert!(errored, "expected a truncation error");
+        // Fatal errors are sticky: every subsequent call fails, including
+        // feeding more data, and at_end never reports a clean end.
+        assert!(reader.next_ready().is_err());
+        assert!(reader.next_value().is_err());
+        assert!(reader.feed(b"more").is_err());
+        assert!(!reader.at_end());
+    }
+
+    #[test]
+    fn feed_after_close_fails() {
+        let mut reader = DataFileReader::create();
+        reader.close_input().unwrap();
+        // close_input is idempotent, feeding afterwards is not allowed.
+        reader.close_input().unwrap();
+        assert!(reader.feed(b"x").is_err());
+    }
+
+    #[test]
+    fn sync_marker_mismatch_is_fatal() {
+        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
+        let mut bytes = write_file(&schema, AvroCodec::Null, &[measurement("a", 1.0)]);
+        // The file ends with the block's 16-byte sync marker; corrupt it.
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+
+        let result = DataFileReader::from_bytes(&bytes);
+        let message = String::from_utf8(result.unwrap_err().into_vec()).unwrap();
+        assert!(message.contains("sync marker"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn unknown_codec_in_header_is_rejected() {
+        // Rewrite the header's codec name to an unsupported one of the same
+        // length, so the framing stays intact but the codec lookup fails.
+        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
+        let bytes = write_file(&schema, AvroCodec::Deflate, &[measurement("a", 1.0)]);
+        let needle = b"deflate";
+        let at = bytes
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("codec name not found in header");
+        let mut corrupted = bytes.clone();
+        corrupted[at..at + needle.len()].copy_from_slice(b"unknown");
+
+        let result = DataFileReader::from_bytes(&corrupted);
+        let message = String::from_utf8(result.unwrap_err().into_vec()).unwrap();
+        assert!(message.contains("Unsupported container codec"), "unexpected: {message}");
+    }
+
+    /// Returns the length of the file's header (everything up to and
+    /// including the header sync marker). The marker equals the file's
+    /// trailing 16 bytes.
+    fn header_len(bytes: &[u8]) -> usize {
+        let marker = &bytes[bytes.len() - 16..];
+        let at = bytes
+            .windows(16)
+            .position(|window| window == marker)
+            .expect("sync marker not found");
+        at + 16
+    }
+
+    fn zigzag(n: i64) -> Vec<u8> {
+        let mut z = ((n << 1) ^ (n >> 63)) as u64;
+        let mut out = Vec::new();
+        loop {
+            let byte = (z & 0x7f) as u8;
+            z >>= 7;
+            if z == 0 {
+                out.push(byte);
+                break;
+            }
+            out.push(byte | 0x80);
+        }
         out
     }
 
-    fn streaming_roundtrip_with_codec(codec: AvroCodec) {
+    #[test]
+    fn negative_block_count_is_fatal() {
         let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
-        let first = measurement("a", 1.5);
-        let second = measurement("b", -2.25);
-        let bytes = stream_write(&schema, codec, &[first.clone(), second.clone()]);
+        let bytes = write_file(&schema, AvroCodec::Null, &[measurement("a", 1.0)]);
+        let mut corrupted = bytes[..header_len(&bytes)].to_vec();
+        corrupted.extend_from_slice(&zigzag(-1));
 
-        let mut reader = StreamingDataFileReader::from_bytes(&bytes).unwrap();
-        assert!(reader.writer_schema().equals(&schema));
-        assert!(reader.has_next());
-        // has_next is idempotent: calling it again does not consume.
-        assert!(reader.has_next());
-        assert!(reader.next_value().unwrap().equals(&first));
-        assert!(reader.next_value().unwrap().equals(&second));
-        assert!(!reader.has_next());
+        let mut reader = DataFileReader::create();
+        reader.feed(&corrupted).unwrap();
+        let message = String::from_utf8(reader.next_ready().unwrap_err().into_vec()).unwrap();
+        assert!(message.contains("negative object count"), "unexpected: {message}");
+    }
+
+    #[test]
+    fn oversized_block_fails_fast_without_buffering() {
+        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
+        let bytes = write_file(&schema, AvroCodec::Null, &[measurement("a", 1.0)]);
+        // A block claiming to be 1 GiB must be rejected from its declared
+        // size alone; no payload bytes are ever fed.
+        let mut corrupted = bytes[..header_len(&bytes)].to_vec();
+        corrupted.extend_from_slice(&zigzag(1));
+        corrupted.extend_from_slice(&zigzag(1024 * 1024 * 1024));
+
+        let mut reader = DataFileReader::create();
+        reader.set_max_block_size(64 * 1024 * 1024).unwrap();
+        reader.feed(&corrupted).unwrap();
+        let message = String::from_utf8(reader.next_ready().unwrap_err().into_vec()).unwrap();
+        assert!(message.contains("exceeds the maximum"), "unexpected: {message}");
+    }
+
+    #[test]
+    fn oversized_header_length_fails_fast() {
+        // A metadata key claiming to be enormous is rejected from its
+        // declared length alone.
+        let mut crafted = b"Obj\x01".to_vec();
+        crafted.extend_from_slice(&zigzag(1)); // one metadata pair
+        crafted.extend_from_slice(&zigzag((MAX_HEADER_BYTES as i64) + 1)); // key length
+
+        let mut reader = DataFileReader::create();
+        reader.feed(&crafted).unwrap();
+        let message = String::from_utf8(reader.next_ready().unwrap_err().into_vec()).unwrap();
+        assert!(message.contains("header cap"), "unexpected: {message}");
+    }
+
+    #[test]
+    fn handmade_header_with_negative_map_count_parses() {
+        // The Avro map encoding allows a negative pair count followed by the
+        // group's byte size; upstream writers rarely emit it, so craft one.
+        let schema_json = br#""long""#;
+        let mut file = b"Obj\x01".to_vec();
+        let mut entries = Vec::new();
+        for (key, value) in
+            [(&b"avro.schema"[..], &schema_json[..]), (&b"avro.codec"[..], &b"null"[..])]
+        {
+            entries.extend_from_slice(&zigzag(key.len() as i64));
+            entries.extend_from_slice(key);
+            entries.extend_from_slice(&zigzag(value.len() as i64));
+            entries.extend_from_slice(value);
+        }
+        file.extend_from_slice(&zigzag(-2)); // two pairs, negative form
+        file.extend_from_slice(&zigzag(entries.len() as i64)); // group byte size
+        file.extend_from_slice(&entries);
+        file.extend_from_slice(&zigzag(0)); // end of map
+        let marker = [7u8; 16];
+        file.extend_from_slice(&marker);
+        // One block: one long value 42.
+        let datum = to_avro_datum(&Schema::Long, Value::Long(42)).unwrap();
+        file.extend_from_slice(&zigzag(1));
+        file.extend_from_slice(&zigzag(datum.len() as i64));
+        file.extend_from_slice(&datum);
+        file.extend_from_slice(&marker);
+
+        let mut reader = DataFileReader::from_bytes(&file).unwrap();
+        assert_eq!(reader.next_value().unwrap().get_long().unwrap(), 42);
+        assert!(!reader.next_ready().unwrap());
+        assert!(reader.at_end());
+    }
+
+    #[test]
+    fn run_of_zero_count_blocks_is_skipped() {
+        // A run of degenerate zero-count blocks (all parsed within a single
+        // next_ready call, exercising buffer compaction) must be skipped and
+        // the real values behind them still decode.
+        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
+        let value = measurement("after-zeros", 3.5);
+        let bytes = write_file(&schema, AvroCodec::Null, &[value.clone()]);
+        let split = header_len(&bytes);
+        let mut crafted = bytes[..split].to_vec();
+        let marker = &bytes[bytes.len() - 16..];
+        for _ in 0..1000 {
+            crafted.extend_from_slice(&zigzag(0)); // object count
+            crafted.extend_from_slice(&zigzag(0)); // block size
+            crafted.extend_from_slice(marker);
+        }
+        crafted.extend_from_slice(&bytes[split..]);
+
+        let values = read_all(&crafted);
+        assert_eq!(values.len(), 1);
+        assert!(values[0].equals(&value));
+    }
+
+    #[test]
+    fn chunked_header_with_many_metadata_pairs_parses_incrementally() {
+        // A header with many metadata pairs fed byte-by-byte exercises the
+        // resumable header parser: progress must be committed between feeds
+        // (a from-scratch reparse per feed would be quadratic) and the
+        // extracted schema/codec must still be correct.
+        let mut file = b"Obj\x01".to_vec();
+        let pairs: i64 = 500;
+        file.extend_from_slice(&zigzag(pairs + 2));
+        for i in 0..pairs {
+            let key = format!("user.meta.{i}");
+            file.extend_from_slice(&zigzag(key.len() as i64));
+            file.extend_from_slice(key.as_bytes());
+            file.extend_from_slice(&zigzag(4));
+            file.extend_from_slice(b"junk");
+        }
+        for (key, value) in
+            [(&b"avro.schema"[..], &br#""long""#[..]), (&b"avro.codec"[..], &b"null"[..])]
+        {
+            file.extend_from_slice(&zigzag(key.len() as i64));
+            file.extend_from_slice(key);
+            file.extend_from_slice(&zigzag(value.len() as i64));
+            file.extend_from_slice(value);
+        }
+        file.extend_from_slice(&zigzag(0));
+        let marker = [9u8; 16];
+        file.extend_from_slice(&marker);
+        let datum = to_avro_datum(&Schema::Long, Value::Long(7)).unwrap();
+        file.extend_from_slice(&zigzag(1));
+        file.extend_from_slice(&zigzag(datum.len() as i64));
+        file.extend_from_slice(&datum);
+        file.extend_from_slice(&marker);
+
+        let mut reader = DataFileReader::create();
+        let mut values = Vec::new();
+        for byte in &file {
+            reader.feed(std::slice::from_ref(byte)).unwrap();
+            while reader.next_ready().unwrap() {
+                values.push(reader.next_value().unwrap());
+            }
+        }
+        reader.close_input().unwrap();
+        assert!(!reader.next_ready().unwrap());
+        assert!(reader.at_end());
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].get_long().unwrap(), 7);
+    }
+
+    #[test]
+    fn moved_out_default_states_error() {
+        // Crubit replaces C++ moved-from objects with Default::default();
+        // both husks must error loudly instead of acting alive.
+        let mut reader = DataFileReader::default();
+        assert!(reader.feed(b"Obj\x01").is_err());
+        assert!(reader.next_ready().is_err());
         assert!(reader.next_value().is_err());
-    }
+        assert!(reader.has_failed());
+        assert!(!reader.at_end());
 
-    #[test]
-    fn streaming_roundtrip_null_codec() {
-        streaming_roundtrip_with_codec(AvroCodec::Null);
-    }
-
-    #[test]
-    fn streaming_roundtrip_deflate_codec() {
-        streaming_roundtrip_with_codec(AvroCodec::Deflate);
-    }
-
-    #[test]
-    fn streaming_roundtrip_snappy_codec() {
-        streaming_roundtrip_with_codec(AvroCodec::Snappy);
-    }
-
-    #[test]
-    fn streaming_roundtrip_zstandard_codec() {
-        streaming_roundtrip_with_codec(AvroCodec::Zstandard);
-    }
-
-    #[test]
-    fn streaming_take_bytes_emits_full_blocks_before_finish() {
-        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
-        let mut writer = StreamingDataFileWriter::create(&schema, AvroCodec::Null).unwrap();
-        let n = 4000;
-        let mut drained = Vec::new();
-        for i in 0..n {
-            writer.append(&measurement("sensor", i as f64)).unwrap();
-            drained.extend_from_slice(writer.take_bytes().unwrap().as_slice());
-        }
-        // Full blocks were flushed and drained before finish (the writer is
-        // not accumulating every value).
-        assert!(!drained.is_empty(), "expected full blocks drained before finish");
-        drained.extend_from_slice(writer.finish().unwrap().as_slice());
-
-        let mut reader = StreamingDataFileReader::from_bytes(&drained).unwrap();
-        let mut count = 0;
-        while reader.has_next() {
-            let value = reader.next_value().unwrap();
-            assert_eq!(
-                value.get_record_field(b"value").unwrap().get_double().unwrap(),
-                count as f64
-            );
-            count += 1;
-        }
-        assert_eq!(count, n);
-    }
-
-    #[test]
-    fn streaming_finish_consumes_writer() {
-        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
-        let mut writer = StreamingDataFileWriter::create(&schema, AvroCodec::Null).unwrap();
-        writer.append(&measurement("x", 1.0)).unwrap();
-        assert!(!writer.is_finished());
-        let _ = writer.finish().unwrap();
+        let mut writer = DataFileWriter::default();
         assert!(writer.is_finished());
-        // Every method errors after finish.
-        assert!(writer.append(&measurement("y", 2.0)).is_err());
+        assert!(writer.append(&AvroValue::create_long(1)).is_err());
         assert!(writer.take_bytes().is_err());
         assert!(writer.finish().is_err());
-        assert!(writer.schema().is_err());
     }
 
     #[test]
-    fn streaming_append_rejects_invalid_value() {
-        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
-        let mut writer = StreamingDataFileWriter::create(&schema, AvroCodec::Null).unwrap();
-        assert!(writer.append(&AvroValue::create_long(1)).is_err());
-    }
-
-    #[test]
-    fn streaming_create_with_unresolved_refs_fails() {
-        let schemas = cross_referencing_schemas();
-        let person_schema = &schemas[1];
-        let result = StreamingDataFileWriter::create(person_schema, AvroCodec::Null);
-        let message = String::from_utf8(result.unwrap_err().into_vec()).unwrap();
-        assert!(message.contains("not self-contained"));
-    }
-
-    #[test]
-    fn streaming_reader_rejects_garbage() {
-        assert!(StreamingDataFileReader::from_bytes(b"not an avro file").is_err());
-        assert!(StreamingDataFileReader::from_bytes(b"").is_err());
-    }
-
-    #[test]
-    fn streaming_reader_resolves_to_reader_schema() {
-        let writer_schema = AvroSchema::parse(
-            br#"{"type": "record", "name": "R", "fields": [
-                {"name": "a", "type": "int"}]}"#,
-        )
-        .unwrap();
-        let reader_schema = AvroSchema::parse(
-            br#"{"type": "record", "name": "R", "fields": [
-                {"name": "a", "type": "long"},
-                {"name": "b", "type": "string", "default": "d"}]}"#,
-        )
-        .unwrap();
-
-        let mut record = AvroValue::create_record();
-        record.record_put(b"a", &AvroValue::create_int(7)).unwrap();
-        let bytes = stream_write(&writer_schema, AvroCodec::Null, &[record]);
-
-        let mut reader =
-            StreamingDataFileReader::from_bytes_with_schema(&reader_schema, &bytes).unwrap();
-        let value = reader.next_value().unwrap();
-        assert_eq!(value.get_record_field(b"a").unwrap().get_long().unwrap(), 7);
-        assert_eq!(
-            value.get_record_field(b"b").unwrap().get_string().unwrap().as_slice(),
-            b"d"
-        );
-        // The reported writer schema stays the original one.
-        assert!(reader.writer_schema().equals(&writer_schema));
-    }
-
-    #[test]
-    fn streaming_empty_file_roundtrips() {
-        // create then finish with zero appends yields a valid header-only OCF.
-        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
-        let bytes = stream_write(&schema, AvroCodec::Null, &[]);
-
-        let mut reader = StreamingDataFileReader::from_bytes(&bytes).unwrap();
-        assert!(reader.writer_schema().equals(&schema));
-        assert!(!reader.has_next());
-        assert!(reader.next_value().is_err());
-        // The buffered reader accepts the same empty file.
-        assert_eq!(DataFileReader::from_bytes(&bytes).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn streaming_reader_surfaces_decode_error_once_then_fuses() {
-        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
-        let bytes =
-            stream_write(&schema, AvroCodec::Null, &[measurement("a", 1.0), measurement("b", 2.0)]);
-        // Truncate into the trailing block so the header still parses (the
-        // reader constructs) but decoding the block fails mid-stream.
-        let truncated = &bytes[..bytes.len() - 8];
-        let mut reader = StreamingDataFileReader::from_bytes(truncated).unwrap();
-
-        let mut errored = false;
-        for _ in 0..100 {
-            if !reader.has_next() {
-                break;
-            }
-            if reader.next_value().is_err() {
-                errored = true;
-                break;
-            }
-        }
-        assert!(errored, "expected a mid-stream decode error");
-        // After the error the reader is fused: no more values, no panic, no
-        // double-surfacing of the error.
-        assert!(!reader.has_next());
-        assert!(reader.next_value().is_err());
-    }
-
-    #[test]
-    fn streaming_output_decodes_with_buffered_reader() {
-        // The streaming writer produces a valid OCF the buffered reader reads.
-        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
-        let first = measurement("a", 1.5);
-        let second = measurement("b", -2.25);
-        let bytes = stream_write(&schema, AvroCodec::Deflate, &[first.clone(), second.clone()]);
-
-        let mut reader = DataFileReader::from_bytes(&bytes).unwrap();
-        assert_eq!(reader.count(), 2);
-        assert!(reader.next_value().unwrap().equals(&first));
-        assert!(reader.next_value().unwrap().equals(&second));
-    }
-
-    #[test]
-    fn buffered_output_decodes_with_streaming_reader() {
-        // ...and the streaming reader reads a file the buffered writer wrote.
-        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
-        let first = measurement("a", 1.5);
-        let second = measurement("b", -2.25);
-        let mut writer = DataFileWriter::create(&schema, AvroCodec::Snappy).unwrap();
-        writer.append(&first).unwrap();
-        writer.append(&second).unwrap();
-        let bytes = writer.to_bytes().unwrap();
-
-        let mut reader = StreamingDataFileReader::from_bytes(bytes.as_slice()).unwrap();
-        assert!(reader.next_value().unwrap().equals(&first));
-        assert!(reader.next_value().unwrap().equals(&second));
-        assert!(!reader.has_next());
+    fn varint_hardening() {
+        // Longer than 10 bytes.
+        let mut pos = 0;
+        let eleven = [0x80u8; 11];
+        assert!(parse_long(&eleven, &mut pos).is_err());
+        // 10th byte carrying more than the final bit.
+        let mut pos = 0;
+        let overflow = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7f];
+        assert!(parse_long(&overflow, &mut pos).is_err());
+        // A valid maximal varint decodes.
+        let mut pos = 0;
+        let max = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        assert_eq!(parse_long(&max, &mut pos).unwrap(), Some(i64::MIN));
+        // Incomplete input reports NeedMore, not corruption.
+        let mut pos = 0;
+        assert_eq!(parse_long(&[0x80], &mut pos).unwrap(), None);
     }
 }

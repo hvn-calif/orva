@@ -20,8 +20,6 @@ namespace security::avro {
 class AvroValue;
 class DataFileWriter;
 class DataFileReader;
-class StreamingDataFileWriter;
-class StreamingDataFileReader;
 
 // Compression codec for object container files. The set deliberately
 // matches avrocpp (null/deflate/snappy/zstd); bzip2 and xz are excluded.
@@ -96,8 +94,6 @@ class AvroSchema final {
   friend class AvroValue;
   friend class DataFileWriter;
   friend class DataFileReader;
-  friend class StreamingDataFileWriter;
-  friend class StreamingDataFileReader;
   friend absl::StatusOr<std::string> EncodeDatum(const AvroSchema& schema,
                                                  const AvroValue& value);
   friend absl::StatusOr<std::string> EncodeDatumSchemata(
@@ -255,8 +251,6 @@ class AvroValue final {
  private:
   friend class DataFileWriter;
   friend class DataFileReader;
-  friend class StreamingDataFileWriter;
-  friend class StreamingDataFileReader;
   friend absl::StatusOr<std::string> EncodeDatum(const AvroSchema& schema,
                                                  const AvroValue& value);
   friend absl::StatusOr<std::string> EncodeDatumSchemata(
@@ -300,11 +294,24 @@ absl::StatusOr<AvroValue> DecodeDatumSchemata(
 // decompression of compressed container codecs (see DataFileReader).
 size_t SetMaxAllocationBytes(size_t num_bytes);
 
-// Writes Avro object container files. Replaces avrocpp's
-// DataFileWriter<GenericDatum>. Values are validated and buffered by
-// Append; the encoded file is produced by ToBytes or WriteToPath.
+// Streaming Avro object container file writer. Replaces avrocpp's
+// DataFileWriter<GenericDatum>.
+//
+// Append validates and buffers values; every 1024 values the batch is
+// encoded into ~16 KiB container blocks. Drain the encoded bytes
+// incrementally with TakeBytes and complete the file with Finish (which
+// encodes any remaining values and consumes the writer). The concatenation
+// of every TakeBytes result followed by the Finish result is a complete,
+// valid container file. Peak memory is one batch, never the whole file.
+//
+// Small-file usage: Append everything, then Finish once for all the bytes.
 class DataFileWriter final {
  public:
+  DataFileWriter(DataFileWriter&&) noexcept = default;
+  DataFileWriter& operator=(DataFileWriter&&) noexcept = default;
+  DataFileWriter(const DataFileWriter&) = delete;
+  DataFileWriter& operator=(const DataFileWriter&) = delete;
+
   // Creates a writer for a self-contained schema. Fails for schemas that
   // reference named types defined in other schemas (as returned by
   // ParseList): container file headers embed only the writer schema, so
@@ -317,34 +324,73 @@ class DataFileWriter final {
   // Returns the schema this writer was created with.
   AvroSchema Schema() const;
 
-  // Validates `value` against the writer schema and buffers it.
+  // Validates `value` against the writer schema and buffers it; a full
+  // batch is encoded into container blocks. A rejected value leaves the
+  // writer usable; an encoding failure tears the stream and consumes the
+  // writer. Fails after Finish.
   absl::Status Append(const AvroValue& value);
 
-  // Returns the number of buffered values.
-  size_t Count() const;
+  // Drains the encoded bytes produced so far (header plus completed blocks)
+  // without forcing a partial block, so may return "". Fails after Finish.
+  absl::StatusOr<std::string> TakeBytes();
 
-  // Encodes all buffered values into a complete container file.
-  absl::StatusOr<std::string> ToBytes() const;
+  // Encodes any remaining buffered values, returns all undrained bytes, and
+  // consumes the writer. Further calls fail. With no appended values the
+  // result is a valid header-only file.
+  absl::StatusOr<std::string> Finish();
 
-  // Encodes all buffered values and writes the container file to `path`.
-  absl::Status WriteToPath(absl::string_view path) const;
+  // Convenience for whole files: Finish() and stream the result to `path`.
+  // Fails with kFailedPrecondition if TakeBytes ever returned bytes (the
+  // file on disk would silently be missing them; concatenate the taken
+  // bytes with Finish() yourself instead). Consumes the writer on success.
+  absl::Status FinishToPath(absl::string_view path);
+
+  // True once Finish has consumed the writer (or a failed flush tore the
+  // stream).
+  bool IsFinished() const;
 
  private:
   explicit DataFileWriter(rust::container::DataFileWriter writer);
 
   rust::container::DataFileWriter writer_;
+  // True once TakeBytes has drained bytes the file cannot be complete
+  // without; guards FinishToPath against writing a truncated file.
+  bool bytes_taken_ = false;
 };
 
-// Reads Avro object container files. Replaces avrocpp's
-// DataFileReader<GenericDatum>. The whole file is decoded eagerly at
-// construction; values are consumed with HasNext / NextValue.
+// Streaming Avro object container file reader (push parser). Replaces
+// avrocpp's DataFileReader<GenericDatum>.
+//
+// Feed input bytes as they arrive with Feed (chunk boundaries are
+// arbitrary; mid-token splits are fine), declare end of input with
+// CloseInput, and drain decoded values with NextReady/NextValue. The
+// FromBytes/FromPath constructors are conveniences that feed a complete
+// file at once. Peak memory is one container block plus one decoded value;
+// the whole file is never required in memory.
+//
+// Any framing or decode error is fatal and fuses the reader (every later
+// call returns the same error), so a torn stream can never silently
+// truncate. There is no Count or Rewind: a stream's length is unknown until
+// consumed, and a consumed stream cannot be rewound.
 class DataFileReader final {
  public:
-  // Opens a container file from a byte buffer; the writer schema is read
-  // from the file header.
-  static absl::StatusOr<DataFileReader> FromBytes(absl::string_view data);
+  DataFileReader(DataFileReader&&) noexcept = default;
+  DataFileReader& operator=(DataFileReader&&) noexcept = default;
+  DataFileReader(const DataFileReader&) = delete;
+  DataFileReader& operator=(const DataFileReader&) = delete;
 
-  // Opens a container file and resolves every value to `reader_schema`.
+  // Creates an empty reader; the writer schema is read from the stream
+  // header once enough bytes have been fed.
+  static DataFileReader Create();
+
+  // As Create, but additionally resolves every value to `reader_schema`
+  // (schema evolution).
+  static DataFileReader CreateWithReaderSchema(const AvroSchema& reader_schema);
+
+  // Conveniences over a complete in-memory file: feed everything, close the
+  // input, and fail eagerly on garbage or a file truncated in the header or
+  // first block.
+  static absl::StatusOr<DataFileReader> FromBytes(absl::string_view data);
   static absl::StatusOr<DataFileReader> FromBytesWithSchema(
       const AvroSchema& reader_schema, absl::string_view data);
 
@@ -353,16 +399,45 @@ class DataFileReader final {
   static absl::StatusOr<DataFileReader> FromPathWithSchema(
       const AvroSchema& reader_schema, absl::string_view path);
 
-  // Returns the schema the file was written with.
-  AvroSchema WriterSchema() const;
+  // Appends input bytes. Fails after CloseInput or a fatal error.
+  absl::Status Feed(absl::string_view data);
 
-  // Returns the total number of values in the file.
-  size_t Count() const;
+  // Declares end of input: data ending mid-header or mid-block then
+  // surfaces as an error from NextReady/NextValue instead of waiting for
+  // more bytes forever. Idempotent.
+  absl::Status CloseInput();
 
-  // Iteration. NextValue fails with kOutOfRange after the last value.
-  bool HasNext() const;
+  // Drives the parser as far as the fed bytes allow. Returns true iff
+  // NextValue would return a value right now; false means more input is
+  // needed or the file ended cleanly (disambiguate with AtEnd).
+  absl::StatusOr<bool> NextReady();
+
+  // Returns the next decoded value. Fails with kOutOfRange when no value is
+  // ready (benign: more input may arrive, or the file ended cleanly) and
+  // with kInvalidArgument for fatal framing/decode errors, which fuse the
+  // reader (see HasFailed).
   absl::StatusOr<AvroValue> NextValue();
-  void Rewind();
+
+  // True once the file ended cleanly: header parsed, input closed and fully
+  // consumed, all values drained, no error. Reflects parse progress as of
+  // the last NextReady/NextValue call.
+  bool AtEnd() const;
+
+  // True once a fatal error has fused the reader: every subsequent call
+  // fails with the same error, and AtEnd never reports a clean end.
+  bool HasFailed() const;
+
+  // True once the header has been parsed and WriterSchema is available.
+  bool HeaderReady() const;
+
+  // The schema the file was written with. Fails until enough input has been
+  // fed and parsed (drive with NextReady).
+  absl::StatusOr<AvroSchema> WriterSchema() const;
+
+  // Adjusts the cap on a block's declared compressed size (default 128 MiB).
+  // Applies to blocks parsed after the call. Note: this bounds the
+  // compressed size only; see the codec decompression caveat on Codec.
+  absl::Status SetMaxBlockSize(uint64_t bytes);
 
  private:
   explicit DataFileReader(rust::container::DataFileReader reader);
@@ -370,85 +445,146 @@ class DataFileReader final {
   rust::container::DataFileReader reader_;
 };
 
-// Streaming object container file writer. Unlike DataFileWriter, values are
-// not all buffered: Append encodes into a ~16 KB block buffer that
-// auto-flushes full blocks into an internal buffer. Drain the encoded bytes
-// incrementally with TakeBytes (full blocks only) and finish with Finish
-// (flushes the final partial block). The concatenation of every TakeBytes
-// result followed by the Finish result is a complete, valid container file.
-// Use this to bound peak memory when writing large files; use DataFileWriter
-// when you want the whole file from one ToBytes call.
-class StreamingDataFileWriter final {
+// Injectable chunked input source for DataFileStreamReader. Mirrors the
+// shape of google::protobuf::io::ZeroCopyInputStream so existing
+// implementations adapt via StreamAdapter, without this binding depending
+// on protobuf. Chunks may be discontiguous memory of any size (gRPC buffer
+// chains, absl::Cord fragments); nothing is flattened at the boundary.
+//
+// Example implementation over an absl::Cord (until a dedicated adapter
+// ships in this binding):
+//
+//   class CordStream final : public security::avro::ZeroCopyInputStream {
+//    public:
+//     explicit CordStream(const absl::Cord& cord)
+//         : chunk_(cord.chunk_begin()), end_(cord.chunk_end()) {}
+//     bool Next(const void** data, int* size) override {
+//       if (chunk_ == end_) return false;
+//       *data = chunk_->data();
+//       *size = static_cast<int>(chunk_->size());
+//       byte_count_ += chunk_->size();
+//       ++chunk_;
+//       return true;
+//     }
+//     void BackUp(int count) override {}  // never called by the reader
+//     int64_t ByteCount() const override { return byte_count_; }
+//    private:
+//     absl::Cord::ChunkIterator chunk_, end_;
+//     int64_t byte_count_ = 0;
+//   };
+class ZeroCopyInputStream {
  public:
-  StreamingDataFileWriter(StreamingDataFileWriter&&) noexcept = default;
-  StreamingDataFileWriter& operator=(StreamingDataFileWriter&&) noexcept =
-      default;
-  StreamingDataFileWriter(const StreamingDataFileWriter&) = delete;
-  StreamingDataFileWriter& operator=(const StreamingDataFileWriter&) = delete;
+  virtual ~ZeroCopyInputStream() = default;
 
-  static absl::StatusOr<StreamingDataFileWriter> Create(const AvroSchema& schema,
-                                                        Codec codec);
+  // Yields the next chunk, or returns false at end of stream. The chunk
+  // must stay valid until the next call on this stream. Returning true
+  // with a zero-size chunk is allowed and skipped, but an unbounded run of
+  // them is treated as a stream protocol violation and fails the read
+  // (this bounds the reader against livelocking on a stuck stream).
+  virtual bool Next(const void** data, int* size) = 0;
 
-  // The schema the writer was created with. Fails after Finish.
-  absl::StatusOr<AvroSchema> Schema() const;
+  // Returns the trailing `count` bytes of the last Next() chunk to the
+  // stream. Present for protobuf shape parity only: an Avro container file
+  // has no in-band end marker, so it always extends to the end of the
+  // stream and DataFileStreamReader consumes every chunk whole, never
+  // calling BackUp.
+  virtual void BackUp(int count) = 0;
 
-  // Validates and encodes `value`; may auto-flush a full block internally.
-  // Fails after Finish.
-  absl::Status Append(const AvroValue& value);
-
-  // Returns the bytes already flushed to the internal buffer (header plus any
-  // full blocks), draining them. Does not force a partial flush, so may
-  // return "". Fails after Finish.
-  absl::StatusOr<std::string> TakeBytes();
-
-  // Flushes any pending block, returns the remaining bytes, and consumes the
-  // writer. Further calls fail. (With no buffered values the result is just
-  // the header plus whatever was already flushed.)
-  absl::StatusOr<std::string> Finish();
-
-  // True once Finish has consumed the writer.
-  bool IsFinished() const;
-
- private:
-  explicit StreamingDataFileWriter(rust::container::StreamingDataFileWriter writer);
-
-  rust::container::StreamingDataFileWriter writer_;
+  // Total bytes yielded so far.
+  virtual int64_t ByteCount() const = 0;
 };
 
-// Streaming object container file reader. Unlike DataFileReader, this decodes
-// one value per NextValue instead of decoding the whole file up front. Use it
-// to bound peak memory when reading large files. There is no Count (unknown
-// without consuming the file) and no Rewind (a consumed stream cannot be
-// rewound); use DataFileReader if you need either.
-class StreamingDataFileReader final {
+// Header-only adapter for any type with the same Next/BackUp/ByteCount
+// shape, e.g. google::protobuf::io::ZeroCopyInputStream itself. Instantiate
+// it in user code where the wrapped type is available; the binding takes no
+// dependency on that type. The wrapped stream is borrowed, not owned.
+template <typename S>
+class StreamAdapter final : public ZeroCopyInputStream {
  public:
-  StreamingDataFileReader(StreamingDataFileReader&&) noexcept = default;
-  StreamingDataFileReader& operator=(StreamingDataFileReader&&) noexcept =
-      default;
-  StreamingDataFileReader(const StreamingDataFileReader&) = delete;
-  StreamingDataFileReader& operator=(const StreamingDataFileReader&) = delete;
-
-  static absl::StatusOr<StreamingDataFileReader> FromBytes(
-      absl::string_view data);
-  static absl::StatusOr<StreamingDataFileReader> FromBytesWithSchema(
-      const AvroSchema& reader_schema, absl::string_view data);
-  static absl::StatusOr<StreamingDataFileReader> FromPath(
-      absl::string_view path);
-  static absl::StatusOr<StreamingDataFileReader> FromPathWithSchema(
-      const AvroSchema& reader_schema, absl::string_view path);
-
-  // The schema the file was written with.
-  AvroSchema WriterSchema() const;
-
-  // HasNext is non-const: it fills a single-value lookahead buffer.
-  bool HasNext();
-  // NextValue fails with kOutOfRange after the last value.
-  absl::StatusOr<AvroValue> NextValue();
+  explicit StreamAdapter(S* stream) : stream_(stream) {}
+  bool Next(const void** data, int* size) override {
+    return stream_->Next(data, size);
+  }
+  void BackUp(int count) override { stream_->BackUp(count); }
+  int64_t ByteCount() const override { return stream_->ByteCount(); }
 
  private:
-  explicit StreamingDataFileReader(rust::container::StreamingDataFileReader reader);
+  S* stream_;
+};
 
-  rust::container::StreamingDataFileReader reader_;
+// Pull-style reader that decodes one Avro object container file arriving
+// through a ZeroCopyInputStream (e.g. gRPC streaming responses). A thin
+// driver over the push DataFileReader: HasNext/NextValue pull chunks from
+// the stream exactly as needed, so peak memory stays one block plus one
+// value regardless of file size, and call sites never touch
+// Feed/NextReady/CloseInput.
+//
+// Blocking: HasNext/NextValue block whenever the stream's Next() blocks
+// (e.g. a synchronous gRPC read). Callers that must not block a thread
+// should drive the push DataFileReader directly instead.
+//
+// The stream is borrowed and must outlive the reader. End of stream defines
+// end of file (the container format has no in-band end marker), so the
+// stream must contain exactly one container file; bound it externally if
+// the transport carries trailing data.
+class DataFileStreamReader final {
+ public:
+  DataFileStreamReader(DataFileStreamReader&&) noexcept = default;
+  DataFileStreamReader& operator=(DataFileStreamReader&&) noexcept = default;
+  DataFileStreamReader(const DataFileStreamReader&) = delete;
+  DataFileStreamReader& operator=(const DataFileStreamReader&) = delete;
+
+  // Creates a reader over `stream`, pulling chunks until the header is
+  // parsed, so garbage and schema errors surface here rather than on the
+  // first value. Data truncated after the header surfaces on the first
+  // HasNext/NextValue.
+  static absl::StatusOr<DataFileStreamReader> Create(
+      ZeroCopyInputStream* stream);
+
+  // As Create, but additionally resolves every value to `reader_schema`
+  // (schema evolution).
+  static absl::StatusOr<DataFileStreamReader> CreateWithReaderSchema(
+      const AvroSchema& reader_schema, ZeroCopyInputStream* stream);
+
+  // True if another value is available, pulling stream chunks as needed;
+  // false at the clean end of the file. Framing/decode errors are fatal and
+  // fuse the reader, like the push DataFileReader's.
+  absl::StatusOr<bool> HasNext();
+
+  // Returns the next decoded value, pulling stream chunks as needed. Fails
+  // with kOutOfRange at the clean end of the file and kInvalidArgument for
+  // fatal framing/decode errors.
+  absl::StatusOr<AvroValue> NextValue();
+
+  // The schema the file was written with (parsed during Create).
+  absl::StatusOr<AvroSchema> WriterSchema() const;
+
+  // See DataFileReader::SetMaxBlockSize. Call right after Create to apply
+  // from the first block onward; Create stops pulling once the header is
+  // parsed, but any block framing that arrived in the same chunks as the
+  // header has already been parsed under the default cap. Callers needing
+  // a strict cap on every block should drive the push DataFileReader
+  // (whose Create parses nothing) directly.
+  absl::Status SetMaxBlockSize(uint64_t bytes);
+
+ private:
+  DataFileStreamReader(DataFileReader reader, ZeroCopyInputStream* stream);
+
+  static absl::StatusOr<DataFileStreamReader> Build(
+      DataFileReader reader, ZeroCopyInputStream* stream);
+
+  // How far PumpUntil drives the parser: to a parsed header (Create) or to
+  // a decodable value / clean end (everything else).
+  enum PumpGoal { kHeaderReady, kValueReady };
+
+  // Pulls chunks and drives the parser until the goal is reached, the file
+  // ends cleanly, or an error occurs.
+  absl::Status PumpUntil(PumpGoal goal);
+  absl::Status Pump();
+
+  DataFileReader reader_;
+  ZeroCopyInputStream* stream_;
+  bool stream_done_ = false;
 };
 
 }  // namespace security::avro

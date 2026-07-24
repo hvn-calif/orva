@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <fstream>
 #include <utility>
 #include <vector>
 
@@ -655,9 +656,9 @@ absl::StatusOr<DataFileWriter> DataFileWriter::Create(const AvroSchema& schema,
   if (!rust_codec.has_value()) {
     return absl::InvalidArgumentError(FromVecU8(std::move(rust_codec).err()));
   }
-  rs_std::Result<rust::container::DataFileWriter, rust::vec_u8::VecU8>
-      result = rust::container::DataFileWriter::create(
-          schema.schema_, std::move(rust_codec).value());
+  rs_std::Result<rust::container::DataFileWriter, rust::vec_u8::VecU8> result =
+      rust::container::DataFileWriter::create(schema.schema_,
+                                              std::move(rust_codec).value());
   if (!result.has_value()) {
     return absl::InvalidArgumentError(FromVecU8(std::move(result).err()));
   }
@@ -672,16 +673,47 @@ absl::Status DataFileWriter::Append(const AvroValue& value) {
   return ToStatus(writer_.append(value.value_), kBadInput);
 }
 
-size_t DataFileWriter::Count() const { return writer_.count(); }
-
-absl::StatusOr<std::string> DataFileWriter::ToBytes() const {
-  return UnwrapString(writer_.to_bytes(), absl::StatusCode::kInternal);
+absl::StatusOr<std::string> DataFileWriter::TakeBytes() {
+  absl::StatusOr<std::string> bytes =
+      UnwrapString(writer_.take_bytes(), absl::StatusCode::kInternal);
+  if (bytes.ok() && !bytes->empty()) {
+    bytes_taken_ = true;
+  }
+  return bytes;
 }
 
-absl::Status DataFileWriter::WriteToPath(absl::string_view path) const {
-  return ToStatus(writer_.write_to_path(ToByteSpan(path)),
-                  absl::StatusCode::kInternal);
+absl::StatusOr<std::string> DataFileWriter::Finish() {
+  return UnwrapString(writer_.finish(), absl::StatusCode::kInternal);
 }
+
+absl::Status DataFileWriter::FinishToPath(absl::string_view path) {
+  if (bytes_taken_) {
+    // Finish() only returns the undrained remainder; writing it alone would
+    // silently produce a file missing the bytes TakeBytes already handed
+    // out. Keep the writer usable so the caller can still Finish().
+    return absl::FailedPreconditionError(
+        "FinishToPath after TakeBytes would write an incomplete file; "
+        "concatenate the taken bytes with Finish() instead");
+  }
+  absl::StatusOr<std::string> bytes = Finish();
+  if (!bytes.ok()) {
+    return bytes.status();
+  }
+  std::ofstream file(std::string(path),
+                     std::ios::binary | std::ios::trunc);
+  if (!file) {
+    return absl::InternalError("Cannot open file for writing: " +
+                               std::string(path));
+  }
+  file.write(bytes->data(), static_cast<std::streamsize>(bytes->size()));
+  file.close();  // close() flushes and sets failbit on error
+  if (file.fail()) {
+    return absl::InternalError("Failed writing file: " + std::string(path));
+  }
+  return absl::OkStatus();
+}
+
+bool DataFileWriter::IsFinished() const { return writer_.is_finished(); }
 
 // ---------------------------------------------------------------------------
 // DataFileReader
@@ -689,6 +721,17 @@ absl::Status DataFileWriter::WriteToPath(absl::string_view path) const {
 
 DataFileReader::DataFileReader(rust::container::DataFileReader reader)
     : reader_(std::move(reader)) {}
+
+DataFileReader DataFileReader::Create() {
+  return DataFileReader(rust::container::DataFileReader::create());
+}
+
+DataFileReader DataFileReader::CreateWithReaderSchema(
+    const AvroSchema& reader_schema) {
+  return DataFileReader(
+      rust::container::DataFileReader::with_reader_schema(
+          reader_schema.schema_));
+}
 
 absl::StatusOr<DataFileReader> DataFileReader::FromBytes(
     absl::string_view data) {
@@ -732,141 +775,166 @@ absl::StatusOr<DataFileReader> DataFileReader::FromPathWithSchema(
   return DataFileReader(std::move(result).value());
 }
 
-AvroSchema DataFileReader::WriterSchema() const {
-  return AvroSchema(reader_.writer_schema());
+absl::Status DataFileReader::Feed(absl::string_view data) {
+  return ToStatus(reader_.feed(ToByteSpan(data)), kBadInput);
 }
 
-size_t DataFileReader::Count() const { return reader_.count(); }
+absl::Status DataFileReader::CloseInput() {
+  return ToStatus(reader_.close_input(), kBadInput);
+}
 
-bool DataFileReader::HasNext() const { return reader_.has_next(); }
+absl::StatusOr<bool> DataFileReader::NextReady() {
+  return Unwrap(reader_.next_ready(), kBadInput);
+}
 
 absl::StatusOr<AvroValue> DataFileReader::NextValue() {
   rs_std::Result<rust::value::AvroValue, rust::vec_u8::VecU8> result =
       reader_.next_value();
   if (!result.has_value()) {
-    return absl::OutOfRangeError(FromVecU8(std::move(result).err()));
+    // A fused (fatal) error gets the same code NextReady reports, so
+    // callers driving the reader through NextValue alone can distinguish
+    // "benign, feed more / clean end" (kOutOfRange) from "stream is
+    // fatally corrupt" (kInvalidArgument).
+    const absl::StatusCode code = reader_.has_failed()
+                                      ? absl::StatusCode::kInvalidArgument
+                                      : absl::StatusCode::kOutOfRange;
+    return absl::Status(code, FromVecU8(std::move(result).err()));
   }
   return AvroValue(std::move(result).value());
 }
 
-void DataFileReader::Rewind() { reader_.rewind(); }
+bool DataFileReader::AtEnd() const { return reader_.at_end(); }
 
-// ---------------------------------------------------------------------------
-// StreamingDataFileWriter
-// ---------------------------------------------------------------------------
+bool DataFileReader::HasFailed() const { return reader_.has_failed(); }
 
-StreamingDataFileWriter::StreamingDataFileWriter(
-    rust::container::StreamingDataFileWriter writer)
-    : writer_(std::move(writer)) {}
+bool DataFileReader::HeaderReady() const { return reader_.header_ready(); }
 
-absl::StatusOr<StreamingDataFileWriter> StreamingDataFileWriter::Create(
-    const AvroSchema& schema, Codec codec) {
-  rs_std::Result<rust::container::AvroCodec, rust::vec_u8::VecU8> rust_codec =
-      rust::container::AvroCodec::from_i32(static_cast<int32_t>(codec));
-  if (!rust_codec.has_value()) {
-    return absl::InvalidArgumentError(FromVecU8(std::move(rust_codec).err()));
-  }
-  rs_std::Result<rust::container::StreamingDataFileWriter, rust::vec_u8::VecU8>
-      result = rust::container::StreamingDataFileWriter::create(
-          schema.schema_, std::move(rust_codec).value());
-  if (!result.has_value()) {
-    return absl::InvalidArgumentError(FromVecU8(std::move(result).err()));
-  }
-  return StreamingDataFileWriter(std::move(result).value());
-}
-
-absl::StatusOr<AvroSchema> StreamingDataFileWriter::Schema() const {
+absl::StatusOr<AvroSchema> DataFileReader::WriterSchema() const {
   rs_std::Result<rust::schema::AvroSchema, rust::vec_u8::VecU8> result =
-      writer_.schema();
+      reader_.writer_schema();
   if (!result.has_value()) {
     return absl::FailedPreconditionError(FromVecU8(std::move(result).err()));
   }
   return AvroSchema(std::move(result).value());
 }
 
-absl::Status StreamingDataFileWriter::Append(const AvroValue& value) {
-  return ToStatus(writer_.append(value.value_), kBadInput);
-}
-
-absl::StatusOr<std::string> StreamingDataFileWriter::TakeBytes() {
-  return UnwrapString(writer_.take_bytes(), absl::StatusCode::kInternal);
-}
-
-absl::StatusOr<std::string> StreamingDataFileWriter::Finish() {
-  return UnwrapString(writer_.finish(), absl::StatusCode::kInternal);
-}
-
-bool StreamingDataFileWriter::IsFinished() const {
-  return writer_.is_finished();
+absl::Status DataFileReader::SetMaxBlockSize(uint64_t bytes) {
+  return ToStatus(reader_.set_max_block_size(bytes), kBadInput);
 }
 
 // ---------------------------------------------------------------------------
-// StreamingDataFileReader
+// DataFileStreamReader
 // ---------------------------------------------------------------------------
 
-StreamingDataFileReader::StreamingDataFileReader(
-    rust::container::StreamingDataFileReader reader)
-    : reader_(std::move(reader)) {}
+DataFileStreamReader::DataFileStreamReader(DataFileReader reader,
+                                           ZeroCopyInputStream* stream)
+    : reader_(std::move(reader)), stream_(stream) {}
 
-absl::StatusOr<StreamingDataFileReader> StreamingDataFileReader::FromBytes(
-    absl::string_view data) {
-  rs_std::Result<rust::container::StreamingDataFileReader, rust::vec_u8::VecU8>
-      result = rust::container::StreamingDataFileReader::from_bytes(
-          ToByteSpan(data));
-  if (!result.has_value()) {
-    return absl::InvalidArgumentError(FromVecU8(std::move(result).err()));
-  }
-  return StreamingDataFileReader(std::move(result).value());
+absl::StatusOr<DataFileStreamReader> DataFileStreamReader::Create(
+    ZeroCopyInputStream* stream) {
+  return Build(DataFileReader::Create(), stream);
 }
 
-absl::StatusOr<StreamingDataFileReader>
-StreamingDataFileReader::FromBytesWithSchema(const AvroSchema& reader_schema,
-                                             absl::string_view data) {
-  rs_std::Result<rust::container::StreamingDataFileReader, rust::vec_u8::VecU8>
-      result = rust::container::StreamingDataFileReader::from_bytes_with_schema(
-          reader_schema.schema_, ToByteSpan(data));
-  if (!result.has_value()) {
-    return absl::InvalidArgumentError(FromVecU8(std::move(result).err()));
-  }
-  return StreamingDataFileReader(std::move(result).value());
+absl::StatusOr<DataFileStreamReader> DataFileStreamReader::CreateWithReaderSchema(
+    const AvroSchema& reader_schema, ZeroCopyInputStream* stream) {
+  return Build(DataFileReader::CreateWithReaderSchema(reader_schema), stream);
 }
 
-absl::StatusOr<StreamingDataFileReader> StreamingDataFileReader::FromPath(
-    absl::string_view path) {
-  rs_std::Result<rust::container::StreamingDataFileReader, rust::vec_u8::VecU8>
-      result = rust::container::StreamingDataFileReader::from_path(
-          ToByteSpan(path));
-  if (!result.has_value()) {
-    return absl::InvalidArgumentError(FromVecU8(std::move(result).err()));
+absl::StatusOr<DataFileStreamReader> DataFileStreamReader::Build(
+    DataFileReader reader, ZeroCopyInputStream* stream) {
+  if (stream == nullptr) {
+    return absl::InvalidArgumentError("Stream must not be null");
   }
-  return StreamingDataFileReader(std::move(result).value());
+  DataFileStreamReader stream_reader(std::move(reader), stream);
+  // Parse eagerly up to the header so garbage and streams truncated inside
+  // the header fail at construction. Stopping there (rather than at the
+  // first value) keeps the first block unparsed, so a SetMaxBlockSize call
+  // right after Create still applies to it.
+  if (absl::Status status = stream_reader.PumpUntil(kHeaderReady);
+      !status.ok()) {
+    return status;
+  }
+  if (!stream_reader.reader_.HeaderReady()) {
+    return absl::InvalidArgumentError(
+        "Container file ended before a complete header");
+  }
+  return stream_reader;
 }
 
-absl::StatusOr<StreamingDataFileReader>
-StreamingDataFileReader::FromPathWithSchema(const AvroSchema& reader_schema,
-                                            absl::string_view path) {
-  rs_std::Result<rust::container::StreamingDataFileReader, rust::vec_u8::VecU8>
-      result = rust::container::StreamingDataFileReader::from_path_with_schema(
-          reader_schema.schema_, ToByteSpan(path));
-  if (!result.has_value()) {
-    return absl::InvalidArgumentError(FromVecU8(std::move(result).err()));
+absl::Status DataFileStreamReader::Pump() { return PumpUntil(kValueReady); }
+
+absl::Status DataFileStreamReader::PumpUntil(PumpGoal goal) {
+  // Bound on consecutive zero-size chunks. The interface allows occasional
+  // empty chunks, but a stream stuck yielding them forever would otherwise
+  // livelock this loop; fail fast instead, like any other framing error.
+  constexpr int kMaxConsecutiveEmptyChunks = 1024;
+  int consecutive_empty = 0;
+  while (true) {
+    absl::StatusOr<bool> ready = reader_.NextReady();
+    if (!ready.ok()) {
+      return ready.status();
+    }
+    if (goal == kHeaderReady && reader_.HeaderReady()) {
+      return absl::OkStatus();
+    }
+    // Done: a value is decodable, or the stream ended and the parser has
+    // consumed everything it will ever get (clean end, since NextReady did
+    // not error after CloseInput).
+    if (*ready || stream_done_) {
+      return absl::OkStatus();
+    }
+    const void* data = nullptr;
+    int size = 0;
+    if (!stream_->Next(&data, &size)) {
+      stream_done_ = true;
+      if (absl::Status status = reader_.CloseInput(); !status.ok()) {
+        return status;
+      }
+      // Loop once more: NextReady after CloseInput surfaces truncation.
+      continue;
+    }
+    if (size < 0) {
+      return absl::InternalError("Stream yielded a negative chunk size");
+    }
+    if (size == 0) {
+      ++consecutive_empty;
+      if (consecutive_empty > kMaxConsecutiveEmptyChunks) {
+        return absl::InternalError(
+            "Stream yielded too many consecutive empty chunks");
+      }
+      continue;
+    }
+    consecutive_empty = 0;
+    absl::string_view chunk(static_cast<const char*>(data),
+                            static_cast<size_t>(size));
+    if (absl::Status status = reader_.Feed(chunk); !status.ok()) {
+      return status;
+    }
   }
-  return StreamingDataFileReader(std::move(result).value());
 }
 
-AvroSchema StreamingDataFileReader::WriterSchema() const {
-  return AvroSchema(reader_.writer_schema());
+absl::StatusOr<bool> DataFileStreamReader::HasNext() {
+  if (absl::Status status = Pump(); !status.ok()) {
+    return status;
+  }
+  // The parser is already advanced as far as possible; this only reports
+  // whether a value is ready.
+  return reader_.NextReady();
 }
 
-bool StreamingDataFileReader::HasNext() { return reader_.has_next(); }
-
-absl::StatusOr<AvroValue> StreamingDataFileReader::NextValue() {
-  rs_std::Result<rust::value::AvroValue, rust::vec_u8::VecU8> result =
-      reader_.next_value();
-  if (!result.has_value()) {
-    return absl::OutOfRangeError(FromVecU8(std::move(result).err()));
+absl::StatusOr<AvroValue> DataFileStreamReader::NextValue() {
+  if (absl::Status status = Pump(); !status.ok()) {
+    return status;
   }
-  return AvroValue(std::move(result).value());
+  return reader_.NextValue();
+}
+
+absl::StatusOr<AvroSchema> DataFileStreamReader::WriterSchema() const {
+  return reader_.WriterSchema();
+}
+
+absl::Status DataFileStreamReader::SetMaxBlockSize(uint64_t bytes) {
+  return reader_.SetMaxBlockSize(bytes);
 }
 
 }  // namespace security::avro
