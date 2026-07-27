@@ -673,6 +673,10 @@ absl::Status DataFileWriter::Append(const AvroValue& value) {
   return ToStatus(writer_.append(value.value_), kBadInput);
 }
 
+absl::Status DataFileWriter::Append(AvroValue&& value) {
+  return ToStatus(writer_.append_owned(value.value_), kBadInput);
+}
+
 absl::StatusOr<std::string> DataFileWriter::TakeBytes() {
   absl::StatusOr<std::string> bytes =
       UnwrapString(writer_.take_bytes(), absl::StatusCode::kInternal);

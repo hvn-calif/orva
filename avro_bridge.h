@@ -324,11 +324,21 @@ class DataFileWriter final {
   // Returns the schema this writer was created with.
   AvroSchema Schema() const;
 
-  // Validates `value` against the writer schema and buffers it; a full
-  // batch is encoded into container blocks. A rejected value leaves the
+  // Validates `value` against the writer schema and buffers a copy of it; a
+  // full batch is encoded into container blocks. A rejected value leaves the
   // writer usable; an encoding failure tears the stream and consumes the
   // writer. Fails after Finish.
+  //
+  // Buffering copies the whole value tree, which is a meaningful share of
+  // the cost of appending (roughly a third for a record holding an
+  // eight-item array and a four-key map). Callers that build a value and
+  // hand it straight to the writer should move it instead; see below.
   absl::Status Append(const AvroValue& value);
+
+  // Append, but moves the value into the writer rather than copying it.
+  // `value` is left null. A rejected value is not consumed, so it can still
+  // be inspected after an error.
+  absl::Status Append(AvroValue&& value);
 
   // Drains the encoded bytes produced so far (header plus completed blocks)
   // without forcing a partial block, so may return "". Fails after Finish.

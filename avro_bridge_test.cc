@@ -569,6 +569,51 @@ TEST(ContainerTest, AppendInvalidValueFailsAndWriterStaysUsable) {
   EXPECT_FALSE(reader->NextReady().value_or(true));
 }
 
+TEST(ContainerTest, AppendMoveWritesTheSameFileAndEmptiesTheValue) {
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  const AvroValue original = MakeUser(7, "moved");
+
+  auto copying = DataFileWriter::Create(*schema, Codec::kNull);
+  ASSERT_TRUE(copying.ok());
+  ASSERT_TRUE(copying->Append(original).ok());
+  auto copied = copying->Finish();
+  ASSERT_TRUE(copied.ok());
+
+  auto moving = DataFileWriter::Create(*schema, Codec::kNull);
+  ASSERT_TRUE(moving.ok());
+  AvroValue donor = MakeUser(7, "moved");
+  ASSERT_TRUE(moving->Append(std::move(donor)).ok());
+  auto moved = moving->Finish();
+  ASSERT_TRUE(moved.ok());
+
+  EXPECT_TRUE(donor.IsNull()) << "the moved-from value should be emptied";
+
+  // Sync markers are random per writer, so compare decoded values.
+  auto from_copy = DataFileReader::FromBytes(*copied);
+  auto from_move = DataFileReader::FromBytes(*moved);
+  ASSERT_TRUE(from_copy.ok() && from_move.ok());
+  auto copied_value = from_copy->NextValue();
+  auto moved_value = from_move->NextValue();
+  ASSERT_TRUE(copied_value.ok() && moved_value.ok());
+  EXPECT_TRUE(*moved_value == original);
+  EXPECT_TRUE(*moved_value == *copied_value);
+}
+
+TEST(ContainerTest, AppendMoveLeavesARejectedValueIntact) {
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  auto writer = DataFileWriter::Create(*schema, Codec::kNull);
+  ASSERT_TRUE(writer.ok());
+  AvroValue wrong_type = AvroValue::CreateLong(1);
+  EXPECT_EQ(writer->Append(std::move(wrong_type)).code(),
+            absl::StatusCode::kInvalidArgument);
+  // A rejection must not consume the caller's value.
+  EXPECT_FALSE(wrong_type.IsNull());
+  EXPECT_EQ(wrong_type.GetLong().value_or(0), 1);
+  EXPECT_FALSE(writer->IsFinished());
+}
+
 TEST(ContainerTest, CreateWithCrossReferencingSchemaFails) {
   // Schemas from ParseList contain unresolved references; using one for a
   // container file must fail cleanly (and not crash in Append, which used
