@@ -22,8 +22,8 @@
 use crate::schema::AvroSchema;
 use crate::value::AvroValue;
 use crate::vec_u8::{catch_panic, utf8, Status, VecU8};
-use apache_avro::from_avro_datum_schemata;
-use apache_avro::schema::ResolvedSchema;
+use apache_avro::decode::decode_resolved;
+use apache_avro::schema::{build_names, Names, ResolvedSchema};
 use apache_avro::types::Value;
 use apache_avro::{Codec, Schema, Writer};
 use std::io::Cursor;
@@ -293,6 +293,12 @@ struct Header {
     schema: Schema,
     codec: AvroCodec,
     marker: [u8; 16],
+    /// `schema`'s named types, resolved once when the header is parsed.
+    /// apache-avro's public per-datum decode entry points rebuild this map
+    /// on every call, which for small records costs more than decoding the
+    /// record; `decode_one` passes this instead. Owned (not a borrow of
+    /// `schema`) so the reader stays movable, which Crubit requires.
+    names: Names,
 }
 
 /// Streaming Avro object container file reader (push parser).
@@ -654,15 +660,21 @@ impl DataFileReader {
             return Err("Internal error: no header while decoding".into());
         };
         let mut cursor = Cursor::new(&self.block[self.block_pos..]);
-        // The writer schema is passed as its own schemata so named-type
-        // references inside a self-contained (e.g. recursive) schema resolve.
-        let value = from_avro_datum_schemata(
-            &header.schema,
-            vec![&header.schema],
-            &mut cursor,
-            self.reader_schema.as_ref(),
-        )
-        .map_err(|err| VecU8::from(err.to_string()))?;
+        // `header.names` carries the writer schema's named types, resolved
+        // once at header parse time, so named-type references inside a
+        // self-contained (e.g. recursive) schema still resolve -- without
+        // rebuilding the map for every value the way the upstream per-datum
+        // entry points do.
+        let value = decode_resolved(&header.schema, &header.names, &mut cursor)
+            .map_err(|err| VecU8::from(err.to_string()))?;
+        // Schema evolution, matching what from_avro_datum_schemata did with
+        // a reader schema and no reader schemata.
+        let value = match &self.reader_schema {
+            Some(reader_schema) => {
+                value.resolve(reader_schema).map_err(|err| VecU8::from(err.to_string()))?
+            }
+            None => value,
+        };
         self.block_pos += cursor.position() as usize;
         self.block_remaining -= 1;
         Ok(AvroValue { value })
@@ -878,7 +890,8 @@ impl HeaderParser {
         let schema =
             Schema::parse_str(utf8(schema_json)?).map_err(|err| VecU8::from(err.to_string()))?;
         let codec = AvroCodec::from_name(&self.codec_name)?;
-        Ok(Header { schema, codec, marker })
+        let names = build_names(&schema).map_err(|err| VecU8::from(err.to_string()))?;
+        Ok(Header { schema, codec, marker, names })
     }
 }
 

@@ -16,7 +16,18 @@ doctest = false
 # and xz are intentionally NOT enabled: avrocpp does not support them, and
 # they are the worst decompression-bomb formats. See container.rs and the
 # README's "Untrusted input" section.
-apache-avro = { version = "0.21", features = ["snappy", "zstandard"] }
+# Local fork of 0.21.0; see third_party/apache-avro/PATCH.md. It adds two
+# public entry points (schema::build_names, decode::decode_resolved) and
+# changes nothing else. Upstream's public per-datum decode entry points all
+# rebuild a ResolvedSchema per call, which for small records costs more than
+# the decode itself, and the machinery to avoid it is pub(crate).
+#
+# Declared as a path dependency rather than [patch.crates-io] on purpose:
+# Crubit's cpp_api_from_rust generates a synthetic -cc-api crate that is its
+# own workspace root, so a patch section in this manifest would not reach it
+# and the bindings build would silently resolve back to the registry crate.
+# A path dependency is carried through into the generated manifest.
+apache-avro = { path = "../third_party/apache-avro", features = ["snappy", "zstandard"] }
 serde_json = "1.0"
 paste = "1.0"
 md-5 = "0.10"
