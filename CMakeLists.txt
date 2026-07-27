@@ -74,3 +74,88 @@ target_link_libraries(avro_bridge_test PRIVATE
 
 include(GoogleTest)
 gtest_discover_tests(avro_bridge_test)
+
+# Benchmark comparing this binding with Apache avro-cpp. Opt-in because it
+# fetches and builds avro-cpp (which needs Boost) and google-benchmark; see
+# doc/specs/AvroBenchmark.md and benchmarks/README.md.
+option(AVRO_BUILD_BENCHMARKS "Build the avrocpp comparison benchmark" OFF)
+if (AVRO_BUILD_BENCHMARKS)
+  FetchContent_Declare(
+    googlebenchmark
+    GIT_REPOSITORY https://github.com/google/benchmark.git
+    GIT_TAG v1.9.1
+    GIT_SHALLOW TRUE
+  )
+  set(BENCHMARK_ENABLE_TESTING OFF)
+  set(BENCHMARK_ENABLE_GTEST_TESTS OFF)
+  FetchContent_MakeAvailable(googlebenchmark)
+
+  FetchContent_Declare(
+    avrocpp_upstream
+    GIT_REPOSITORY https://github.com/apache/avro.git
+    GIT_TAG release-1.11.4
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR lang/c++
+  )
+  # avro-cpp's find_package(Snappy) depends on its own FindSnappy.cmake
+  # located via CMAKE_SOURCE_DIR, which under FetchContent is this repo,
+  # so detection silently fails and the snappy codec is dropped. Preset
+  # the result variables its CMakeLists checks (same probes FindSnappy
+  # would run) before it configures.
+  find_path(SNAPPY_INCLUDE_DIR NAMES snappy.h)
+  find_library(SNAPPY_LIBRARIES NAMES snappy)
+  if (SNAPPY_INCLUDE_DIR AND SNAPPY_LIBRARIES)
+    set(SNAPPY_FOUND TRUE)
+  else()
+    message(FATAL_ERROR "snappy-devel is required for the benchmark's "
+            "snappy rows; see benchmarks/README.md")
+  endif()
+  FetchContent_MakeAvailable(avrocpp_upstream)
+
+  # avro-cpp's build tree keeps its public headers in api/ and only maps
+  # them to the installed <avro/...> layout at install time; recreate that
+  # layout in the build dir so the benchmark includes <avro/DataFile.hh>
+  # exactly like an external consumer would.
+  file(COPY ${avrocpp_upstream_SOURCE_DIR}/lang/c++/api/
+       DESTINATION ${CMAKE_BINARY_DIR}/avrocpp_include/avro)
+
+  add_executable(avro_benchmark benchmarks/avro_benchmark.cc)
+  target_include_directories(avro_benchmark PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_BINARY_DIR}/avrocpp_include)
+  # avro-cpp hides the SNAPPY_CODEC enum value behind this define; the
+  # library itself is built with snappy (snappy-devel is a documented
+  # prerequisite), consumers must opt in. Cross-validation at benchmark
+  # startup catches a snappy-less avrocpp build with a clear error.
+  target_compile_definitions(avro_benchmark PRIVATE SNAPPY_CODEC_AVAILABLE)
+  # avrocpp_s does not propagate its own link interface; supply the Boost
+  # pieces and snappy it depends on.
+  find_package(Boost REQUIRED COMPONENTS iostreams)
+  target_link_libraries(avro_benchmark PRIVATE
+    avro_bridge
+    rust
+    avrocpp_s
+    Boost::iostreams
+    ${SNAPPY_LIBRARIES}
+    benchmark::benchmark
+  )
+
+  # Probes answering narrower questions than the avro_benchmark matrix:
+  #   block_probe   container block-framing cost vs per-value decode cost
+  #   avro_sweep    how the read gap scales with payload size and field count
+  #   append_probe  what the copy inside Append costs, and what moving saves
+  foreach(probe block_probe avro_sweep append_probe)
+    add_executable(${probe} benchmarks/${probe}.cc)
+    target_include_directories(${probe} PRIVATE
+      ${CMAKE_SOURCE_DIR}
+      ${CMAKE_BINARY_DIR}/avrocpp_include)
+    target_link_libraries(${probe} PRIVATE
+      avro_bridge
+      rust
+      avrocpp_s
+      Boost::iostreams
+      ${SNAPPY_LIBRARIES}
+      benchmark::benchmark
+    )
+  endforeach()
+endif()
