@@ -3,7 +3,7 @@
 
 use crate::schema::AvroSchema;
 use crate::value::AvroValue;
-use crate::vec_u8::{catch_panic, VecU8};
+use crate::vec_u8::{VecU8, catch_panic};
 use apache_avro::Schema;
 
 /// Error returned when a single-datum decode leaves bytes unconsumed.
@@ -13,10 +13,12 @@ const TRAILING_BYTES_ERROR: &str = "trailing bytes after single Avro datum";
 
 /// Encodes a value to Avro binary format using the given schema.
 pub fn encode_datum(schema: &AvroSchema, value: &AvroValue) -> Result<VecU8, VecU8> {
-    catch_panic(|| match apache_avro::to_avro_datum(&schema.schema, value.value.clone()) {
-        Ok(bytes) => Ok(bytes.into()),
-        Err(err) => Err(err.to_string().into()),
-    })
+    catch_panic(
+        || match apache_avro::to_avro_datum(&schema.schema, value.value.clone()) {
+            Ok(bytes) => Ok(bytes.into()),
+            Err(err) => Err(err.to_string().into()),
+        },
+    )
 }
 
 /// Encodes a value using a schema that may reference named types defined in
@@ -159,13 +161,18 @@ mod tests {
     #[test]
     fn decode_rejects_trailing_bytes() {
         let schema = AvroSchema::parse(b"\"int\"").unwrap();
-        let mut encoded = encode_datum(&schema, &AvroValue::create_int(1)).unwrap().into_vec();
+        let mut encoded = encode_datum(&schema, &AvroValue::create_int(1))
+            .unwrap()
+            .into_vec();
         // A valid single datum followed by stray bytes must be rejected
         // rather than silently decoding only the first datum.
         encoded.extend_from_slice(&[0xff, 0xfe]);
         let err = decode_datum(&schema, &encoded).unwrap_err();
         let message = String::from_utf8(err.into_vec()).unwrap();
-        assert!(message.contains("trailing bytes"), "unexpected error: {message}");
+        assert!(
+            message.contains("trailing bytes"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]
@@ -196,9 +203,17 @@ mod tests {
         record.record_put(b"a", &AvroValue::create_long(5)).unwrap();
         let encoded = encode_datum(&writer, &record).unwrap();
         let decoded = decode_datum_resolved(&writer, &reader, encoded.as_slice()).unwrap();
-        assert_eq!(decoded.get_record_field(b"a").unwrap().get_long().unwrap(), 5);
         assert_eq!(
-            decoded.get_record_field(b"b").unwrap().get_string().unwrap().as_slice(),
+            decoded.get_record_field(b"a").unwrap().get_long().unwrap(),
+            5
+        );
+        assert_eq!(
+            decoded
+                .get_record_field(b"b")
+                .unwrap()
+                .get_string()
+                .unwrap()
+                .as_slice(),
             b"fallback"
         );
     }
@@ -230,7 +245,9 @@ mod tests {
         let person_schema = &schemas[1];
 
         let mut address = AvroValue::create_record();
-        address.record_put(b"city", &AvroValue::create_string(b"Zurich").unwrap()).unwrap();
+        address
+            .record_put(b"city", &AvroValue::create_string(b"Zurich").unwrap())
+            .unwrap();
         let mut person = AvroValue::create_record();
         person.record_put(b"address", &address).unwrap();
 

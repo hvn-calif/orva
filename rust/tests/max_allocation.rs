@@ -16,7 +16,11 @@ use rust::value::AvroValue;
 fn max_allocation_bytes_rejects_oversized_field() {
     // Must be set before the first decode in this process.
     const LIMIT: usize = 1024;
-    assert_eq!(set_max_allocation_bytes(LIMIT), LIMIT, "limit should take on first set");
+    assert_eq!(
+        set_max_allocation_bytes(LIMIT),
+        LIMIT,
+        "limit should take on first set"
+    );
 
     let schema = AvroSchema::parse(b"\"bytes\"").unwrap();
 

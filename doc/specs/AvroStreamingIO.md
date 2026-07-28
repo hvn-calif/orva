@@ -144,9 +144,10 @@ never silently truncates).
    lazily (one per call). `next_value` uses `from_avro_datum_schemata` with
    the writer schema (passed in `schemata` so recursive/named-type references
    inside a self-contained schema resolve) and the optional reader schema.
-   `next_value_into` uses a compiled identity plan from `crate::decode` to
+   `next_value_into` uses apache-avro's cached owning datum reader to
    overwrite compatible record, array, union, string, bytes, fixed and enum
-   storage; reader-schema resolution retains the ordinary allocating path.
+   storage. Projection and reader-schema resolution retain their ordinary
+   allocating paths.
 
 ## Security / untrusted input
 

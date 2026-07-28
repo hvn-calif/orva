@@ -27,15 +27,15 @@
 
 use std::collections::HashMap;
 
-use apache_avro::from_avro_datum_schemata;
-use apache_avro::schema::{Name, Schema};
-use apache_avro::types::Value;
 use apache_avro::Duration;
+use apache_avro::from_avro_datum_schemata;
+use apache_avro::schema::{InnerDecimalSchema, Name, Schema, UuidSchema};
+use apache_avro::types::Value;
 use uuid::Uuid;
 
 use crate::schema::AvroSchema;
 use crate::value::AvroValue;
-use crate::vec_u8::{catch_panic, VecU8};
+use crate::vec_u8::{VecU8, catch_panic};
 
 /// Error returned when a projected datum decode leaves bytes unconsumed.
 /// Mirrors `crate::datum`: a correctly framed datum buffer is fully consumed.
@@ -74,7 +74,10 @@ enum Plan {
     /// A record where only some fields survive. One entry per *writer*
     /// field, in writer order, because the bytes must be walked in that
     /// order whether or not a field is kept.
-    Record { fields: Vec<FieldPlan>, kept: usize },
+    Record {
+        fields: Vec<FieldPlan>,
+        kept: usize,
+    },
     Array(Box<Plan>),
     Map(Box<Plan>),
     /// One plan per union variant, in writer order.
@@ -111,7 +114,11 @@ impl Default for AvroProjection {
         // Exists for Crubit's move semantics: a C++ move replaces the
         // moved-from object with Default::default(). An identity projection
         // of the null schema decodes nothing, which is the safest inert state.
-        AvroProjection { plan: Plan::Take, names: HashMap::new(), root: Schema::Null }
+        AvroProjection {
+            plan: Plan::Take,
+            names: HashMap::new(),
+            root: Schema::Null,
+        }
     }
 }
 
@@ -155,26 +162,20 @@ impl AvroProjection {
         let plan = compile_node(writer, projection, &mut Vec::new())?;
         let mut names = HashMap::new();
         collect_names(writer, &mut names);
-        Ok(AvroProjection { plan, names, root: writer.clone() })
+        Ok(AvroProjection {
+            plan,
+            names,
+            root: writer.clone(),
+        })
     }
 
     /// Decodes one datum from `input`, consuming exactly its bytes.
     pub(crate) fn decode(&self, input: &mut &[u8]) -> Result<Value, String> {
-        let context = Context { names: &self.names, root: &self.root };
+        let context = Context {
+            names: &self.names,
+            root: &self.root,
+        };
         context.read(&self.plan, &self.root, input)
-    }
-
-    /// Decodes one datum into caller-owned storage, consuming exactly its
-    /// bytes. Compatible record, array, union, string, bytes, fixed, and enum
-    /// allocations are reused. Maps and delegated upstream-only types retain
-    /// their ordinary allocating behavior.
-    pub(crate) fn decode_into(
-        &self,
-        input: &mut &[u8],
-        value: &mut Value,
-    ) -> Result<(), String> {
-        let context = Context { names: &self.names, root: &self.root };
-        context.read_into(&self.plan, &self.root, input, value)
     }
 }
 
@@ -185,7 +186,11 @@ impl AvroProjection {
 /// Describes where a mismatch was found, so the error names the field rather
 /// than just the type.
 fn path_of(path: &[String]) -> String {
-    if path.is_empty() { "<root>".to_string() } else { path.join(".") }
+    if path.is_empty() {
+        "<root>".to_string()
+    } else {
+        path.join(".")
+    }
 }
 
 fn compile_node(
@@ -252,9 +257,15 @@ fn compile_node(
                             compile_node(&writer_field.schema, &projected_field.schema, path)?;
                         path.pop();
                         kept += 1;
-                        fields.push(FieldPlan { name: Some(writer_field.name.clone()), plan });
+                        fields.push(FieldPlan {
+                            name: Some(writer_field.name.clone()),
+                            plan,
+                        });
                     }
-                    None => fields.push(FieldPlan { name: None, plan: Plan::Drop }),
+                    None => fields.push(FieldPlan {
+                        name: None,
+                        plan: Plan::Drop,
+                    }),
                 }
             }
             Ok(Plan::Record { fields, kept })
@@ -333,7 +344,7 @@ fn kind_name(schema: &Schema) -> &'static str {
         Schema::Fixed(_) => "fixed",
         Schema::Decimal(_) => "decimal",
         Schema::BigDecimal => "big-decimal",
-        Schema::Uuid => "uuid",
+        Schema::Uuid(_) => "uuid",
         Schema::Date => "date",
         Schema::TimeMillis => "time-millis",
         Schema::TimeMicros => "time-micros",
@@ -343,7 +354,7 @@ fn kind_name(schema: &Schema) -> &'static str {
         Schema::LocalTimestampMillis => "local-timestamp-millis",
         Schema::LocalTimestampMicros => "local-timestamp-micros",
         Schema::LocalTimestampNanos => "local-timestamp-nanos",
-        Schema::Duration => "duration",
+        Schema::Duration(_) => "duration",
         Schema::Ref { .. } => "reference",
     }
 }
@@ -358,9 +369,30 @@ fn same_kind(writer: &Schema, projection: &Schema) -> bool {
         (Schema::Record(a), Schema::Record(b)) => a.name == b.name,
         (Schema::Ref { name: a }, Schema::Ref { name: b }) => a == b,
         (Schema::Decimal(a), Schema::Decimal(b)) => {
-            a.precision == b.precision && a.scale == b.scale && same_kind(&a.inner, &b.inner)
+            a.precision == b.precision
+                && a.scale == b.scale
+                && same_decimal_kind(&a.inner, &b.inner)
         }
+        (Schema::Uuid(a), Schema::Uuid(b)) => same_uuid_kind(a, b),
         _ => kind_name(writer) == kind_name(projection),
+    }
+}
+
+fn same_decimal_kind(writer: &InnerDecimalSchema, projection: &InnerDecimalSchema) -> bool {
+    match (writer, projection) {
+        (InnerDecimalSchema::Bytes, InnerDecimalSchema::Bytes) => true,
+        (InnerDecimalSchema::Fixed(a), InnerDecimalSchema::Fixed(b)) => {
+            a.name == b.name && a.size == b.size
+        }
+        _ => false,
+    }
+}
+
+fn same_uuid_kind(writer: &UuidSchema, projection: &UuidSchema) -> bool {
+    match (writer, projection) {
+        (UuidSchema::Bytes, UuidSchema::Bytes) | (UuidSchema::String, UuidSchema::String) => true,
+        (UuidSchema::Fixed(a), UuidSchema::Fixed(b)) => a.name == b.name && a.size == b.size,
+        _ => false,
     }
 }
 
@@ -402,7 +434,14 @@ fn collect_names(schema: &Schema, names: &mut HashMap<Name, Schema>) {
                 collect_names(variant, names);
             }
         }
-        Schema::Decimal(decimal) => collect_names(&decimal.inner, names),
+        Schema::Decimal(decimal) => {
+            if let InnerDecimalSchema::Fixed(fixed) = &decimal.inner {
+                names.insert(fixed.name.clone(), schema.clone());
+            }
+        }
+        Schema::Uuid(UuidSchema::Fixed(fixed)) | Schema::Duration(fixed) => {
+            names.insert(fixed.name.clone(), schema.clone());
+        }
         _ => {}
     }
 }
@@ -480,9 +519,12 @@ impl Context<'_> {
         let Schema::Ref { name } = schema else {
             return Ok(schema);
         };
-        self.names
-            .get(name)
-            .ok_or_else(|| format!("Unknown named type {} in writer schema", name.fullname(None)))
+        self.names.get(name).ok_or_else(|| {
+            format!(
+                "Unknown named type {} in writer schema",
+                name.fullname(None)
+            )
+        })
     }
 
     /// Steps over one value, allocating nothing.
@@ -504,12 +546,17 @@ impl Context<'_> {
             | Schema::Enum(_) => read_long(input).map(|_| ()),
             Schema::Float => take(input, 4).map(|_| ()),
             Schema::Double => take(input, 8).map(|_| ()),
-            Schema::Duration => take(input, 12).map(|_| ()),
-            Schema::Bytes | Schema::String | Schema::Uuid | Schema::BigDecimal => {
-                read_bytes(input).map(|_| ())
-            }
+            Schema::Duration(_) => take(input, 12).map(|_| ()),
+            Schema::Bytes | Schema::String | Schema::BigDecimal => read_bytes(input).map(|_| ()),
             Schema::Fixed(fixed) => take(input, fixed.size).map(|_| ()),
-            Schema::Decimal(decimal) => self.skip(&decimal.inner, input),
+            Schema::Decimal(decimal) => match &decimal.inner {
+                InnerDecimalSchema::Bytes => read_bytes(input).map(|_| ()),
+                InnerDecimalSchema::Fixed(fixed) => take(input, fixed.size).map(|_| ()),
+            },
+            Schema::Uuid(uuid) => match uuid {
+                UuidSchema::Bytes | UuidSchema::String => read_bytes(input).map(|_| ()),
+                UuidSchema::Fixed(fixed) => take(input, fixed.size).map(|_| ()),
+            },
             Schema::Union(union) => {
                 let branch = read_long(input)?;
                 let variants = union.variants();
@@ -517,7 +564,10 @@ impl Context<'_> {
                     .ok()
                     .filter(|index| *index < variants.len())
                     .ok_or_else(|| {
-                        format!("Union branch {branch} out of range for {} variants", variants.len())
+                        format!(
+                            "Union branch {branch} out of range for {} variants",
+                            variants.len()
+                        )
                     })?;
                 self.skip(&variants[index], input)
             }
@@ -527,9 +577,9 @@ impl Context<'_> {
                 }
                 Ok(())
             }
-            Schema::Array(array) => self.skip_blocks(input, |context, input| {
-                context.skip(&array.items, input)
-            }),
+            Schema::Array(array) => {
+                self.skip_blocks(input, |context, input| context.skip(&array.items, input))
+            }
             Schema::Map(map) => self.skip_blocks(input, |context, input| {
                 read_bytes(input)?;
                 context.skip(&map.types, input)
@@ -581,10 +631,8 @@ impl Context<'_> {
                 self.skip(schema, input)?;
                 Ok(Value::Null)
             }
-            Plan::Delegate => {
-                from_avro_datum_schemata(schema, vec![self.root], input, None)
-                    .map_err(|error| error.to_string())
-            }
+            Plan::Delegate => from_avro_datum_schemata(schema, vec![self.root], input, None)
+                .map_err(|error| error.to_string()),
             Plan::Take => self.read_all(schema, input),
             Plan::Record { fields, kept } => {
                 let Schema::Record(record) = self.resolve(schema)? else {
@@ -594,8 +642,7 @@ impl Context<'_> {
                 for (field_plan, writer_field) in fields.iter().zip(&record.fields) {
                     match &field_plan.name {
                         Some(name) => {
-                            let value =
-                                self.read(&field_plan.plan, &writer_field.schema, input)?;
+                            let value = self.read(&field_plan.plan, &writer_field.schema, input)?;
                             out.push((name.clone(), value));
                         }
                         None => self.skip(&writer_field.schema, input)?,
@@ -636,272 +683,15 @@ impl Context<'_> {
                     .ok()
                     .filter(|index| *index < variants.len())
                     .ok_or_else(|| {
-                        format!("Union branch {branch} out of range for {} variants", variants.len())
+                        format!(
+                            "Union branch {branch} out of range for {} variants",
+                            variants.len()
+                        )
                     })?;
                 let value = self.read(&branch_plans[index], &variants[index], input)?;
                 Ok(Value::Union(index as u32, Box::new(value)))
             }
         }
-    }
-
-    /// In-place counterpart to `read`. The public `Value` is allowed to have
-    /// been replaced or structurally mutated between calls, so record names
-    /// are checked before their storage is trusted.
-    fn read_into(
-        &self,
-        plan: &Plan,
-        schema: &Schema,
-        input: &mut &[u8],
-        value: &mut Value,
-    ) -> Result<(), String> {
-        match plan {
-            Plan::Drop => {
-                self.skip(schema, input)?;
-                *value = Value::Null;
-            }
-            Plan::Delegate => {
-                *value = from_avro_datum_schemata(schema, vec![self.root], input, None)
-                    .map_err(|error| error.to_string())?;
-            }
-            Plan::Take => self.read_all_into(schema, input, value)?,
-            Plan::Record { fields, kept } => {
-                let Schema::Record(record) = self.resolve(schema)? else {
-                    return Err(format!("Expected a record, found {}", kind_name(schema)));
-                };
-                let reusable = matches!(
-                    value,
-                    Value::Record(out)
-                        if out.len() == *kept
-                            && out.iter().map(|(name, _)| name).eq(
-                                fields.iter().filter_map(|field| field.name.as_ref())
-                            )
-                );
-                if !reusable {
-                    let mut out = Vec::with_capacity(*kept);
-                    out.extend(
-                        fields
-                            .iter()
-                            .filter_map(|field| field.name.clone())
-                            .map(|name| (name, Value::Null)),
-                    );
-                    *value = Value::Record(out);
-                }
-
-                let Value::Record(out) = value else {
-                    unreachable!("record storage was initialized above")
-                };
-                let mut output_index = 0;
-                for (field_plan, writer_field) in fields.iter().zip(&record.fields) {
-                    if field_plan.name.is_some() {
-                        self.read_into(
-                            &field_plan.plan,
-                            &writer_field.schema,
-                            input,
-                            &mut out[output_index].1,
-                        )?;
-                        output_index += 1;
-                    } else {
-                        self.skip(&writer_field.schema, input)?;
-                    }
-                }
-            }
-            Plan::Array(item_plan) => {
-                let Schema::Array(array) = self.resolve(schema)? else {
-                    return Err(format!("Expected an array, found {}", kind_name(schema)));
-                };
-                if !matches!(value, Value::Array(_)) {
-                    *value = Value::Array(Vec::new());
-                }
-                let Value::Array(items) = value else {
-                    unreachable!("array storage was initialized above")
-                };
-                let mut decoded = 0usize;
-                self.read_blocks(input, |context, input| {
-                    if decoded == items.len() {
-                        items.push(Value::Null);
-                    }
-                    context.read_into(item_plan, &array.items, input, &mut items[decoded])?;
-                    decoded += 1;
-                    Ok(())
-                })?;
-                items.truncate(decoded);
-            }
-            Plan::Map(_) => {
-                // HashMap does not expose stale key/value ownership in a form
-                // that can be reassigned by wire-order entry. A production
-                // map path needs decoder-owned entry pools.
-                *value = self.read(plan, schema, input)?;
-            }
-            Plan::Union(branch_plans) => {
-                let Schema::Union(union) = self.resolve(schema)? else {
-                    return Err(format!("Expected a union, found {}", kind_name(schema)));
-                };
-                let branch = read_long(input)?;
-                let variants = union.variants();
-                let index = usize::try_from(branch)
-                    .ok()
-                    .filter(|index| *index < variants.len())
-                    .ok_or_else(|| {
-                        format!("Union branch {branch} out of range for {} variants", variants.len())
-                    })?;
-                if !matches!(value, Value::Union(_, _)) {
-                    *value = Value::Union(index as u32, Box::new(Value::Null));
-                }
-                let Value::Union(current_index, inner) = value else {
-                    unreachable!("union storage was initialized above")
-                };
-                *current_index = index as u32;
-                self.read_into(
-                    &branch_plans[index],
-                    &variants[index],
-                    input,
-                    inner,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Reuses storage for a leaf covered by `Plan::Take`. Container nodes are
-    /// represented by structural plans during compilation; delegated types
-    /// are handled before this method is reached.
-    fn read_all_into(
-        &self,
-        schema: &Schema,
-        input: &mut &[u8],
-        value: &mut Value,
-    ) -> Result<(), String> {
-        macro_rules! set_scalar {
-            ($variant:path, $decoded:expr) => {{
-                let decoded = $decoded;
-                match value {
-                    $variant(current) => *current = decoded,
-                    _ => *value = $variant(decoded),
-                }
-            }};
-        }
-
-        match self.resolve(schema)? {
-            Schema::Null => *value = Value::Null,
-            Schema::Boolean => match take(input, 1)?[0] {
-                0 => set_scalar!(Value::Boolean, false),
-                1 => set_scalar!(Value::Boolean, true),
-                other => return Err(format!("Invalid Avro boolean byte {other}")),
-            },
-            Schema::Int => set_scalar!(Value::Int, read_int(input)?),
-            Schema::Long => set_scalar!(Value::Long, read_long(input)?),
-            Schema::Date => set_scalar!(Value::Date, read_int(input)?),
-            Schema::TimeMillis => set_scalar!(Value::TimeMillis, read_int(input)?),
-            Schema::TimeMicros => set_scalar!(Value::TimeMicros, read_long(input)?),
-            Schema::TimestampMillis => {
-                set_scalar!(Value::TimestampMillis, read_long(input)?);
-            }
-            Schema::TimestampMicros => {
-                set_scalar!(Value::TimestampMicros, read_long(input)?);
-            }
-            Schema::TimestampNanos => {
-                set_scalar!(Value::TimestampNanos, read_long(input)?);
-            }
-            Schema::LocalTimestampMillis => {
-                set_scalar!(Value::LocalTimestampMillis, read_long(input)?);
-            }
-            Schema::LocalTimestampMicros => {
-                set_scalar!(Value::LocalTimestampMicros, read_long(input)?);
-            }
-            Schema::LocalTimestampNanos => {
-                set_scalar!(Value::LocalTimestampNanos, read_long(input)?);
-            }
-            Schema::Float => {
-                let bytes: [u8; 4] = take(input, 4)?.try_into().expect("checked width");
-                set_scalar!(Value::Float, f32::from_le_bytes(bytes));
-            }
-            Schema::Double => {
-                let bytes: [u8; 8] = take(input, 8)?.try_into().expect("checked width");
-                set_scalar!(Value::Double, f64::from_le_bytes(bytes));
-            }
-            Schema::Duration => {
-                let bytes: [u8; 12] = take(input, 12)?.try_into().expect("checked width");
-                set_scalar!(Value::Duration, Duration::from(bytes));
-            }
-            Schema::Bytes => {
-                let decoded = read_bytes(input)?;
-                if !matches!(value, Value::Bytes(_)) {
-                    *value = Value::Bytes(Vec::new());
-                }
-                let Value::Bytes(out) = value else {
-                    unreachable!("bytes storage was initialized above")
-                };
-                out.clear();
-                out.extend_from_slice(decoded);
-            }
-            Schema::String => {
-                let decoded = read_bytes(input)?;
-                let old = std::mem::replace(value, Value::Null);
-                let mut out = match old {
-                    Value::String(string) => string.into_bytes(),
-                    _ => Vec::new(),
-                };
-                out.clear();
-                out.extend_from_slice(decoded);
-                *value = Value::String(
-                    String::from_utf8(out)
-                        .map_err(|_| "Avro string is not valid UTF-8".to_string())?,
-                );
-            }
-            Schema::Uuid => {
-                let bytes = read_bytes(input)?;
-                let uuid = if bytes.len() == 16 {
-                    Uuid::from_slice(bytes).map_err(|error| error.to_string())?
-                } else {
-                    Uuid::parse_str(&utf8(bytes)?).map_err(|error| error.to_string())?
-                };
-                set_scalar!(Value::Uuid, uuid);
-            }
-            Schema::Fixed(fixed) => {
-                let decoded = take(input, fixed.size)?;
-                if !matches!(value, Value::Fixed(_, _)) {
-                    *value = Value::Fixed(fixed.size, Vec::new());
-                }
-                let Value::Fixed(size, out) = value else {
-                    unreachable!("fixed storage was initialized above")
-                };
-                *size = fixed.size;
-                out.clear();
-                out.extend_from_slice(decoded);
-            }
-            Schema::Enum(enumeration) => {
-                let position = read_long(input)?;
-                let symbol = usize::try_from(position)
-                    .ok()
-                    .and_then(|index| enumeration.symbols.get(index))
-                    .ok_or_else(|| {
-                        format!(
-                            "Enum position {position} out of range for {} symbols",
-                            enumeration.symbols.len()
-                        )
-                    })?;
-                match value {
-                    Value::Enum(current_position, current_symbol) => {
-                        *current_position = position as u32;
-                        current_symbol.clone_from(symbol);
-                    }
-                    _ => *value = Value::Enum(position as u32, symbol.clone()),
-                }
-            }
-            Schema::Record(_)
-            | Schema::Array(_)
-            | Schema::Map(_)
-            | Schema::Union(_)
-            | Schema::Decimal(_)
-            | Schema::BigDecimal
-            | Schema::Ref { .. } => {
-                return Err(format!(
-                    "Internal error: structural/delegated type {} reached Plan::Take",
-                    kind_name(schema)
-                ));
-            }
-        }
-        Ok(())
     }
 
     /// Decodes a whole subtree, keeping everything. Mirrors apache-avro's
@@ -934,16 +724,19 @@ impl Context<'_> {
                 let bytes: [u8; 8] = take(input, 8)?.try_into().expect("checked width");
                 Ok(Value::Double(f64::from_le_bytes(bytes)))
             }
-            Schema::Duration => {
+            Schema::Duration(_) => {
                 let bytes: [u8; 12] = take(input, 12)?.try_into().expect("checked width");
                 Ok(Value::Duration(Duration::from(bytes)))
             }
             Schema::Bytes => Ok(Value::Bytes(read_bytes(input)?.to_vec())),
             Schema::String => Ok(Value::String(utf8(read_bytes(input)?)?)),
-            Schema::Uuid => {
+            Schema::Uuid(uuid_schema) => {
                 // apache-avro accepts both the 16-byte form and the textual
                 // form; mirror that rather than being stricter.
-                let bytes = read_bytes(input)?;
+                let bytes = match uuid_schema {
+                    UuidSchema::Bytes | UuidSchema::String => read_bytes(input)?,
+                    UuidSchema::Fixed(fixed) => take(input, fixed.size)?,
+                };
                 let uuid = if bytes.len() == 16 {
                     Uuid::from_slice(bytes).map_err(|error| error.to_string())?
                 } else {
@@ -951,9 +744,7 @@ impl Context<'_> {
                 };
                 Ok(Value::Uuid(uuid))
             }
-            Schema::Fixed(fixed) => {
-                Ok(Value::Fixed(fixed.size, take(input, fixed.size)?.to_vec()))
-            }
+            Schema::Fixed(fixed) => Ok(Value::Fixed(fixed.size, take(input, fixed.size)?.to_vec())),
             Schema::Enum(enumeration) => {
                 let position = read_long(input)?;
                 let symbol = usize::try_from(position)
@@ -974,7 +765,10 @@ impl Context<'_> {
                     .ok()
                     .filter(|index| *index < variants.len())
                     .ok_or_else(|| {
-                        format!("Union branch {branch} out of range for {} variants", variants.len())
+                        format!(
+                            "Union branch {branch} out of range for {} variants",
+                            variants.len()
+                        )
                     })?;
                 let value = self.read_all(&variants[index], input)?;
                 Ok(Value::Union(index as u32, Box::new(value)))
@@ -1085,7 +879,11 @@ mod tests {
             .unwrap_or_else(|error| panic!("projected decode for {json}: {error}"));
 
         assert_eq!(actual, expected, "value mismatch for {json}");
-        assert!(input.is_empty(), "{} bytes left unconsumed for {json}", input.len());
+        assert!(
+            input.is_empty(),
+            "{} bytes left unconsumed for {json}",
+            input.len()
+        );
     }
 
     #[test]
@@ -1189,7 +987,10 @@ mod tests {
             ("id".into(), Value::Long(7)),
             (
                 "tags".into(),
-                Value::Map(HashMap::from([("env".to_string(), Value::String("prod".into()))])),
+                Value::Map(HashMap::from([(
+                    "env".to_string(),
+                    Value::String("prod".into()),
+                )])),
             ),
             (
                 "items".into(),
@@ -1204,7 +1005,10 @@ mod tests {
                     ]),
                 ]),
             ),
-            ("maybe".into(), Value::Union(1, Box::new(Value::String("x".into())))),
+            (
+                "maybe".into(),
+                Value::Union(1, Box::new(Value::String("x".into()))),
+            ),
         ])
     }
 
@@ -1231,7 +1035,10 @@ mod tests {
             value,
             Value::Record(vec![
                 ("id".into(), Value::Long(7)),
-                ("maybe".into(), Value::Union(1, Box::new(Value::String("x".into())))),
+                (
+                    "maybe".into(),
+                    Value::Union(1, Box::new(Value::String("x".into())))
+                ),
             ])
         );
         // The dropped map and array must still have been stepped over
@@ -1318,7 +1125,9 @@ mod tests {
             ]),
         );
         let decoded = identity.decode(&mut bytes.as_slice()).unwrap();
-        let Value::Record(fields) = &decoded else { panic!("expected a record") };
+        let Value::Record(fields) = &decoded else {
+            panic!("expected a record")
+        };
         assert_eq!(fields.len(), 2);
 
         // Asking for one of its two fields must be refused rather than
@@ -1337,21 +1146,18 @@ mod tests {
     fn projection_rejects_shapes_that_are_not_subsets() {
         let writer = schema(NESTED);
 
-        let unknown_field = schema(
-            r#"{"type":"record","name":"Outer","fields":[{"name":"nope","type":"long"}]}"#,
-        );
+        let unknown_field =
+            schema(r#"{"type":"record","name":"Outer","fields":[{"name":"nope","type":"long"}]}"#);
         let error = AvroProjection::compile(&writer, &unknown_field).unwrap_err();
         assert!(error.contains("nope"), "unexpected error: {error}");
 
-        let wrong_type = schema(
-            r#"{"type":"record","name":"Outer","fields":[{"name":"id","type":"string"}]}"#,
-        );
+        let wrong_type =
+            schema(r#"{"type":"record","name":"Outer","fields":[{"name":"id","type":"string"}]}"#);
         let error = AvroProjection::compile(&writer, &wrong_type).unwrap_err();
         assert!(error.contains("id"), "unexpected error: {error}");
 
-        let wrong_name = schema(
-            r#"{"type":"record","name":"Other","fields":[{"name":"id","type":"long"}]}"#,
-        );
+        let wrong_name =
+            schema(r#"{"type":"record","name":"Other","fields":[{"name":"id","type":"long"}]}"#);
         assert!(AvroProjection::compile(&writer, &wrong_name).is_err());
 
         // Union branch indices are encoded in the data, so narrowing a union
@@ -1361,7 +1167,10 @@ mod tests {
                 {"name":"maybe","type":["null"],"default":null}]}"#,
         );
         let error = AvroProjection::compile(&writer, &narrowed_union).unwrap_err();
-        assert!(error.contains("union branches"), "unexpected error: {error}");
+        assert!(
+            error.contains("union branches"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

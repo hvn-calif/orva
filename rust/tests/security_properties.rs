@@ -21,16 +21,27 @@ use rust::value::AvroValue;
 fn trailing_bytes_after_a_single_datum_are_rejected() {
     let schema = AvroSchema::parse(b"\"int\"").unwrap();
 
-    let mut buf = encode_datum(&schema, &AvroValue::create_int(7)).unwrap().into_vec();
+    let mut buf = encode_datum(&schema, &AvroValue::create_int(7))
+        .unwrap()
+        .into_vec();
     buf.extend_from_slice(b"\xde\xad\xbe\xef");
 
     let err = decode_datum(&schema, &buf).unwrap_err();
     let message = String::from_utf8(err.into_vec()).unwrap();
-    assert!(message.contains("trailing bytes"), "unexpected error: {message}");
+    assert!(
+        message.contains("trailing bytes"),
+        "unexpected error: {message}"
+    );
 
     // A correctly framed datum with no trailing bytes still decodes.
     let clean = encode_datum(&schema, &AvroValue::create_int(7)).unwrap();
-    assert_eq!(decode_datum(&schema, clean.as_slice()).unwrap().get_int().unwrap(), 7);
+    assert_eq!(
+        decode_datum(&schema, clean.as_slice())
+            .unwrap()
+            .get_int()
+            .unwrap(),
+        7
+    );
 }
 
 /// Issue 2 (documented limitation): compressed container files amplify a
@@ -52,7 +63,9 @@ fn compression_amplifies_small_input_into_large_memory() {
 
     let payload = vec![b'A'; 4 * 1024 * 1024]; // 4 MiB, maximally compressible
     let mut record = AvroValue::create_record();
-    record.record_put(b"data", &AvroValue::create_string(&payload).unwrap()).unwrap();
+    record
+        .record_put(b"data", &AvroValue::create_string(&payload).unwrap())
+        .unwrap();
 
     let mut writer = DataFileWriter::create(&schema, AvroCodec::Deflate).unwrap();
     writer.append(&record).unwrap();
@@ -68,11 +81,18 @@ fn compression_amplifies_small_input_into_large_memory() {
     // Reading that tiny file reconstructs the full 4 MiB in memory, unbounded.
     let mut reader = DataFileReader::from_bytes(compressed.as_slice()).unwrap();
     let value = reader.next_value().unwrap();
-    let data = value.get_record_field(b"data").unwrap().get_string().unwrap();
+    let data = value
+        .get_record_field(b"data")
+        .unwrap()
+        .get_string()
+        .unwrap();
     assert_eq!(data.len(), payload.len());
 
     let amplification = data.len() / compressed.len();
-    assert!(amplification > 50, "expected large amplification, got {amplification}x");
+    assert!(
+        amplification > 50,
+        "expected large amplification, got {amplification}x"
+    );
 }
 
 /// Issue 3 (documented limitation): decode recurses one frame per nesting
@@ -108,12 +128,17 @@ fn deeply_nested_values_decode_without_a_depth_limit() {
 
             // Innermost link: next = null (union branch 0).
             let mut node = AvroValue::create_record();
-            node.record_put(b"next", &AvroValue::create_union(0, &AvroValue::create_null()))
-                .unwrap();
+            node.record_put(
+                b"next",
+                &AvroValue::create_union(0, &AvroValue::create_null()),
+            )
+            .unwrap();
             // Wrap DEPTH times: each next = Node (union branch 1).
             for _ in 0..DEPTH {
                 let mut outer = AvroValue::create_record();
-                outer.record_put(b"next", &AvroValue::create_union(1, &node)).unwrap();
+                outer
+                    .record_put(b"next", &AvroValue::create_union(1, &node))
+                    .unwrap();
                 node = outer;
             }
 

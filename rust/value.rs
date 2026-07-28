@@ -2,8 +2,8 @@
 //! Replaces avrocpp's `GenericDatum`.
 
 use crate::make_vec_type;
-use crate::schema::AvroSchema;
-use crate::vec_u8::{catch_panic, utf8, Status, VecU8};
+use crate::schema::{AvroSchema, SchemaType};
+use crate::vec_u8::{Status, VecU8, catch_panic, utf8};
 use apache_avro::types::Value;
 use apache_avro::{Days, Decimal, Duration, Millis, Months};
 
@@ -12,9 +12,9 @@ make_vec_type!(VecU8, VecVecU8);
 /// A generic Avro value tree. Replaces avrocpp's `GenericDatum`.
 ///
 /// Values are built with the `create_*` constructors and `record_put` /
-/// `array_push` / `map_put` mutators, inspected with the `is_*` predicates
-/// and read with the `get_*` accessors. Accessors return clones; the
-/// boundary cannot return references.
+/// `array_push` / `map_put` mutators, inspected with `schema_type`, and read
+/// with the `get_*` accessors. Accessors return clones; the boundary cannot
+/// return references.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AvroValue {
     pub(crate) value: Value,
@@ -27,45 +27,55 @@ impl Default for AvroValue {
 }
 
 impl AvroValue {
-    fn wrap(value: Value) -> AvroValue {
-        AvroValue { value }
-    }
-
     // ------------------------------------------------------------------
     // Constructors: primitive types.
     // ------------------------------------------------------------------
 
     pub fn create_null() -> AvroValue {
-        Self::wrap(Value::Null)
+        Self { value: Value::Null }
     }
 
     pub fn create_boolean(v: bool) -> AvroValue {
-        Self::wrap(Value::Boolean(v))
+        Self {
+            value: Value::Boolean(v),
+        }
     }
 
     pub fn create_int(v: i32) -> AvroValue {
-        Self::wrap(Value::Int(v))
+        Self {
+            value: Value::Int(v),
+        }
     }
 
     pub fn create_long(v: i64) -> AvroValue {
-        Self::wrap(Value::Long(v))
+        Self {
+            value: Value::Long(v),
+        }
     }
 
     pub fn create_float(v: f32) -> AvroValue {
-        Self::wrap(Value::Float(v))
+        Self {
+            value: Value::Float(v),
+        }
     }
 
     pub fn create_double(v: f64) -> AvroValue {
-        Self::wrap(Value::Double(v))
+        Self {
+            value: Value::Double(v),
+        }
     }
 
     pub fn create_bytes(v: &[u8]) -> AvroValue {
-        Self::wrap(Value::Bytes(v.to_vec()))
+        Self {
+            value: Value::Bytes(v.to_vec()),
+        }
     }
 
     /// Creates a string value. Returns an error if `v` is not valid UTF-8.
     pub fn create_string(v: &[u8]) -> Result<AvroValue, VecU8> {
-        Ok(Self::wrap(Value::String(utf8(v)?.to_string())))
+        Ok(Self {
+            value: Value::String(utf8(v)?.to_string()),
+        })
     }
 
     // ------------------------------------------------------------------
@@ -74,33 +84,45 @@ impl AvroValue {
 
     /// Creates an empty record. Add fields with `record_put`.
     pub fn create_record() -> AvroValue {
-        Self::wrap(Value::Record(Vec::new()))
+        Self {
+            value: Value::Record(Vec::new()),
+        }
     }
 
     /// Creates an empty array. Add items with `array_push`.
     pub fn create_array() -> AvroValue {
-        Self::wrap(Value::Array(Vec::new()))
+        Self {
+            value: Value::Array(Vec::new()),
+        }
     }
 
     /// Creates an empty map. Add entries with `map_put`.
     pub fn create_map() -> AvroValue {
-        Self::wrap(Value::Map(Default::default()))
+        Self {
+            value: Value::Map(Default::default()),
+        }
     }
 
     /// Creates an enum value from the symbol's position in the schema and
     /// the symbol name. Returns an error if `symbol` is not valid UTF-8.
     pub fn create_enum(position: u32, symbol: &[u8]) -> Result<AvroValue, VecU8> {
-        Ok(Self::wrap(Value::Enum(position, utf8(symbol)?.to_string())))
+        Ok(Self {
+            value: Value::Enum(position, utf8(symbol)?.to_string()),
+        })
     }
 
     pub fn create_fixed(v: &[u8]) -> AvroValue {
-        Self::wrap(Value::Fixed(v.len(), v.to_vec()))
+        Self {
+            value: Value::Fixed(v.len(), v.to_vec()),
+        }
     }
 
     /// Creates a union value holding `v` at the given zero-based branch
     /// index of the union schema.
     pub fn create_union(branch_index: u32, v: &AvroValue) -> AvroValue {
-        Self::wrap(Value::Union(branch_index, Box::new(v.value.clone())))
+        Self {
+            value: Value::Union(branch_index, Box::new(v.value.clone())),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -110,58 +132,82 @@ impl AvroValue {
     /// Creates a decimal value from its two's-complement big-endian
     /// representation (as serialized by Avro).
     pub fn create_decimal(v: &[u8]) -> AvroValue {
-        Self::wrap(Value::Decimal(Decimal::from(v)))
+        Self {
+            value: Value::Decimal(Decimal::from(v)),
+        }
     }
 
     /// Creates a UUID value from its string representation.
     pub fn create_uuid(v: &[u8]) -> Result<AvroValue, VecU8> {
         let uuid = uuid::Uuid::parse_str(utf8(v)?).map_err(|err| VecU8::from(err.to_string()))?;
-        Ok(Self::wrap(Value::Uuid(uuid)))
+        Ok(Self {
+            value: Value::Uuid(uuid),
+        })
     }
 
     /// Creates a date value (days since the Unix epoch).
     pub fn create_date(days: i32) -> AvroValue {
-        Self::wrap(Value::Date(days))
+        Self {
+            value: Value::Date(days),
+        }
     }
 
     pub fn create_time_millis(v: i32) -> AvroValue {
-        Self::wrap(Value::TimeMillis(v))
+        Self {
+            value: Value::TimeMillis(v),
+        }
     }
 
     pub fn create_time_micros(v: i64) -> AvroValue {
-        Self::wrap(Value::TimeMicros(v))
+        Self {
+            value: Value::TimeMicros(v),
+        }
     }
 
     pub fn create_timestamp_millis(v: i64) -> AvroValue {
-        Self::wrap(Value::TimestampMillis(v))
+        Self {
+            value: Value::TimestampMillis(v),
+        }
     }
 
     pub fn create_timestamp_micros(v: i64) -> AvroValue {
-        Self::wrap(Value::TimestampMicros(v))
+        Self {
+            value: Value::TimestampMicros(v),
+        }
     }
 
     pub fn create_timestamp_nanos(v: i64) -> AvroValue {
-        Self::wrap(Value::TimestampNanos(v))
+        Self {
+            value: Value::TimestampNanos(v),
+        }
     }
 
     pub fn create_local_timestamp_millis(v: i64) -> AvroValue {
-        Self::wrap(Value::LocalTimestampMillis(v))
+        Self {
+            value: Value::LocalTimestampMillis(v),
+        }
     }
 
     pub fn create_local_timestamp_micros(v: i64) -> AvroValue {
-        Self::wrap(Value::LocalTimestampMicros(v))
+        Self {
+            value: Value::LocalTimestampMicros(v),
+        }
     }
 
     pub fn create_local_timestamp_nanos(v: i64) -> AvroValue {
-        Self::wrap(Value::LocalTimestampNanos(v))
+        Self {
+            value: Value::LocalTimestampNanos(v),
+        }
     }
 
     pub fn create_duration(months: u32, days: u32, millis: u32) -> AvroValue {
-        Self::wrap(Value::Duration(Duration::new(
-            Months::new(months),
-            Days::new(days),
-            Millis::new(millis),
-        )))
+        Self {
+            value: Value::Duration(Duration::new(
+                Months::new(months),
+                Days::new(days),
+                Millis::new(millis),
+            )),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -249,7 +295,9 @@ impl AvroValue {
     /// Returns the value held by a union.
     pub fn get_union_value(&self) -> Result<AvroValue, VecU8> {
         match &self.value {
-            Value::Union(_, v) => Ok(Self::wrap(v.as_ref().clone())),
+            Value::Union(_, v) => Ok(Self {
+                value: v.as_ref().clone(),
+            }),
             _ => Err(self.type_error("union")),
         }
     }
@@ -377,13 +425,12 @@ impl AvroValue {
     pub fn get_array_item(&self, index: usize) -> Result<AvroValue, VecU8> {
         match &self.value {
             Value::Array(items) => match items.get(index) {
-                Some(item) => Ok(Self::wrap(item.clone())),
-                None => Err(format!(
-                    "Array index {} out of bounds (len {})",
-                    index,
-                    items.len()
-                )
-                .into()),
+                Some(item) => Ok(Self {
+                    value: item.clone(),
+                }),
+                None => {
+                    Err(format!("Array index {} out of bounds (len {})", index, items.len()).into())
+                }
             },
             _ => Err(self.type_error("array")),
         }
@@ -404,7 +451,11 @@ impl AvroValue {
             Value::Map(entries) => {
                 let mut keys: Vec<&String> = entries.keys().collect();
                 keys.sort();
-                Ok(keys.into_iter().map(|k| k.as_str().into()).collect::<Vec<VecU8>>().into())
+                Ok(keys
+                    .into_iter()
+                    .map(|k| k.as_str().into())
+                    .collect::<Vec<VecU8>>()
+                    .into())
             }
             _ => Err(self.type_error("map")),
         }
@@ -414,7 +465,7 @@ impl AvroValue {
         let key = utf8(raw_key)?;
         match &self.value {
             Value::Map(entries) => match entries.get(key) {
-                Some(v) => Ok(Self::wrap(v.clone())),
+                Some(v) => Ok(Self { value: v.clone() }),
                 None => Err(format!("Key '{}' not found in map", key).into()),
             },
             _ => Err(self.type_error("map")),
@@ -454,7 +505,7 @@ impl AvroValue {
         match &self.value {
             Value::Record(fields) => {
                 match fields.iter().find(|(field_name, _)| field_name == name) {
-                    Some((_, v)) => Ok(Self::wrap(v.clone())),
+                    Some((_, v)) => Ok(Self { value: v.clone() }),
                     None => Err(format!("Field '{}' not found in record", name).into()),
                 }
             }
@@ -465,9 +516,7 @@ impl AvroValue {
     pub fn has_record_field(&self, raw_name: &[u8]) -> Result<bool, VecU8> {
         let name = utf8(raw_name)?;
         match &self.value {
-            Value::Record(fields) => {
-                Ok(fields.iter().any(|(field_name, _)| field_name == name))
-            }
+            Value::Record(fields) => Ok(fields.iter().any(|(field_name, _)| field_name == name)),
             _ => Err(self.type_error("record")),
         }
     }
@@ -515,117 +564,41 @@ impl AvroValue {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Type predicates.
-    // ------------------------------------------------------------------
-
-    pub fn is_null(&self) -> bool {
-        matches!(self.value, Value::Null)
+    /// Returns the value variant without allocating a string.
+    pub fn schema_type(&self) -> SchemaType {
+        Self::schema_type_of(&self.value)
     }
 
-    pub fn is_boolean(&self) -> bool {
-        matches!(self.value, Value::Boolean(_))
-    }
-
-    pub fn is_int(&self) -> bool {
-        matches!(self.value, Value::Int(_))
-    }
-
-    pub fn is_long(&self) -> bool {
-        matches!(self.value, Value::Long(_))
-    }
-
-    pub fn is_float(&self) -> bool {
-        matches!(self.value, Value::Float(_))
-    }
-
-    pub fn is_double(&self) -> bool {
-        matches!(self.value, Value::Double(_))
-    }
-
-    pub fn is_bytes(&self) -> bool {
-        matches!(self.value, Value::Bytes(_))
-    }
-
-    pub fn is_string(&self) -> bool {
-        matches!(self.value, Value::String(_))
-    }
-
-    pub fn is_record(&self) -> bool {
-        matches!(self.value, Value::Record(_))
-    }
-
-    pub fn is_enum(&self) -> bool {
-        matches!(self.value, Value::Enum(_, _))
-    }
-
-    pub fn is_array(&self) -> bool {
-        matches!(self.value, Value::Array(_))
-    }
-
-    pub fn is_map(&self) -> bool {
-        matches!(self.value, Value::Map(_))
-    }
-
-    pub fn is_union(&self) -> bool {
-        matches!(self.value, Value::Union(_, _))
-    }
-
-    pub fn is_fixed(&self) -> bool {
-        matches!(self.value, Value::Fixed(_, _))
-    }
-
-    pub fn is_decimal(&self) -> bool {
-        matches!(self.value, Value::Decimal(_))
-    }
-
-    pub fn is_uuid(&self) -> bool {
-        matches!(self.value, Value::Uuid(_))
-    }
-
-    pub fn is_date(&self) -> bool {
-        matches!(self.value, Value::Date(_))
-    }
-
-    pub fn is_time_millis(&self) -> bool {
-        matches!(self.value, Value::TimeMillis(_))
-    }
-
-    pub fn is_time_micros(&self) -> bool {
-        matches!(self.value, Value::TimeMicros(_))
-    }
-
-    pub fn is_timestamp_millis(&self) -> bool {
-        matches!(self.value, Value::TimestampMillis(_))
-    }
-
-    pub fn is_timestamp_micros(&self) -> bool {
-        matches!(self.value, Value::TimestampMicros(_))
-    }
-
-    pub fn is_timestamp_nanos(&self) -> bool {
-        matches!(self.value, Value::TimestampNanos(_))
-    }
-
-    pub fn is_local_timestamp_millis(&self) -> bool {
-        matches!(self.value, Value::LocalTimestampMillis(_))
-    }
-
-    pub fn is_local_timestamp_micros(&self) -> bool {
-        matches!(self.value, Value::LocalTimestampMicros(_))
-    }
-
-    pub fn is_local_timestamp_nanos(&self) -> bool {
-        matches!(self.value, Value::LocalTimestampNanos(_))
-    }
-
-    pub fn is_duration(&self) -> bool {
-        matches!(self.value, Value::Duration(_))
-    }
-
-    /// Returns the name of the value's type, e.g. "record" or "int".
-    pub fn type_name(&self) -> VecU8 {
-        self.type_name_str().into()
+    fn schema_type_of(value: &Value) -> SchemaType {
+        match value {
+            Value::Null => SchemaType::Null,
+            Value::Boolean(_) => SchemaType::Boolean,
+            Value::Int(_) => SchemaType::Int,
+            Value::Long(_) => SchemaType::Long,
+            Value::Float(_) => SchemaType::Float,
+            Value::Double(_) => SchemaType::Double,
+            Value::Bytes(_) => SchemaType::Bytes,
+            Value::String(_) => SchemaType::String,
+            Value::Fixed(_, _) => SchemaType::Fixed,
+            Value::Enum(_, _) => SchemaType::Enum,
+            Value::Union(_, _) => SchemaType::Union,
+            Value::Array(_) => SchemaType::Array,
+            Value::Map(_) => SchemaType::Map,
+            Value::Record(_) => SchemaType::Record,
+            Value::Date(_) => SchemaType::Date,
+            Value::Decimal(_) => SchemaType::Decimal,
+            Value::BigDecimal(_) => SchemaType::BigDecimal,
+            Value::TimeMillis(_) => SchemaType::TimeMillis,
+            Value::TimeMicros(_) => SchemaType::TimeMicros,
+            Value::TimestampMillis(_) => SchemaType::TimestampMillis,
+            Value::TimestampMicros(_) => SchemaType::TimestampMicros,
+            Value::TimestampNanos(_) => SchemaType::TimestampNanos,
+            Value::LocalTimestampMillis(_) => SchemaType::LocalTimestampMillis,
+            Value::LocalTimestampMicros(_) => SchemaType::LocalTimestampMicros,
+            Value::LocalTimestampNanos(_) => SchemaType::LocalTimestampNanos,
+            Value::Duration(_) => SchemaType::Duration,
+            Value::Uuid(_) => SchemaType::Uuid,
+        }
     }
 
     // ------------------------------------------------------------------
@@ -642,7 +615,7 @@ impl AvroValue {
     /// resolved value. Returns an error if the value cannot be resolved.
     pub fn resolve(&self, schema: &AvroSchema) -> Result<AvroValue, VecU8> {
         catch_panic(|| match self.value.clone().resolve(&schema.schema) {
-            Ok(value) => Ok(Self::wrap(value)),
+            Ok(value) => Ok(Self { value }),
             Err(err) => Err(err.to_string().into()),
         })
     }
@@ -653,7 +626,9 @@ impl AvroValue {
         catch_panic(|| {
             let json = serde_json::Value::try_from(self.value.clone())
                 .map_err(|err| VecU8::from(err.to_string()))?;
-            serde_json::to_string(&json).map(VecU8::from).map_err(|err| err.to_string().into())
+            serde_json::to_string(&json)
+                .map(VecU8::from)
+                .map_err(|err| err.to_string().into())
         })
     }
 
@@ -662,40 +637,17 @@ impl AvroValue {
         self.value == other.value
     }
 
-    fn type_name_str(&self) -> &'static str {
-        match &self.value {
-            Value::Null => "null",
-            Value::Boolean(_) => "boolean",
-            Value::Int(_) => "int",
-            Value::Long(_) => "long",
-            Value::Float(_) => "float",
-            Value::Double(_) => "double",
-            Value::Bytes(_) => "bytes",
-            Value::String(_) => "string",
-            Value::Fixed(_, _) => "fixed",
-            Value::Enum(_, _) => "enum",
-            Value::Union(_, _) => "union",
-            Value::Array(_) => "array",
-            Value::Map(_) => "map",
-            Value::Record(_) => "record",
-            Value::Date(_) => "date",
-            Value::Decimal(_) => "decimal",
-            Value::BigDecimal(_) => "big-decimal",
-            Value::TimeMillis(_) => "time-millis",
-            Value::TimeMicros(_) => "time-micros",
-            Value::TimestampMillis(_) => "timestamp-millis",
-            Value::TimestampMicros(_) => "timestamp-micros",
-            Value::TimestampNanos(_) => "timestamp-nanos",
-            Value::LocalTimestampMillis(_) => "local-timestamp-millis",
-            Value::LocalTimestampMicros(_) => "local-timestamp-micros",
-            Value::LocalTimestampNanos(_) => "local-timestamp-nanos",
-            Value::Duration(_) => "duration",
-            Value::Uuid(_) => "uuid",
-        }
+    fn schema_type_name(&self) -> &'static str {
+        self.schema_type().name()
     }
 
     fn type_error(&self, expected: &str) -> VecU8 {
-        format!("Value is not {}; actual type is {}", expected, self.type_name_str()).into()
+        format!(
+            "Value is not {}; actual type is {}",
+            expected,
+            self.schema_type_name()
+        )
+        .into()
     }
 }
 
@@ -762,7 +714,10 @@ impl AvroPath {
     /// `create` rather than `new` because `new` is reserved in the generated
     /// C++.)
     pub fn create() -> AvroPath {
-        AvroPath { steps: Vec::new(), len: 0 }
+        AvroPath {
+            steps: Vec::new(),
+            len: 0,
+        }
     }
 
     /// Appends a record field name. Errors if `name` is not valid UTF-8.
@@ -860,7 +815,11 @@ impl AvroPath {
                 Step::Key(key) => out.push_str(&format!("[\"{}\"]", key)),
             }
         }
-        if out.is_empty() { "<root>".to_string() } else { out }
+        if out.is_empty() {
+            "<root>".to_string()
+        } else {
+            out
+        }
     }
 }
 
@@ -875,9 +834,10 @@ impl AvroValue {
         for (depth, step) in path.steps[..path.len].iter().enumerate() {
             current = Self::unwrap_unions(current);
             let next = match (step, current) {
-                (Step::Field(name), Value::Record(fields)) => {
-                    fields.iter().find(|(field, _)| field == name).map(|(_, v)| v)
-                }
+                (Step::Field(name), Value::Record(fields)) => fields
+                    .iter()
+                    .find(|(field, _)| field == name)
+                    .map(|(_, v)| v),
                 (Step::Index(index), Value::Array(items)) => items.get(*index),
                 (Step::Key(key), Value::Map(entries)) => entries.get(key),
                 _ => None,
@@ -918,7 +878,10 @@ impl AvroValue {
             "Value at path {} is not {}; actual type is {}",
             path.describe(),
             expected,
-            AvroValue { value: actual.clone() }.type_name_str()
+            AvroValue {
+                value: actual.clone()
+            }
+            .schema_type_name()
         )
         .into()
     }
@@ -980,10 +943,9 @@ impl AvroValue {
         Ok(matches!(self.at_leaf(path)?, Value::Null))
     }
 
-    /// Returns the name of the type at `path`, e.g. "record" or "int".
-    pub fn type_name_at(&self, path: &AvroPath) -> Result<VecU8, VecU8> {
-        let value = self.at_leaf(path)?.clone();
-        Ok(AvroValue { value }.type_name())
+    /// Returns the schema variant at `path`.
+    pub fn schema_type_at(&self, path: &AvroPath) -> Result<SchemaType, VecU8> {
+        Ok(Self::schema_type_of(self.at_leaf(path)?))
     }
 
     // ------------------------------------------------------------------
@@ -1018,7 +980,11 @@ impl AvroValue {
             Value::Map(entries) => {
                 let mut keys: Vec<&String> = entries.keys().collect();
                 keys.sort();
-                Ok(keys.into_iter().map(|k| k.as_str().into()).collect::<Vec<VecU8>>().into())
+                Ok(keys
+                    .into_iter()
+                    .map(|k| k.as_str().into())
+                    .collect::<Vec<VecU8>>()
+                    .into())
             }
             other => Err(Self::at_type_error(path, other, "map")),
         }
@@ -1040,7 +1006,9 @@ impl AvroValue {
     /// callers that really do want an owned value; the `*_at` leaf readers
     /// above exist so that reaching a leaf does not have to.
     pub fn get_value_at(&self, path: &AvroPath) -> Result<AvroValue, VecU8> {
-        Ok(AvroValue { value: self.at(path)?.clone() })
+        Ok(AvroValue {
+            value: self.at(path)?.clone(),
+        })
     }
 }
 
@@ -1050,25 +1018,32 @@ mod tests {
 
     #[test]
     fn primitive_roundtrips() {
-        assert!(AvroValue::create_null().is_null());
+        assert_eq!(AvroValue::create_null().schema_type(), SchemaType::Null);
         assert!(AvroValue::create_boolean(true).get_boolean().unwrap());
         assert_eq!(AvroValue::create_int(-42).get_int().unwrap(), -42);
         assert_eq!(AvroValue::create_long(1 << 40).get_long().unwrap(), 1 << 40);
         assert_eq!(AvroValue::create_float(1.5).get_float().unwrap(), 1.5);
         assert_eq!(AvroValue::create_double(2.5).get_double().unwrap(), 2.5);
         assert_eq!(
-            AvroValue::create_bytes(&[1, 2, 3]).get_bytes().unwrap().as_slice(),
+            AvroValue::create_bytes(&[1, 2, 3])
+                .get_bytes()
+                .unwrap()
+                .as_slice(),
             &[1, 2, 3]
         );
         assert_eq!(
-            AvroValue::create_string(b"hello").unwrap().get_string().unwrap().as_slice(),
+            AvroValue::create_string(b"hello")
+                .unwrap()
+                .get_string()
+                .unwrap()
+                .as_slice(),
             b"hello"
         );
     }
 
     #[test]
     fn default_is_null() {
-        assert!(AvroValue::default().is_null());
+        assert_eq!(AvroValue::default().schema_type(), SchemaType::Null);
     }
 
     #[test]
@@ -1089,7 +1064,7 @@ mod tests {
     #[test]
     fn enum_roundtrip() {
         let v = AvroValue::create_enum(2, b"GREEN").unwrap();
-        assert!(v.is_enum());
+        assert_eq!(v.schema_type(), SchemaType::Enum);
         assert_eq!(v.get_enum_position().unwrap(), 2);
         assert_eq!(v.get_enum_symbol().unwrap().as_slice(), b"GREEN");
     }
@@ -1097,7 +1072,7 @@ mod tests {
     #[test]
     fn fixed_roundtrip() {
         let v = AvroValue::create_fixed(&[9, 8, 7, 6]);
-        assert!(v.is_fixed());
+        assert_eq!(v.schema_type(), SchemaType::Fixed);
         assert_eq!(v.get_fixed_bytes().unwrap().as_slice(), &[9, 8, 7, 6]);
     }
 
@@ -1105,7 +1080,7 @@ mod tests {
     fn union_roundtrip() {
         let inner = AvroValue::create_long(7);
         let v = AvroValue::create_union(1, &inner);
-        assert!(v.is_union());
+        assert_eq!(v.schema_type(), SchemaType::Union);
         assert_eq!(v.get_union_branch().unwrap(), 1);
         assert!(v.get_union_value().unwrap().equals(&inner));
     }
@@ -1124,7 +1099,10 @@ mod tests {
         // Replacing an existing field keeps field order and count.
         record.record_put(b"a", &AvroValue::create_int(10)).unwrap();
         assert_eq!(record.get_record_len().unwrap(), 2);
-        assert_eq!(record.get_record_field(b"a").unwrap().get_int().unwrap(), 10);
+        assert_eq!(
+            record.get_record_field(b"a").unwrap().get_int().unwrap(),
+            10
+        );
 
         let names = record.get_record_field_names().unwrap();
         assert_eq!(names.as_slice()[0].as_slice(), b"a");
@@ -1140,7 +1118,11 @@ mod tests {
         assert_eq!(array.get_array_item(1).unwrap().get_int().unwrap(), 2);
         assert!(array.get_array_item(2).is_err());
         // Mutating a non-array fails.
-        assert!(AvroValue::create_int(0).array_push(&AvroValue::create_null()).is_err());
+        assert!(
+            AvroValue::create_int(0)
+                .array_push(&AvroValue::create_null())
+                .is_err()
+        );
     }
 
     #[test]
@@ -1168,11 +1150,11 @@ mod tests {
     #[test]
     fn logical_type_roundtrips() {
         let decimal = AvroValue::create_decimal(&[1, 24]);
-        assert!(decimal.is_decimal());
+        assert_eq!(decimal.schema_type(), SchemaType::Decimal);
         assert_eq!(decimal.get_decimal_bytes().unwrap().as_slice(), &[1, 24]);
 
         let uuid = AvroValue::create_uuid(b"6f2b0e76-4d3d-4f8e-9d3a-2e1b8a7c6d5e").unwrap();
-        assert!(uuid.is_uuid());
+        assert_eq!(uuid.schema_type(), SchemaType::Uuid);
         assert_eq!(
             uuid.get_uuid().unwrap().as_slice(),
             b"6f2b0e76-4d3d-4f8e-9d3a-2e1b8a7c6d5e"
@@ -1180,26 +1162,53 @@ mod tests {
         assert!(AvroValue::create_uuid(b"not-a-uuid").is_err());
 
         assert_eq!(AvroValue::create_date(19000).get_date().unwrap(), 19000);
-        assert_eq!(AvroValue::create_time_millis(1).get_time_millis().unwrap(), 1);
-        assert_eq!(AvroValue::create_time_micros(2).get_time_micros().unwrap(), 2);
-        assert_eq!(AvroValue::create_timestamp_millis(3).get_timestamp_millis().unwrap(), 3);
-        assert_eq!(AvroValue::create_timestamp_micros(4).get_timestamp_micros().unwrap(), 4);
-        assert_eq!(AvroValue::create_timestamp_nanos(5).get_timestamp_nanos().unwrap(), 5);
         assert_eq!(
-            AvroValue::create_local_timestamp_millis(6).get_local_timestamp_millis().unwrap(),
+            AvroValue::create_time_millis(1).get_time_millis().unwrap(),
+            1
+        );
+        assert_eq!(
+            AvroValue::create_time_micros(2).get_time_micros().unwrap(),
+            2
+        );
+        assert_eq!(
+            AvroValue::create_timestamp_millis(3)
+                .get_timestamp_millis()
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            AvroValue::create_timestamp_micros(4)
+                .get_timestamp_micros()
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            AvroValue::create_timestamp_nanos(5)
+                .get_timestamp_nanos()
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            AvroValue::create_local_timestamp_millis(6)
+                .get_local_timestamp_millis()
+                .unwrap(),
             6
         );
         assert_eq!(
-            AvroValue::create_local_timestamp_micros(7).get_local_timestamp_micros().unwrap(),
+            AvroValue::create_local_timestamp_micros(7)
+                .get_local_timestamp_micros()
+                .unwrap(),
             7
         );
         assert_eq!(
-            AvroValue::create_local_timestamp_nanos(8).get_local_timestamp_nanos().unwrap(),
+            AvroValue::create_local_timestamp_nanos(8)
+                .get_local_timestamp_nanos()
+                .unwrap(),
             8
         );
 
         let duration = AvroValue::create_duration(1, 2, 3);
-        assert!(duration.is_duration());
+        assert_eq!(duration.schema_type(), SchemaType::Duration);
         assert_eq!(duration.get_duration_months().unwrap(), 1);
         assert_eq!(duration.get_duration_days().unwrap(), 2);
         assert_eq!(duration.get_duration_millis().unwrap(), 3);
@@ -1219,14 +1228,22 @@ mod tests {
         assert_eq!(resolved.get_long().unwrap(), 41);
 
         let string_schema = AvroSchema::parse(b"\"string\"").unwrap();
-        assert!(AvroValue::create_boolean(true).resolve(&string_schema).is_err());
+        assert!(
+            AvroValue::create_boolean(true)
+                .resolve(&string_schema)
+                .is_err()
+        );
     }
 
     #[test]
     fn to_json_string_renders_records() {
         let mut record = AvroValue::create_record();
-        record.record_put(b"id", &AvroValue::create_long(7)).unwrap();
-        record.record_put(b"name", &AvroValue::create_string(b"x").unwrap()).unwrap();
+        record
+            .record_put(b"id", &AvroValue::create_long(7))
+            .unwrap();
+        record
+            .record_put(b"name", &AvroValue::create_string(b"x").unwrap())
+            .unwrap();
         let json = String::from_utf8(record.to_json_string().unwrap().into_vec()).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["id"], 7);
@@ -1288,7 +1305,7 @@ mod tests {
         let root = AvroPath::create();
         assert!(root.is_empty());
         assert_eq!(record.get_record_len_at(&root).unwrap(), 3);
-        assert_eq!(record.type_name_at(&root).unwrap().as_slice(), b"record");
+        assert_eq!(record.schema_type_at(&root).unwrap(), SchemaType::Record);
     }
 
     #[test]
@@ -1326,7 +1343,10 @@ mod tests {
         // get_value_at keeps the union itself, so it stays inspectable.
         let mut contact = AvroPath::create();
         contact.push_field(b"contact").unwrap();
-        assert!(wrapped.get_value_at(&contact).unwrap().is_union());
+        assert_eq!(
+            wrapped.get_value_at(&contact).unwrap().schema_type(),
+            SchemaType::Union
+        );
     }
 
     #[test]
@@ -1389,16 +1409,19 @@ mod tests {
             .unwrap()
             .get_string()
             .unwrap();
-        assert_eq!(record.get_string_at(&path).unwrap().as_slice(), by_clone.as_slice());
+        assert_eq!(
+            record.get_string_at(&path).unwrap().as_slice(),
+            by_clone.as_slice()
+        );
     }
 
     #[test]
-    fn type_names() {
-        assert_eq!(AvroValue::create_null().type_name().as_slice(), b"null");
-        assert_eq!(AvroValue::create_record().type_name().as_slice(), b"record");
+    fn schema_types() {
+        assert_eq!(AvroValue::create_null().schema_type(), SchemaType::Null);
+        assert_eq!(AvroValue::create_record().schema_type(), SchemaType::Record);
         assert_eq!(
-            AvroValue::create_timestamp_micros(1).type_name().as_slice(),
-            b"timestamp-micros"
+            AvroValue::create_timestamp_micros(1).schema_type(),
+            SchemaType::TimestampMicros
         );
     }
 }

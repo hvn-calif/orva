@@ -148,7 +148,8 @@ fn metrics_map(columns: i32, bytes_value: bool) -> AvroValue {
     let mut array = AvroValue::create_array();
     for column in 0..columns {
         let mut pair = AvroValue::create_record();
-        pair.record_put(b"key", &AvroValue::create_int(column)).unwrap();
+        pair.record_put(b"key", &AvroValue::create_int(column))
+            .unwrap();
         let value = if bytes_value {
             AvroValue::create_bytes(&[0x5a; 16])
         } else {
@@ -163,38 +164,83 @@ fn metrics_map(columns: i32, bytes_value: bool) -> AvroValue {
 fn manifest_entry(columns: i32) -> AvroValue {
     let mut partition = AvroValue::create_record();
     partition
-        .record_put(b"dept", &optional(AvroValue::create_string(b"engineering").unwrap()))
+        .record_put(
+            b"dept",
+            &optional(AvroValue::create_string(b"engineering").unwrap()),
+        )
         .unwrap();
-    partition.record_put(b"event_day", &optional(AvroValue::create_int(20630))).unwrap();
+    partition
+        .record_put(b"event_day", &optional(AvroValue::create_int(20630)))
+        .unwrap();
 
     let mut offsets = AvroValue::create_array();
     for split in 0..8i64 {
-        offsets.array_push(&AvroValue::create_long(4 + split * 6553600)).unwrap();
+        offsets
+            .array_push(&AvroValue::create_long(4 + split * 6553600))
+            .unwrap();
     }
 
     let mut file = AvroValue::create_record();
-    file.record_put(b"content", &AvroValue::create_int(0)).unwrap();
-    file.record_put(b"file_path", &AvroValue::create_string(FILE_PATH).unwrap()).unwrap();
-    file.record_put(b"file_format", &AvroValue::create_string(b"parquet").unwrap()).unwrap();
+    file.record_put(b"content", &AvroValue::create_int(0))
+        .unwrap();
+    file.record_put(b"file_path", &AvroValue::create_string(FILE_PATH).unwrap())
+        .unwrap();
+    file.record_put(
+        b"file_format",
+        &AvroValue::create_string(b"parquet").unwrap(),
+    )
+    .unwrap();
     file.record_put(b"partition", &partition).unwrap();
-    file.record_put(b"record_count", &AvroValue::create_long(100_017)).unwrap();
-    file.record_put(b"file_size_in_bytes", &AvroValue::create_long(52_428_800)).unwrap();
-    file.record_put(b"column_sizes", &metrics_map(columns, false)).unwrap();
-    file.record_put(b"value_counts", &metrics_map(columns, false)).unwrap();
-    file.record_put(b"null_value_counts", &metrics_map(columns, false)).unwrap();
-    file.record_put(b"nan_value_counts", &metrics_map(columns, false)).unwrap();
-    file.record_put(b"lower_bounds", &metrics_map(columns, true)).unwrap();
-    file.record_put(b"upper_bounds", &metrics_map(columns, true)).unwrap();
-    file.record_put(b"key_metadata", &AvroValue::create_union(0, &AvroValue::create_null())).unwrap();
-    file.record_put(b"split_offsets", &optional(offsets)).unwrap();
-    file.record_put(b"equality_ids", &AvroValue::create_union(0, &AvroValue::create_null())).unwrap();
-    file.record_put(b"sort_order_id", &optional(AvroValue::create_int(0))).unwrap();
+    file.record_put(b"record_count", &AvroValue::create_long(100_017))
+        .unwrap();
+    file.record_put(b"file_size_in_bytes", &AvroValue::create_long(52_428_800))
+        .unwrap();
+    file.record_put(b"column_sizes", &metrics_map(columns, false))
+        .unwrap();
+    file.record_put(b"value_counts", &metrics_map(columns, false))
+        .unwrap();
+    file.record_put(b"null_value_counts", &metrics_map(columns, false))
+        .unwrap();
+    file.record_put(b"nan_value_counts", &metrics_map(columns, false))
+        .unwrap();
+    file.record_put(b"lower_bounds", &metrics_map(columns, true))
+        .unwrap();
+    file.record_put(b"upper_bounds", &metrics_map(columns, true))
+        .unwrap();
+    file.record_put(
+        b"key_metadata",
+        &AvroValue::create_union(0, &AvroValue::create_null()),
+    )
+    .unwrap();
+    file.record_put(b"split_offsets", &optional(offsets))
+        .unwrap();
+    file.record_put(
+        b"equality_ids",
+        &AvroValue::create_union(0, &AvroValue::create_null()),
+    )
+    .unwrap();
+    file.record_put(b"sort_order_id", &optional(AvroValue::create_int(0)))
+        .unwrap();
 
     let mut entry = AvroValue::create_record();
-    entry.record_put(b"status", &AvroValue::create_int(1)).unwrap();
-    entry.record_put(b"snapshot_id", &optional(AvroValue::create_long(7_856_392_845_000_000_000))).unwrap();
-    entry.record_put(b"sequence_number", &optional(AvroValue::create_long(33))).unwrap();
-    entry.record_put(b"file_sequence_number", &optional(AvroValue::create_long(33))).unwrap();
+    entry
+        .record_put(b"status", &AvroValue::create_int(1))
+        .unwrap();
+    entry
+        .record_put(
+            b"snapshot_id",
+            &optional(AvroValue::create_long(7_856_392_845_000_000_000)),
+        )
+        .unwrap();
+    entry
+        .record_put(b"sequence_number", &optional(AvroValue::create_long(33)))
+        .unwrap();
+    entry
+        .record_put(
+            b"file_sequence_number",
+            &optional(AvroValue::create_long(33)),
+        )
+        .unwrap();
     entry.record_put(b"data_file", &file).unwrap();
     entry
 }
@@ -231,7 +277,13 @@ fn manifest_decode_allocation_profile() {
         drop(resolved);
         drop(projected);
 
-        profile.push((columns, payload.len(), full_cost, resolved_cost, projected_cost));
+        profile.push((
+            columns,
+            payload.len(),
+            full_cost,
+            resolved_cost,
+            projected_cost,
+        ));
     }
 
     println!();
@@ -240,8 +292,14 @@ fn manifest_decode_allocation_profile() {
     println!();
     println!(
         "{:>7}  {:>8}  {:>9}  {:>10}  {:>9}  {:>10}  {:>9}  {:>10}",
-        "columns", "payload", "full ops", "full bytes", "resv ops", "resv bytes",
-        "proj ops", "proj bytes"
+        "columns",
+        "payload",
+        "full ops",
+        "full bytes",
+        "resv ops",
+        "resv bytes",
+        "proj ops",
+        "proj bytes"
     );
     for (columns, payload, full, resolved, projected) in &profile {
         println!(
@@ -272,9 +330,9 @@ fn manifest_decode_allocation_profile() {
         twenty.2.operations, twenty.3.operations, twenty.4.operations
     );
 
-    // The first call builds the caller-owned tree and compiles the identity
-    // decode plan. Measure the second same-shaped entry, which is the steady
-    // state of DataFileReader::next_value_into.
+    // The first call builds the caller-owned tree and initializes Apache's
+    // reusable datum reader. Measure the second same-shaped entry, which is
+    // the steady state of DataFileReader::next_value_into.
     let entry = manifest_entry(20);
     let mut writer = DataFileWriter::create(&schema, AvroCodec::Null).unwrap();
     writer.append(&entry).unwrap();

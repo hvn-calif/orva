@@ -1,12 +1,82 @@
 //! Crubit-friendly wrapper around `apache_avro::Schema`.
 
 use crate::make_vec_type;
-use crate::vec_u8::{catch_panic, utf8, Status, VecU8};
+use crate::vec_u8::{Status, VecU8, catch_panic, utf8};
+use apache_avro::Schema;
 use apache_avro::rabin::Rabin;
 use apache_avro::schema_compatibility::SchemaCompatibility;
-use apache_avro::Schema;
 use md5::Md5;
 use sha2::Sha256;
+
+/// The Avro schema/value variant exposed across the C++ boundary.
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaType {
+    #[default]
+    Null,
+    Boolean,
+    Int,
+    Long,
+    Float,
+    Double,
+    Bytes,
+    String,
+    Record,
+    Enum,
+    Array,
+    Map,
+    Union,
+    Fixed,
+    Decimal,
+    BigDecimal,
+    Uuid,
+    Date,
+    TimeMillis,
+    TimeMicros,
+    TimestampMillis,
+    TimestampMicros,
+    TimestampNanos,
+    LocalTimestampMillis,
+    LocalTimestampMicros,
+    LocalTimestampNanos,
+    Duration,
+    Ref,
+}
+
+impl SchemaType {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Boolean => "boolean",
+            Self::Int => "int",
+            Self::Long => "long",
+            Self::Float => "float",
+            Self::Double => "double",
+            Self::Bytes => "bytes",
+            Self::String => "string",
+            Self::Record => "record",
+            Self::Enum => "enum",
+            Self::Array => "array",
+            Self::Map => "map",
+            Self::Union => "union",
+            Self::Fixed => "fixed",
+            Self::Decimal => "decimal",
+            Self::BigDecimal => "big-decimal",
+            Self::Uuid => "uuid",
+            Self::Date => "date",
+            Self::TimeMillis => "time-millis",
+            Self::TimeMicros => "time-micros",
+            Self::TimestampMillis => "timestamp-millis",
+            Self::TimestampMicros => "timestamp-micros",
+            Self::TimestampNanos => "timestamp-nanos",
+            Self::LocalTimestampMillis => "local-timestamp-millis",
+            Self::LocalTimestampMicros => "local-timestamp-micros",
+            Self::LocalTimestampNanos => "local-timestamp-nanos",
+            Self::Duration => "duration",
+            Self::Ref => "ref",
+        }
+    }
+}
 
 /// Wrapper around an Avro schema. Replaces avrocpp's `ValidSchema`.
 #[derive(Debug, Clone, PartialEq)]
@@ -16,7 +86,9 @@ pub struct AvroSchema {
 
 impl Default for AvroSchema {
     fn default() -> Self {
-        AvroSchema { schema: Schema::Null }
+        AvroSchema {
+            schema: Schema::Null,
+        }
     }
 }
 
@@ -92,7 +164,7 @@ impl AvroSchema {
     /// Returns an error for unnamed schemas.
     pub fn name(&self) -> Result<VecU8, VecU8> {
         match self.schema.name() {
-            Some(name) => Ok(name.name.clone().into()),
+            Some(name) => Ok(name.name().to_owned().into()),
             None => Err("Schema is not a named schema".into()),
         }
     }
@@ -102,7 +174,7 @@ impl AvroSchema {
     /// (Named `namespace_name` because `namespace` is a C++ keyword.)
     pub fn namespace_name(&self) -> Result<VecU8, VecU8> {
         match self.schema.name() {
-            Some(name) => Ok(name.namespace.clone().unwrap_or_default().into()),
+            Some(name) => Ok(name.namespace().unwrap_or_default().into()),
             None => Err("Schema is not a named schema".into()),
         }
     }
@@ -124,96 +196,38 @@ impl AvroSchema {
         }
     }
 
-    /// Returns the name of the schema type, e.g. "record" or "int".
-    /// Logical types report their underlying name, e.g. "timestamp-millis".
-    pub fn type_name(&self) -> VecU8 {
-        let name = match &self.schema {
-            Schema::Null => "null",
-            Schema::Boolean => "boolean",
-            Schema::Int => "int",
-            Schema::Long => "long",
-            Schema::Float => "float",
-            Schema::Double => "double",
-            Schema::Bytes => "bytes",
-            Schema::String => "string",
-            Schema::Record(_) => "record",
-            Schema::Enum(_) => "enum",
-            Schema::Array(_) => "array",
-            Schema::Map(_) => "map",
-            Schema::Union(_) => "union",
-            Schema::Fixed(_) => "fixed",
-            Schema::Decimal(_) => "decimal",
-            Schema::BigDecimal => "big-decimal",
-            Schema::Uuid => "uuid",
-            Schema::Date => "date",
-            Schema::TimeMillis => "time-millis",
-            Schema::TimeMicros => "time-micros",
-            Schema::TimestampMillis => "timestamp-millis",
-            Schema::TimestampMicros => "timestamp-micros",
-            Schema::TimestampNanos => "timestamp-nanos",
-            Schema::LocalTimestampMillis => "local-timestamp-millis",
-            Schema::LocalTimestampMicros => "local-timestamp-micros",
-            Schema::LocalTimestampNanos => "local-timestamp-nanos",
-            Schema::Duration => "duration",
-            Schema::Ref { .. } => "ref",
-        };
-        name.into()
-    }
-
-    pub fn is_null(&self) -> bool {
-        matches!(self.schema, Schema::Null)
-    }
-
-    pub fn is_boolean(&self) -> bool {
-        matches!(self.schema, Schema::Boolean)
-    }
-
-    pub fn is_int(&self) -> bool {
-        matches!(self.schema, Schema::Int)
-    }
-
-    pub fn is_long(&self) -> bool {
-        matches!(self.schema, Schema::Long)
-    }
-
-    pub fn is_float(&self) -> bool {
-        matches!(self.schema, Schema::Float)
-    }
-
-    pub fn is_double(&self) -> bool {
-        matches!(self.schema, Schema::Double)
-    }
-
-    pub fn is_bytes(&self) -> bool {
-        matches!(self.schema, Schema::Bytes)
-    }
-
-    pub fn is_string(&self) -> bool {
-        matches!(self.schema, Schema::String)
-    }
-
-    pub fn is_record(&self) -> bool {
-        matches!(self.schema, Schema::Record(_))
-    }
-
-    pub fn is_enum(&self) -> bool {
-        matches!(self.schema, Schema::Enum(_))
-    }
-
-    pub fn is_array(&self) -> bool {
-        matches!(self.schema, Schema::Array(_))
-    }
-
-    pub fn is_map(&self) -> bool {
-        matches!(self.schema, Schema::Map(_))
-    }
-
-    pub fn is_union(&self) -> bool {
-        matches!(self.schema, Schema::Union(_))
-    }
-
-    pub fn is_fixed(&self) -> bool {
-        matches!(self.schema, Schema::Fixed(_))
+    /// Returns the schema variant without allocating a string.
+    pub fn schema_type(&self) -> SchemaType {
+        match &self.schema {
+            Schema::Null => SchemaType::Null,
+            Schema::Boolean => SchemaType::Boolean,
+            Schema::Int => SchemaType::Int,
+            Schema::Long => SchemaType::Long,
+            Schema::Float => SchemaType::Float,
+            Schema::Double => SchemaType::Double,
+            Schema::Bytes => SchemaType::Bytes,
+            Schema::String => SchemaType::String,
+            Schema::Record(_) => SchemaType::Record,
+            Schema::Enum(_) => SchemaType::Enum,
+            Schema::Array(_) => SchemaType::Array,
+            Schema::Map(_) => SchemaType::Map,
+            Schema::Union(_) => SchemaType::Union,
+            Schema::Fixed(_) => SchemaType::Fixed,
+            Schema::Decimal(_) => SchemaType::Decimal,
+            Schema::BigDecimal => SchemaType::BigDecimal,
+            Schema::Uuid(_) => SchemaType::Uuid,
+            Schema::Date => SchemaType::Date,
+            Schema::TimeMillis => SchemaType::TimeMillis,
+            Schema::TimeMicros => SchemaType::TimeMicros,
+            Schema::TimestampMillis => SchemaType::TimestampMillis,
+            Schema::TimestampMicros => SchemaType::TimestampMicros,
+            Schema::TimestampNanos => SchemaType::TimestampNanos,
+            Schema::LocalTimestampMillis => SchemaType::LocalTimestampMillis,
+            Schema::LocalTimestampMicros => SchemaType::LocalTimestampMicros,
+            Schema::LocalTimestampNanos => SchemaType::LocalTimestampNanos,
+            Schema::Duration(_) => SchemaType::Duration,
+            Schema::Ref { .. } => SchemaType::Ref,
+        }
     }
 
     /// Checks that data written with the `writer` schema can be read using
@@ -221,7 +235,7 @@ impl AvroSchema {
     /// the incompatibility reason otherwise.
     pub fn can_read_from(&self, writer: &AvroSchema) -> Status {
         match SchemaCompatibility::can_read(&writer.schema, &self.schema) {
-            Ok(()) => Ok(0),
+            Ok(_) => Ok(0),
             Err(err) => Err(err.to_string().into()),
         }
     }
@@ -230,7 +244,7 @@ impl AvroSchema {
     /// other one.
     pub fn mutual_read(&self, other: &AvroSchema) -> Status {
         match SchemaCompatibility::mutual_read(&other.schema, &self.schema) {
-            Ok(()) => Ok(0),
+            Ok(_) => Ok(0),
             Err(err) => Err(err.to_string().into()),
         }
     }
@@ -260,15 +274,13 @@ mod tests {
     #[test]
     fn parse_primitive() {
         let schema = AvroSchema::parse(b"\"int\"").unwrap();
-        assert!(schema.is_int());
-        assert!(!schema.is_long());
-        assert_eq!(schema.type_name().as_slice(), b"int");
+        assert_eq!(schema.schema_type(), SchemaType::Int);
     }
 
     #[test]
     fn parse_record() {
         let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
-        assert!(schema.is_record());
+        assert_eq!(schema.schema_type(), SchemaType::Record);
         assert_eq!(schema.name().unwrap().as_slice(), b"User");
         assert_eq!(schema.namespace_name().unwrap().as_slice(), b"com.example");
         assert_eq!(schema.full_name().unwrap().as_slice(), b"com.example.User");
@@ -293,8 +305,7 @@ mod tests {
     #[test]
     fn canonical_form_of_record() {
         // Test case 019 from apache/avro share/test/data/schema-tests.txt.
-        let schema =
-            AvroSchema::parse(br#"{"fields":[], "type":"record", "name":"foo"}"#).unwrap();
+        let schema = AvroSchema::parse(br#"{"fields":[], "type":"record", "name":"foo"}"#).unwrap();
         assert_eq!(
             schema.canonical_form().as_slice(),
             br#"{"name":"foo","type":"record","fields":[]}"#

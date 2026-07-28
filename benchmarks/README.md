@@ -106,14 +106,16 @@ target each.
 
   The `ours_reuse/*` rows use `DataFileReader::NextValueInto`, overwriting one
   caller-owned `AvroValue` exactly as avro-cpp overwrites one
-  `GenericDatum`. Same-process 20-column medians (2000 entries, null codec,
-  seven repetitions):
+  `GenericDatum`. The reusable binary decoder lives in apache-avro;
+  orva only caches its owning datum reader at the container boundary.
+  Same-process 20-column medians (2000 entries, null codec, seven
+  repetitions):
 
   | work | owned value | reusable value | avrocpp | reusable vs avrocpp |
   |------|------------:|---------------:|--------:|---------------------:|
-  | decode only | 67.0k/s | **322.3k/s** | 109.5k/s | **2.94x faster** |
-  | planner walk | 61.3k/s | **229.5k/s** | 108.8k/s | **2.11x faster** |
-  | full metrics walk | 38.2k/s | **71.7k/s** | 104.6k/s | **1.46x slower** |
+  | decode only | 76.75k/s | **377.2k/s** | 109.09k/s | **3.46x faster** |
+  | planner walk | 68.78k/s | **257.0k/s** | 108.66k/s | **2.37x faster** |
+  | full metrics walk | 41.18k/s | **73.69k/s** | 104.53k/s | **1.42x slower** |
 
   Reuse therefore reverses the full-materialization *decode* comparison, but
   not an exhaustive read-back comparison: thousands of `AvroPath` leaf calls
@@ -121,7 +123,7 @@ target each.
   only planner fields are required because it does not decode the metrics
   bytes at all. The allocation test measures **0 allocator operations and
   0 allocated bytes** for the second same-shaped 20-column entry after
-  warm-up, against 670 operations and 34,564 bytes for an owned decode. Raw
+  warm-up, against 464 operations and 32,350 bytes for an owned decode. Raw
   throughput output and the exact command are in
   `benchmarks/manifest_reuse_results.txt`.
 - `access_probe`: what reading a decoded value back out costs. Every other

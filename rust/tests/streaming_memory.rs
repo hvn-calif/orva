@@ -36,7 +36,10 @@ fn streaming_bounds_working_set_for_large_files() {
 
     // No single incremental drain holds anywhere near the whole file: the
     // writer's working set is bounded to roughly one batch.
-    assert!(max_chunk < 128 * 1024, "drain chunk grew to {max_chunk} bytes");
+    assert!(
+        max_chunk < 128 * 1024,
+        "drain chunk grew to {max_chunk} bytes"
+    );
     assert!(
         file.len() > 4 * max_chunk.max(1),
         "file ({} bytes) should span many drains (max chunk {max_chunk})",
@@ -51,7 +54,10 @@ fn streaming_bounds_working_set_for_large_files() {
         reader.feed(chunk).unwrap();
         while reader.next_ready().unwrap() {
             let value = reader.next_value().unwrap();
-            assert_eq!(value.get_record_field(b"i").unwrap().get_long().unwrap(), expected);
+            assert_eq!(
+                value.get_record_field(b"i").unwrap().get_long().unwrap(),
+                expected
+            );
             expected += 1;
         }
     }

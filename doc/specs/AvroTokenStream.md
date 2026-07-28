@@ -63,11 +63,11 @@ is per-entry CPU cost, not a cache cliff.
 
 Allocation profile, one 20-column entry (rust/tests/manifest_alloc.rs):
 
-- **670 allocator operations** and **34.5 KB of heap** for a **1212-byte**
-  payload: 28x byte amplification.
-- Fixed cost 144 operations; **marginal cost ~26 operations per column**.
-- A projected reader schema costs *more*, not less: **691** operations.
-- After warming the identity plan and caller-owned tree, reusable decode of
+- **464 allocator operations** and **32.4 KB of heap** for a **1212-byte**
+  payload: 27x byte amplification.
+- Fixed cost 58 operations; **marginal cost ~20 operations per column**.
+- A projected reader schema costs *more*, not less: **477** operations.
+- After warming Apache's reusable datum reader and caller-owned tree, decode of
   the next same-shaped entry costs **0 allocator operations and 0 bytes**.
 
 ### What the numbers say
@@ -78,8 +78,8 @@ Three conclusions, in order of how much they change the design:
    original `decode_only` row is 1.30x-2.28x behind, but it returns and drops
    a new owned `Value` per entry while avro-cpp overwrites one
    `GenericDatum`. `NextValueInto` makes the ownership equal. At 20 columns it
-   improves 67.0k to 322.3k entries/s and is **2.94x faster than avro-cpp's
-   109.5k**. This is a 4.81x win from reuse, not an order of magnitude, and
+   improves 76.75k to 377.2k entries/s and is **3.46x faster than avro-cpp's
+   109.09k**. This is a 4.91x win from reuse, not an order of magnitude, and
    it still decodes every metrics byte into a complete tree.
 
 2. **Projection is the largest structural win.** avrocpp's `ResolvingDecoder`
@@ -87,8 +87,8 @@ Three conclusions, in order of how much they change the design:
    faster than its own `decode_only`. apache-avro materializes the full
    writer-schema value and *then* resolves, so our projected read is never
    faster than our unprojected one (4.22x behind at 20 columns, 4.83x at 160,
-   and widening). The allocation test confirms the mechanism: 691 operations
-   projected against 670 unprojected. This is a measured ceiling, not an
+   and widening). The allocation test confirms the mechanism: 477 operations
+   projected against 464 unprojected. This is a measured ceiling, not an
    estimate - avrocpp demonstrates it on the same bytes.
 
 3. **Reading values back out costs 24-31x**, and that is *with* `AvroPath`,
@@ -106,13 +106,20 @@ arrays, unions, strings, bytes, fixed values and enums. It is the same
 ownership contract as avro-cpp's `reader->read(datum)`: the caller consumes
 the value before the next read.
 
+The reusable binary walk is implemented by apache-avro's `Reader::read_into`,
+`GenericDatumReader::read_value_into`, and `OwnedGenericDatumReader`. Orva
+stores one owned datum reader beside its incremental container state and
+only adapts block slices and error types; it does not maintain a duplicate
+full-schema in-place decoder. Orva's byte-level projection decoder remains
+separate because projection is not part of this upstream patch.
+
 Same-process 20-column medians, 2000 entries, null codec, seven repetitions:
 
 | work | owned Rust | reusable Rust | avrocpp | reusable vs avrocpp |
 |------|-----------:|--------------:|--------:|---------------------:|
-| decode only | 67.0k/s | **322.3k/s** | 109.5k/s | **2.94x faster** |
-| planner walk | 61.3k/s | **229.5k/s** | 108.8k/s | **2.11x faster** |
-| full metrics walk | 38.2k/s | **71.7k/s** | 104.6k/s | **1.46x slower** |
+| decode only | 76.75k/s | **377.2k/s** | 109.09k/s | **3.46x faster** |
+| planner walk | 68.78k/s | **257.0k/s** | 108.66k/s | **2.37x faster** |
+| full metrics walk | 41.18k/s | **73.69k/s** | 104.53k/s | **1.42x slower** |
 
 The planner row shows that reuse survives the real C++ bridge and normal
 field access. The full-walk row isolates what remains: roughly 120
@@ -122,12 +129,12 @@ sequential view over an existing tree.
 
 The allocator test also isolates the mechanism from timing: the second
 same-shaped 20-column entry decoded into one caller-owned value performs
-**0 heap allocations**, versus 670 operations and 34,564 bytes for the
+**0 heap allocations**, versus 464 operations and 32,350 bytes for the
 ordinary owned decode. Shape changes and the first value can still allocate.
 
 Projection and reuse are complementary. At 20 columns native projection is
 still about 466.7k entries/s because it skips all metrics bytes; reusable
-full decode is 322.3k decode-only or 229.5k with planner access.
+full decode is 377.2k decode-only or 257.0k with planner access.
 
 ## Outcome (stage 1, implemented)
 
@@ -156,8 +163,8 @@ projection compiled once as a real caller would:
 
 | path | allocator ops | bytes |
 |------|--------------:|------:|
-| full decode | 670 | 34564 |
-| reader-schema resolution | 691 | 38838 |
+| full decode | 464 | 32350 |
+| reader-schema resolution | 477 | 36496 |
 | **byte-level projection** | **8** | **613** |
 
 84x fewer allocations, and **flat in table width**: 8 operations whether the

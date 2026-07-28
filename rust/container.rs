@@ -22,8 +22,9 @@
 use crate::decode::AvroProjection;
 use crate::schema::AvroSchema;
 use crate::value::AvroValue;
-use crate::vec_u8::{catch_panic, utf8, Status, VecU8};
+use crate::vec_u8::{Status, VecU8, catch_panic, utf8};
 use apache_avro::from_avro_datum_schemata;
+use apache_avro::reader::datum::OwnedGenericDatumReader;
 use apache_avro::schema::ResolvedSchema;
 use apache_avro::types::Value;
 use apache_avro::{Codec, Schema, Writer};
@@ -171,7 +172,9 @@ impl DataFileWriter {
 
     /// Returns the schema this writer was created with.
     pub fn schema(&self) -> AvroSchema {
-        AvroSchema { schema: self.schema.clone() }
+        AvroSchema {
+            schema: self.schema.clone(),
+        }
     }
 
     /// Validates `value` against the writer schema and buffers a copy of it.
@@ -194,7 +197,8 @@ impl DataFileWriter {
     /// writer usable), so a caller can inspect or reuse it after an error.
     pub fn append_owned(&mut self, value: &mut AvroValue) -> Status {
         self.check_appendable(value)?;
-        self.pending.push(std::mem::replace(&mut value.value, Value::Null));
+        self.pending
+            .push(std::mem::replace(&mut value.value, Value::Null));
         self.flush_if_batch_full()
     }
 
@@ -208,7 +212,7 @@ impl DataFileWriter {
         if !valid {
             return Err(format!(
                 "Value of type {} does not conform to the writer schema",
-                String::from_utf8_lossy(value.type_name().as_slice())
+                value.schema_type().name()
             )
             .into());
         }
@@ -275,11 +279,16 @@ impl DataFileWriter {
             .codec(self.codec.into())
             .marker(self.marker)
             .has_header(self.header_written)
-            .build();
+            .build()
+            .map_err(|err| VecU8::from(err.to_string()))?;
         for value in self.pending.drain(..) {
-            writer.append_value_ref(&value).map_err(|err| VecU8::from(err.to_string()))?;
+            writer
+                .append_value_ref(&value)
+                .map_err(|err| VecU8::from(err.to_string()))?;
         }
-        self.out = writer.into_inner().map_err(|err| VecU8::from(err.to_string()))?;
+        self.out = writer
+            .into_inner()
+            .map_err(|err| VecU8::from(err.to_string()))?;
         self.header_written = true;
         Ok(())
     }
@@ -359,9 +368,9 @@ pub struct DataFileReader {
     /// `projection_schema` compiled against the writer schema, which is only
     /// known once the header has been parsed.
     projection: Option<AvroProjection>,
-    /// Identity plan used only by `next_value_into`. It is compiled lazily so
+    /// Apache Avro's reusable datum reader. It is initialized lazily so
     /// ordinary owned-value readers retain their existing setup cost.
-    reuse_decoder: Option<AvroProjection>,
+    reuse_decoder: Option<OwnedGenericDatumReader>,
     max_block_bytes: u64,
     /// Decompressed payload of the block currently being drained, with the
     /// decode position and the number of values left in it.
@@ -487,10 +496,7 @@ impl DataFileReader {
         Self::from_bytes_with_schema(reader_schema, &data)
     }
 
-    fn finish_from_bytes(
-        mut reader: DataFileReader,
-        data: &[u8],
-    ) -> Result<DataFileReader, VecU8> {
+    fn finish_from_bytes(mut reader: DataFileReader, data: &[u8]) -> Result<DataFileReader, VecU8> {
         reader.feed(data)?;
         reader.close_input()?;
         // Parse eagerly up to the first value so garbage and files truncated
@@ -606,7 +612,9 @@ impl DataFileReader {
     /// input has been fed and parsed (drive with `next_ready`).
     pub fn writer_schema(&self) -> Result<AvroSchema, VecU8> {
         match &self.header {
-            Some(header) => Ok(AvroSchema { schema: header.schema.clone() }),
+            Some(header) => Ok(AvroSchema {
+                schema: header.schema.clone(),
+            }),
             None => Err("Header not parsed yet: feed more input and call next_ready".into()),
         }
     }
@@ -640,8 +648,7 @@ impl DataFileReader {
         // header arriving in many small chunks is parsed in linear total
         // time (nothing is re-walked on later calls).
         if self.header.is_none() {
-            let (consumed, header) =
-                self.header_parser.advance(&self.input[self.consumed..])?;
+            let (consumed, header) = self.header_parser.advance(&self.input[self.consumed..])?;
             self.consumed += consumed;
             self.compact();
             match header {
@@ -804,16 +811,14 @@ impl DataFileReader {
 
     /// In-place counterpart to `decode_one`.
     fn decode_one_into(&mut self, output: &mut AvroValue) -> Result<(), VecU8> {
-        if self.projection.is_none()
-            && self.reader_schema.is_none()
-            && self.reuse_decoder.is_none()
+        if self.projection.is_none() && self.reader_schema.is_none() && self.reuse_decoder.is_none()
         {
             let Some(header) = &self.header else {
                 return Err("Internal error: no header while decoding".into());
             };
             self.reuse_decoder = Some(
-                AvroProjection::compile(&header.schema, &header.schema)
-                    .map_err(VecU8::from)?,
+                OwnedGenericDatumReader::new(header.schema.clone())
+                    .map_err(|error| VecU8::from(error.to_string()))?,
             );
         }
 
@@ -821,12 +826,15 @@ impl DataFileReader {
             return Err("Internal error: no header while decoding".into());
         };
         let remaining = &self.block[self.block_pos..];
-        let consumed = if let Some(decoder) = self.projection.as_ref().or(self.reuse_decoder.as_ref())
-        {
+        let consumed = if let Some(projection) = &self.projection {
+            let mut cursor = remaining;
+            output.value = projection.decode(&mut cursor).map_err(VecU8::from)?;
+            remaining.len() - cursor.len()
+        } else if let Some(decoder) = &self.reuse_decoder {
             let mut cursor = remaining;
             decoder
-                .decode_into(&mut cursor, &mut output.value)
-                .map_err(VecU8::from)?;
+                .read_value_into(&mut cursor, &mut output.value)
+                .map_err(|error| VecU8::from(error.to_string()))?;
             remaining.len() - cursor.len()
         } else {
             // Reader-schema resolution consumes and can reshape an owned
@@ -892,9 +900,11 @@ fn parse_header_len(buf: &[u8], pos: &mut usize, what: &str) -> Result<Option<us
         return Err(format!("Corrupt header: negative length for {}", what).into());
     }
     if len as u64 > MAX_HEADER_BYTES as u64 {
-        return Err(
-            format!("Corrupt header: {} length {} exceeds the header cap", what, len).into(),
-        );
+        return Err(format!(
+            "Corrupt header: {} length {} exceeds the header cap",
+            what, len
+        )
+        .into());
     }
     Ok(Some(len as usize))
 }
@@ -917,11 +927,25 @@ enum MetaKey {
 enum HeaderState {
     Magic,
     GroupCount,
-    GroupSize { pairs_left: u64 },
-    KeyLen { pairs_left: u64 },
-    KeyBytes { pairs_left: u64, len: usize },
-    ValueLen { pairs_left: u64, key: MetaKey },
-    ValueBytes { pairs_left: u64, key: MetaKey, len: usize },
+    GroupSize {
+        pairs_left: u64,
+    },
+    KeyLen {
+        pairs_left: u64,
+    },
+    KeyBytes {
+        pairs_left: u64,
+        len: usize,
+    },
+    ValueLen {
+        pairs_left: u64,
+        key: MetaKey,
+    },
+    ValueBytes {
+        pairs_left: u64,
+        key: MetaKey,
+        len: usize,
+    },
     Marker,
 }
 
@@ -980,9 +1004,13 @@ impl HeaderParser {
                     self.state = if count == 0 {
                         HeaderState::Marker
                     } else if count < 0 {
-                        HeaderState::GroupSize { pairs_left: count.unsigned_abs() }
+                        HeaderState::GroupSize {
+                            pairs_left: count.unsigned_abs(),
+                        }
                     } else {
-                        HeaderState::KeyLen { pairs_left: count as u64 }
+                        HeaderState::KeyLen {
+                            pairs_left: count as u64,
+                        }
                     };
                 }
                 HeaderState::GroupSize { pairs_left } => {
@@ -1013,9 +1041,17 @@ impl HeaderParser {
                     let Some(len) = parse_header_len(input, &mut pos, "metadata value")? else {
                         break;
                     };
-                    self.state = HeaderState::ValueBytes { pairs_left, key, len };
+                    self.state = HeaderState::ValueBytes {
+                        pairs_left,
+                        key,
+                        len,
+                    };
                 }
-                HeaderState::ValueBytes { pairs_left, key, len } => {
+                HeaderState::ValueBytes {
+                    pairs_left,
+                    key,
+                    len,
+                } => {
                     if input.len() - pos < len {
                         break;
                     }
@@ -1056,14 +1092,18 @@ impl HeaderParser {
         let schema =
             Schema::parse_str(utf8(schema_json)?).map_err(|err| VecU8::from(err.to_string()))?;
         let codec = AvroCodec::from_name(&self.codec_name)?;
-        Ok(Header { schema, codec, marker })
+        Ok(Header {
+            schema,
+            codec,
+            marker,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apache_avro::{to_avro_datum, Reader as UpstreamReader, Writer as UpstreamWriter};
+    use apache_avro::{Reader as UpstreamReader, Writer as UpstreamWriter, to_avro_datum};
 
     const RECORD_SCHEMA: &str = r#"{
         "type": "record",
@@ -1077,9 +1117,14 @@ mod tests {
     fn measurement(sensor: &str, value: f64) -> AvroValue {
         let mut record = AvroValue::create_record();
         record
-            .record_put(b"sensor", &AvroValue::create_string(sensor.as_bytes()).unwrap())
+            .record_put(
+                b"sensor",
+                &AvroValue::create_string(sensor.as_bytes()).unwrap(),
+            )
             .unwrap();
-        record.record_put(b"value", &AvroValue::create_double(value)).unwrap();
+        record
+            .record_put(b"value", &AvroValue::create_double(value))
+            .unwrap();
         record
     }
 
@@ -1124,7 +1169,10 @@ mod tests {
         assert!(!reader.next_ready().unwrap());
         assert!(reader.at_end());
         let message = String::from_utf8(reader.next_value().unwrap_err().into_vec()).unwrap();
-        assert!(message.contains("No more values"), "unexpected error: {message}");
+        assert!(
+            message.contains("No more values"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]
@@ -1187,8 +1235,7 @@ mod tests {
         // Enough values to span several flush batches and many blocks.
         let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
         let n = 3000usize;
-        let values: Vec<AvroValue> =
-            (0..n).map(|i| measurement("sensor", i as f64)).collect();
+        let values: Vec<AvroValue> = (0..n).map(|i| measurement("sensor", i as f64)).collect();
         let bytes = write_file(&schema, AvroCodec::Deflate, &values);
 
         let mut reader = DataFileReader::create();
@@ -1197,8 +1244,11 @@ mod tests {
             reader.feed(std::slice::from_ref(byte)).unwrap();
             while reader.next_ready().unwrap() {
                 let value = reader.next_value().unwrap();
-                let got =
-                    value.get_record_field(b"value").unwrap().get_double().unwrap();
+                let got = value
+                    .get_record_field(b"value")
+                    .unwrap()
+                    .get_double()
+                    .unwrap();
                 assert_eq!(got, seen as f64);
                 seen += 1;
             }
@@ -1215,7 +1265,8 @@ mod tests {
         // reader (wire-format compatibility in the read direction).
         let schema = Schema::parse_str(RECORD_SCHEMA).unwrap();
         let mut upstream =
-            UpstreamWriter::with_codec(&schema, Vec::new(), Codec::Deflate(Default::default()));
+            UpstreamWriter::with_codec(&schema, Vec::new(), Codec::Deflate(Default::default()))
+                .unwrap();
         for i in 0..100 {
             let value = measurement("s", i as f64);
             upstream.append_value_ref(&value.value).unwrap();
@@ -1225,7 +1276,11 @@ mod tests {
         let values = read_all(&bytes);
         assert_eq!(values.len(), 100);
         assert_eq!(
-            values[99].get_record_field(b"value").unwrap().get_double().unwrap(),
+            values[99]
+                .get_record_field(b"value")
+                .unwrap()
+                .get_double()
+                .unwrap(),
             99.0
         );
     }
@@ -1235,14 +1290,15 @@ mod tests {
         // A file written by our writer decodes with apache-avro's own Reader
         // (wire-format compatibility in the write direction).
         let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
-        let values: Vec<AvroValue> =
-            (0..100).map(|i| measurement("s", i as f64)).collect();
+        let values: Vec<AvroValue> = (0..100).map(|i| measurement("s", i as f64)).collect();
         let bytes = write_file(&schema, AvroCodec::Snappy, &values);
 
         let upstream = UpstreamReader::new(bytes.as_slice()).unwrap();
         let decoded: Vec<Value> = upstream.map(|item| item.unwrap()).collect();
         assert_eq!(decoded.len(), 100);
-        assert!(values[7].equals(&AvroValue { value: decoded[7].clone() }));
+        assert!(values[7].equals(&AvroValue {
+            value: decoded[7].clone()
+        }));
     }
 
     fn cross_referencing_schemas() -> Vec<AvroSchema> {
@@ -1254,7 +1310,9 @@ mod tests {
             r#"{"type": "record", "name": "Person", "fields": [
                 {"name": "address", "type": "Address"}]}"#,
         );
-        AvroSchema::parse_list(&[address, person]).unwrap().into_vec()
+        AvroSchema::parse_list(&[address, person])
+            .unwrap()
+            .into_vec()
     }
 
     #[test]
@@ -1283,7 +1341,9 @@ mod tests {
         .unwrap();
 
         let mut address = AvroValue::create_record();
-        address.record_put(b"city", &AvroValue::create_string(b"Zurich").unwrap()).unwrap();
+        address
+            .record_put(b"city", &AvroValue::create_string(b"Zurich").unwrap())
+            .unwrap();
         let mut person = AvroValue::create_record();
         person.record_put(b"address", &address).unwrap();
 
@@ -1304,10 +1364,15 @@ mod tests {
 
         let mut inner = AvroValue::create_record();
         inner
-            .record_put(b"next", &AvroValue::create_union(0, &AvroValue::create_null()))
+            .record_put(
+                b"next",
+                &AvroValue::create_union(0, &AvroValue::create_null()),
+            )
             .unwrap();
         let mut outer = AvroValue::create_record();
-        outer.record_put(b"next", &AvroValue::create_union(1, &inner)).unwrap();
+        outer
+            .record_put(b"next", &AvroValue::create_union(1, &inner))
+            .unwrap();
 
         let bytes = write_file(&schema, AvroCodec::Null, &[outer.clone()]);
         let values = read_all(&bytes);
@@ -1327,7 +1392,10 @@ mod tests {
     #[test]
     fn codec_from_name_rejects_unsupported() {
         assert_eq!(AvroCodec::from_name(b"null").unwrap(), AvroCodec::Null);
-        assert_eq!(AvroCodec::from_name(b"zstandard").unwrap(), AvroCodec::Zstandard);
+        assert_eq!(
+            AvroCodec::from_name(b"zstandard").unwrap(),
+            AvroCodec::Zstandard
+        );
         assert!(AvroCodec::from_name(b"bzip2").is_err());
         assert!(AvroCodec::from_name(b"xz").is_err());
         assert!(AvroCodec::from_name(b"lz4").is_err());
@@ -1363,7 +1431,7 @@ mod tests {
         let moved_bytes = moving.finish().unwrap();
 
         // The donor was emptied, not copied.
-        assert!(donor.is_null());
+        assert_eq!(donor.schema_type(), crate::schema::SchemaType::Null);
         // Sync markers are random per writer, so compare decoded values.
         let from_copy = read_all(copied_bytes.as_slice());
         let from_move = read_all(moved_bytes.as_slice());
@@ -1389,7 +1457,7 @@ mod tests {
         writer.finish().unwrap();
         let mut after = measurement("late", 2.0);
         assert!(writer.append_owned(&mut after).is_err());
-        assert!(!after.is_null());
+        assert_ne!(after.schema_type(), crate::schema::SchemaType::Null);
     }
 
     #[test]
@@ -1422,14 +1490,24 @@ mod tests {
         }
         // Batches were flushed and drained before finish: the writer is not
         // accumulating the whole file, and no single drain approaches it.
-        assert!(!drained.is_empty(), "expected batches drained before finish");
-        assert!(max_chunk < 128 * 1024, "drain chunk grew to {max_chunk} bytes");
+        assert!(
+            !drained.is_empty(),
+            "expected batches drained before finish"
+        );
+        assert!(
+            max_chunk < 128 * 1024,
+            "drain chunk grew to {max_chunk} bytes"
+        );
         drained.extend_from_slice(writer.finish().unwrap().as_slice());
 
         let values = read_all(&drained);
         assert_eq!(values.len(), n);
         assert_eq!(
-            values[n - 1].get_record_field(b"value").unwrap().get_double().unwrap(),
+            values[n - 1]
+                .get_record_field(b"value")
+                .unwrap()
+                .get_double()
+                .unwrap(),
             (n - 1) as f64
         );
     }
@@ -1463,12 +1541,19 @@ mod tests {
         record.record_put(b"a", &AvroValue::create_int(12)).unwrap();
         let bytes = write_file(&writer_schema, AvroCodec::Null, &[record]);
 
-        let mut reader =
-            DataFileReader::from_bytes_with_schema(&reader_schema, &bytes).unwrap();
+        let mut reader = DataFileReader::from_bytes_with_schema(&reader_schema, &bytes).unwrap();
         let value = reader.next_value().unwrap();
-        assert_eq!(value.get_record_field(b"a").unwrap().get_long().unwrap(), 12);
         assert_eq!(
-            value.get_record_field(b"b").unwrap().get_string().unwrap().as_slice(),
+            value.get_record_field(b"a").unwrap().get_long().unwrap(),
+            12
+        );
+        assert_eq!(
+            value
+                .get_record_field(b"b")
+                .unwrap()
+                .get_string()
+                .unwrap()
+                .as_slice(),
             b"d"
         );
         // The writer schema reported by the file stays the original one.
@@ -1509,7 +1594,9 @@ mod tests {
         )
         .unwrap();
         let mut record = AvroValue::create_record();
-        record.record_put(b"v", &AvroValue::create_long(42)).unwrap();
+        record
+            .record_put(b"v", &AvroValue::create_long(42))
+            .unwrap();
         let bytes = write_file(&schema, AvroCodec::Null, &[record.clone()]);
 
         // Magic per the Avro 1.x specification.
@@ -1549,7 +1636,10 @@ mod tests {
         let mut reader = DataFileReader::create();
         reader.feed(&bytes[..10]).unwrap();
         let message = String::from_utf8(reader.next_value().unwrap_err().into_vec()).unwrap();
-        assert!(message.contains("No value ready"), "unexpected error: {message}");
+        assert!(
+            message.contains("No value ready"),
+            "unexpected error: {message}"
+        );
 
         reader.feed(&bytes[10..]).unwrap();
         reader.close_input().unwrap();
@@ -1561,8 +1651,11 @@ mod tests {
     #[test]
     fn truncated_stream_errors_and_fuses() {
         let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
-        let bytes =
-            write_file(&schema, AvroCodec::Null, &[measurement("a", 1.0), measurement("b", 2.0)]);
+        let bytes = write_file(
+            &schema,
+            AvroCodec::Null,
+            &[measurement("a", 1.0), measurement("b", 2.0)],
+        );
         let truncated = &bytes[..bytes.len() - 8];
 
         let mut reader = DataFileReader::create();
@@ -1612,7 +1705,10 @@ mod tests {
 
         let result = DataFileReader::from_bytes(&bytes);
         let message = String::from_utf8(result.unwrap_err().into_vec()).unwrap();
-        assert!(message.contains("sync marker"), "unexpected error: {message}");
+        assert!(
+            message.contains("sync marker"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]
@@ -1631,7 +1727,10 @@ mod tests {
 
         let result = DataFileReader::from_bytes(&corrupted);
         let message = String::from_utf8(result.unwrap_err().into_vec()).unwrap();
-        assert!(message.contains("Unsupported container codec"), "unexpected: {message}");
+        assert!(
+            message.contains("Unsupported container codec"),
+            "unexpected: {message}"
+        );
     }
 
     /// Returns the length of the file's header (everything up to and
@@ -1671,7 +1770,10 @@ mod tests {
         let mut reader = DataFileReader::create();
         reader.feed(&corrupted).unwrap();
         let message = String::from_utf8(reader.next_ready().unwrap_err().into_vec()).unwrap();
-        assert!(message.contains("negative object count"), "unexpected: {message}");
+        assert!(
+            message.contains("negative object count"),
+            "unexpected: {message}"
+        );
     }
 
     #[test]
@@ -1688,7 +1790,10 @@ mod tests {
         reader.set_max_block_size(64 * 1024 * 1024).unwrap();
         reader.feed(&corrupted).unwrap();
         let message = String::from_utf8(reader.next_ready().unwrap_err().into_vec()).unwrap();
-        assert!(message.contains("exceeds the maximum"), "unexpected: {message}");
+        assert!(
+            message.contains("exceeds the maximum"),
+            "unexpected: {message}"
+        );
     }
 
     #[test]
@@ -1712,9 +1817,10 @@ mod tests {
         let schema_json = br#""long""#;
         let mut file = b"Obj\x01".to_vec();
         let mut entries = Vec::new();
-        for (key, value) in
-            [(&b"avro.schema"[..], &schema_json[..]), (&b"avro.codec"[..], &b"null"[..])]
-        {
+        for (key, value) in [
+            (&b"avro.schema"[..], &schema_json[..]),
+            (&b"avro.codec"[..], &b"null"[..]),
+        ] {
             entries.extend_from_slice(&zigzag(key.len() as i64));
             entries.extend_from_slice(key);
             entries.extend_from_slice(&zigzag(value.len() as i64));
@@ -1778,9 +1884,10 @@ mod tests {
             file.extend_from_slice(&zigzag(4));
             file.extend_from_slice(b"junk");
         }
-        for (key, value) in
-            [(&b"avro.schema"[..], &br#""long""#[..]), (&b"avro.codec"[..], &b"null"[..])]
-        {
+        for (key, value) in [
+            (&b"avro.schema"[..], &br#""long""#[..]),
+            (&b"avro.codec"[..], &b"null"[..]),
+        ] {
             file.extend_from_slice(&zigzag(key.len() as i64));
             file.extend_from_slice(key);
             file.extend_from_slice(&zigzag(value.len() as i64));
@@ -1866,17 +1973,28 @@ mod tests {
         let mut metrics = AvroValue::create_array();
         for column in 0..6i32 {
             let mut pair = AvroValue::create_record();
-            pair.record_put(b"key", &AvroValue::create_int(column)).unwrap();
-            pair.record_put(b"value", &AvroValue::create_long(i * 100 + i64::from(column)))
+            pair.record_put(b"key", &AvroValue::create_int(column))
                 .unwrap();
+            pair.record_put(
+                b"value",
+                &AvroValue::create_long(i * 100 + i64::from(column)),
+            )
+            .unwrap();
             metrics.array_push(&pair).unwrap();
         }
         let mut record = AvroValue::create_record();
-        record.record_put(b"id", &AvroValue::create_long(i)).unwrap();
-        record.record_put(b"metrics", &metrics).unwrap();
-        record.record_put(b"blob", &AvroValue::create_bytes(&vec![0xab; 24])).unwrap();
         record
-            .record_put(b"name", &AvroValue::create_string(format!("row-{i}").as_bytes()).unwrap())
+            .record_put(b"id", &AvroValue::create_long(i))
+            .unwrap();
+        record.record_put(b"metrics", &metrics).unwrap();
+        record
+            .record_put(b"blob", &AvroValue::create_bytes(&vec![0xab; 24]))
+            .unwrap();
+        record
+            .record_put(
+                b"name",
+                &AvroValue::create_string(format!("row-{i}").as_bytes()).unwrap(),
+            )
             .unwrap();
         record
     }
@@ -1896,9 +2014,17 @@ mod tests {
         let mut seen = 0i64;
         while reader.next_ready().unwrap() {
             let value = reader.next_value().unwrap();
-            assert_eq!(value.get_record_field(b"id").unwrap().get_long().unwrap(), seen);
             assert_eq!(
-                value.get_record_field(b"name").unwrap().get_string().unwrap().as_slice(),
+                value.get_record_field(b"id").unwrap().get_long().unwrap(),
+                seen
+            );
+            assert_eq!(
+                value
+                    .get_record_field(b"name")
+                    .unwrap()
+                    .get_string()
+                    .unwrap()
+                    .as_slice(),
                 format!("row-{seen}").as_bytes()
             );
             // The dropped fields are absent rather than null-filled.
@@ -1927,7 +2053,10 @@ mod tests {
         }
         assert_eq!(actual.len(), expected.len());
         for (got, want) in actual.iter().zip(&expected) {
-            assert!(got.equals(want), "projected identity read differs from plain read");
+            assert!(
+                got.equals(want),
+                "projected identity read differs from plain read"
+            );
         }
     }
 
@@ -1942,7 +2071,10 @@ mod tests {
         let mut seen = 0i64;
         while reader.next_ready().unwrap() {
             let value = reader.next_value().unwrap();
-            assert_eq!(value.get_record_field(b"id").unwrap().get_long().unwrap(), seen);
+            assert_eq!(
+                value.get_record_field(b"id").unwrap().get_long().unwrap(),
+                seen
+            );
             seen += 1;
         }
         assert_eq!(seen, 200);
@@ -1963,5 +2095,4 @@ mod tests {
         let message = String::from_utf8(error.into_vec()).unwrap();
         assert!(message.contains("absent"), "unexpected error: {message}");
     }
-
 }

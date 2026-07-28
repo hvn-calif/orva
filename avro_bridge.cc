@@ -71,6 +71,75 @@ constexpr absl::StatusCode kWrongType = absl::StatusCode::kFailedPrecondition;
 constexpr absl::StatusCode kBadInput = absl::StatusCode::kInvalidArgument;
 constexpr absl::StatusCode kNotFound = absl::StatusCode::kNotFound;
 
+using RustSchemaType = rust::schema::SchemaType;
+using RustSchemaTypeTag = RustSchemaType::Tag;
+
+bool IsSchemaType(RustSchemaType type, RustSchemaTypeTag expected) {
+  return type.tag == expected;
+}
+
+absl::string_view SchemaTypeName(RustSchemaType type) {
+  switch (type.tag) {
+    case RustSchemaTypeTag::Null:
+      return "null";
+    case RustSchemaTypeTag::Boolean:
+      return "boolean";
+    case RustSchemaTypeTag::Int:
+      return "int";
+    case RustSchemaTypeTag::Long:
+      return "long";
+    case RustSchemaTypeTag::Float:
+      return "float";
+    case RustSchemaTypeTag::Double:
+      return "double";
+    case RustSchemaTypeTag::Bytes:
+      return "bytes";
+    case RustSchemaTypeTag::String:
+      return "string";
+    case RustSchemaTypeTag::Record:
+      return "record";
+    case RustSchemaTypeTag::Enum:
+      return "enum";
+    case RustSchemaTypeTag::Array:
+      return "array";
+    case RustSchemaTypeTag::Map:
+      return "map";
+    case RustSchemaTypeTag::Union:
+      return "union";
+    case RustSchemaTypeTag::Fixed:
+      return "fixed";
+    case RustSchemaTypeTag::Decimal:
+      return "decimal";
+    case RustSchemaTypeTag::BigDecimal:
+      return "big-decimal";
+    case RustSchemaTypeTag::Uuid:
+      return "uuid";
+    case RustSchemaTypeTag::Date:
+      return "date";
+    case RustSchemaTypeTag::TimeMillis:
+      return "time-millis";
+    case RustSchemaTypeTag::TimeMicros:
+      return "time-micros";
+    case RustSchemaTypeTag::TimestampMillis:
+      return "timestamp-millis";
+    case RustSchemaTypeTag::TimestampMicros:
+      return "timestamp-micros";
+    case RustSchemaTypeTag::TimestampNanos:
+      return "timestamp-nanos";
+    case RustSchemaTypeTag::LocalTimestampMillis:
+      return "local-timestamp-millis";
+    case RustSchemaTypeTag::LocalTimestampMicros:
+      return "local-timestamp-micros";
+    case RustSchemaTypeTag::LocalTimestampNanos:
+      return "local-timestamp-nanos";
+    case RustSchemaTypeTag::Duration:
+      return "duration";
+    case RustSchemaTypeTag::Ref:
+      return "ref";
+  }
+  return "unknown";
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -147,23 +216,51 @@ absl::StatusOr<std::string> AvroSchema::ToJsonString() const {
 }
 
 std::string AvroSchema::TypeName() const {
-  return FromVecU8(schema_.type_name());
+  return std::string(SchemaTypeName(schema_.schema_type()));
 }
 
-bool AvroSchema::IsNull() const { return schema_.is_null(); }
-bool AvroSchema::IsBoolean() const { return schema_.is_boolean(); }
-bool AvroSchema::IsInt() const { return schema_.is_int(); }
-bool AvroSchema::IsLong() const { return schema_.is_long(); }
-bool AvroSchema::IsFloat() const { return schema_.is_float(); }
-bool AvroSchema::IsDouble() const { return schema_.is_double(); }
-bool AvroSchema::IsBytes() const { return schema_.is_bytes(); }
-bool AvroSchema::IsString() const { return schema_.is_string(); }
-bool AvroSchema::IsRecord() const { return schema_.is_record(); }
-bool AvroSchema::IsEnum() const { return schema_.is_enum(); }
-bool AvroSchema::IsArray() const { return schema_.is_array(); }
-bool AvroSchema::IsMap() const { return schema_.is_map(); }
-bool AvroSchema::IsUnion() const { return schema_.is_union(); }
-bool AvroSchema::IsFixed() const { return schema_.is_fixed(); }
+bool AvroSchema::IsNull() const {
+  return IsSchemaType(schema_.schema_type(), RustSchemaTypeTag::Null);
+}
+bool AvroSchema::IsBoolean() const {
+  return IsSchemaType(schema_.schema_type(), RustSchemaTypeTag::Boolean);
+}
+bool AvroSchema::IsInt() const {
+  return IsSchemaType(schema_.schema_type(), RustSchemaTypeTag::Int);
+}
+bool AvroSchema::IsLong() const {
+  return IsSchemaType(schema_.schema_type(), RustSchemaTypeTag::Long);
+}
+bool AvroSchema::IsFloat() const {
+  return IsSchemaType(schema_.schema_type(), RustSchemaTypeTag::Float);
+}
+bool AvroSchema::IsDouble() const {
+  return IsSchemaType(schema_.schema_type(), RustSchemaTypeTag::Double);
+}
+bool AvroSchema::IsBytes() const {
+  return IsSchemaType(schema_.schema_type(), RustSchemaTypeTag::Bytes);
+}
+bool AvroSchema::IsString() const {
+  return IsSchemaType(schema_.schema_type(), RustSchemaTypeTag::String);
+}
+bool AvroSchema::IsRecord() const {
+  return IsSchemaType(schema_.schema_type(), RustSchemaTypeTag::Record);
+}
+bool AvroSchema::IsEnum() const {
+  return IsSchemaType(schema_.schema_type(), RustSchemaTypeTag::Enum);
+}
+bool AvroSchema::IsArray() const {
+  return IsSchemaType(schema_.schema_type(), RustSchemaTypeTag::Array);
+}
+bool AvroSchema::IsMap() const {
+  return IsSchemaType(schema_.schema_type(), RustSchemaTypeTag::Map);
+}
+bool AvroSchema::IsUnion() const {
+  return IsSchemaType(schema_.schema_type(), RustSchemaTypeTag::Union);
+}
+bool AvroSchema::IsFixed() const {
+  return IsSchemaType(schema_.schema_type(), RustSchemaTypeTag::Fixed);
+}
 
 absl::Status AvroSchema::CanReadFrom(const AvroSchema& writer) const {
   return ToStatus(schema_.can_read_from(writer.schema_),
@@ -549,7 +646,12 @@ absl::StatusOr<bool> AvroValue::IsNullAt(const AvroPath& path) const {
 }
 
 absl::StatusOr<std::string> AvroValue::TypeNameAt(const AvroPath& path) const {
-  return UnwrapString(value_.type_name_at(path.path_), kNotFound);
+  absl::StatusOr<RustSchemaType> type =
+      Unwrap(value_.schema_type_at(path.path_), kNotFound);
+  if (!type.ok()) {
+    return type.status();
+  }
+  return std::string(SchemaTypeName(*type));
 }
 
 absl::StatusOr<uint64_t> AvroValue::GetArrayLenAt(const AvroPath& path) const {
@@ -622,47 +724,92 @@ absl::Status AvroValue::MapPut(absl::string_view key, const AvroValue& value) {
   return ToStatus(value_.map_put(ToByteSpan(key), value.value_), kWrongType);
 }
 
-bool AvroValue::IsNull() const { return value_.is_null(); }
-bool AvroValue::IsBoolean() const { return value_.is_boolean(); }
-bool AvroValue::IsInt() const { return value_.is_int(); }
-bool AvroValue::IsLong() const { return value_.is_long(); }
-bool AvroValue::IsFloat() const { return value_.is_float(); }
-bool AvroValue::IsDouble() const { return value_.is_double(); }
-bool AvroValue::IsBytes() const { return value_.is_bytes(); }
-bool AvroValue::IsString() const { return value_.is_string(); }
-bool AvroValue::IsRecord() const { return value_.is_record(); }
-bool AvroValue::IsEnum() const { return value_.is_enum(); }
-bool AvroValue::IsArray() const { return value_.is_array(); }
-bool AvroValue::IsMap() const { return value_.is_map(); }
-bool AvroValue::IsUnion() const { return value_.is_union(); }
-bool AvroValue::IsFixed() const { return value_.is_fixed(); }
-bool AvroValue::IsDecimal() const { return value_.is_decimal(); }
-bool AvroValue::IsUuid() const { return value_.is_uuid(); }
-bool AvroValue::IsDate() const { return value_.is_date(); }
-bool AvroValue::IsTimeMillis() const { return value_.is_time_millis(); }
-bool AvroValue::IsTimeMicros() const { return value_.is_time_micros(); }
+bool AvroValue::IsNull() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::Null);
+}
+bool AvroValue::IsBoolean() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::Boolean);
+}
+bool AvroValue::IsInt() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::Int);
+}
+bool AvroValue::IsLong() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::Long);
+}
+bool AvroValue::IsFloat() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::Float);
+}
+bool AvroValue::IsDouble() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::Double);
+}
+bool AvroValue::IsBytes() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::Bytes);
+}
+bool AvroValue::IsString() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::String);
+}
+bool AvroValue::IsRecord() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::Record);
+}
+bool AvroValue::IsEnum() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::Enum);
+}
+bool AvroValue::IsArray() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::Array);
+}
+bool AvroValue::IsMap() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::Map);
+}
+bool AvroValue::IsUnion() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::Union);
+}
+bool AvroValue::IsFixed() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::Fixed);
+}
+bool AvroValue::IsDecimal() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::Decimal);
+}
+bool AvroValue::IsUuid() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::Uuid);
+}
+bool AvroValue::IsDate() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::Date);
+}
+bool AvroValue::IsTimeMillis() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::TimeMillis);
+}
+bool AvroValue::IsTimeMicros() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::TimeMicros);
+}
 bool AvroValue::IsTimestampMillis() const {
-  return value_.is_timestamp_millis();
+  return IsSchemaType(value_.schema_type(),
+                      RustSchemaTypeTag::TimestampMillis);
 }
 bool AvroValue::IsTimestampMicros() const {
-  return value_.is_timestamp_micros();
+  return IsSchemaType(value_.schema_type(),
+                      RustSchemaTypeTag::TimestampMicros);
 }
 bool AvroValue::IsTimestampNanos() const {
-  return value_.is_timestamp_nanos();
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::TimestampNanos);
 }
 bool AvroValue::IsLocalTimestampMillis() const {
-  return value_.is_local_timestamp_millis();
+  return IsSchemaType(value_.schema_type(),
+                      RustSchemaTypeTag::LocalTimestampMillis);
 }
 bool AvroValue::IsLocalTimestampMicros() const {
-  return value_.is_local_timestamp_micros();
+  return IsSchemaType(value_.schema_type(),
+                      RustSchemaTypeTag::LocalTimestampMicros);
 }
 bool AvroValue::IsLocalTimestampNanos() const {
-  return value_.is_local_timestamp_nanos();
+  return IsSchemaType(value_.schema_type(),
+                      RustSchemaTypeTag::LocalTimestampNanos);
 }
-bool AvroValue::IsDuration() const { return value_.is_duration(); }
+bool AvroValue::IsDuration() const {
+  return IsSchemaType(value_.schema_type(), RustSchemaTypeTag::Duration);
+}
 
 std::string AvroValue::TypeName() const {
-  return FromVecU8(value_.type_name());
+  return std::string(SchemaTypeName(value_.schema_type()));
 }
 
 bool AvroValue::Validate(const AvroSchema& schema) const {

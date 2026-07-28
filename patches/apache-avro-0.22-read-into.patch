@@ -1,0 +1,607 @@
+From 665664804707037d50845dabecdb9e72beac44e9 Mon Sep 17 00:00:00 2001
+From: Viet Hung Nguyen <hvn@calif.io>
+Date: Tue, 28 Jul 2026 17:18:51 +0700
+Subject: [PATCH] Add allocation-reusing value decoding
+
+---
+ avro/src/decode.rs       | 271 +++++++++++++++++++++++++++++++++++++++
+ avro/src/reader/block.rs |  46 ++++++-
+ avro/src/reader/datum.rs | 125 +++++++++++++++++-
+ avro/src/reader/mod.rs   |  64 +++++++++
+ 4 files changed, 503 insertions(+), 3 deletions(-)
+
+diff --git a/avro/src/decode.rs b/avro/src/decode.rs
+index d78da71..469fd1e 100644
+--- a/avro/src/decode.rs
++++ b/avro/src/decode.rs
+@@ -368,6 +368,277 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
+     }
+ }
+ 
++/// Decode a `Value` into caller-owned storage.
++///
++/// This is an experimental counterpart to [`decode_internal`] used by
++/// `Reader::read_into`. It reuses allocations for bytes, strings, fixed values,
++/// unions, arrays, and records when the existing value has a compatible shape.
++/// Maps and the allocation-owning logical types currently fall back to
++/// `decode_internal`.
++pub(crate) fn decode_into_internal<R: Read, S: Borrow<Schema>>(
++    schema: &Schema,
++    names: &HashMap<Name, S>,
++    enclosing_namespace: NamespaceRef,
++    reader: &mut R,
++    value: &mut Value,
++) -> AvroResult<()> {
++    macro_rules! set_scalar {
++        ($variant:path, $decoded:expr) => {{
++            let decoded = $decoded;
++            match value {
++                $variant(current) => *current = decoded,
++                _ => *value = $variant(decoded),
++            }
++        }};
++    }
++
++    match schema {
++        Schema::Null => {
++            if !matches!(value, Value::Null) {
++                *value = Value::Null;
++            }
++        }
++        Schema::Boolean => {
++            let mut buf = [0u8; 1];
++            match reader.read_exact(&mut buf) {
++                Ok(()) => match buf[0] {
++                    0 => set_scalar!(Value::Boolean, false),
++                    1 => set_scalar!(Value::Boolean, true),
++                    byte => return Err(Details::BoolValue(byte).into()),
++                },
++                Err(io_err) if io_err.kind() == ErrorKind::UnexpectedEof => *value = Value::Null,
++                Err(io_err) => return Err(Details::ReadBoolean(io_err).into()),
++            }
++        }
++        Schema::Int => set_scalar!(Value::Int, zag_i32(reader)?),
++        Schema::Date => set_scalar!(Value::Date, zag_i32(reader)?),
++        Schema::TimeMillis => set_scalar!(Value::TimeMillis, zag_i32(reader)?),
++        Schema::Long => set_scalar!(Value::Long, zag_i64(reader)?),
++        Schema::TimeMicros => set_scalar!(Value::TimeMicros, zag_i64(reader)?),
++        Schema::TimestampMillis => set_scalar!(Value::TimestampMillis, zag_i64(reader)?),
++        Schema::TimestampMicros => set_scalar!(Value::TimestampMicros, zag_i64(reader)?),
++        Schema::TimestampNanos => set_scalar!(Value::TimestampNanos, zag_i64(reader)?),
++        Schema::LocalTimestampMillis => {
++            set_scalar!(Value::LocalTimestampMillis, zag_i64(reader)?);
++        }
++        Schema::LocalTimestampMicros => {
++            set_scalar!(Value::LocalTimestampMicros, zag_i64(reader)?);
++        }
++        Schema::LocalTimestampNanos => {
++            set_scalar!(Value::LocalTimestampNanos, zag_i64(reader)?);
++        }
++        Schema::Duration(fixed_schema) => {
++            if fixed_schema.size != 12 {
++                return Err(Details::CompareFixedSizes {
++                    size: 12,
++                    n: fixed_schema.size,
++                }
++                .into());
++            }
++            let mut buf = [0u8; 12];
++            reader.read_exact(&mut buf).map_err(Details::ReadDuration)?;
++            set_scalar!(Value::Duration, Duration::from(buf));
++        }
++        Schema::Float => {
++            let mut buf = [0u8; std::mem::size_of::<f32>()];
++            reader.read_exact(&mut buf).map_err(Details::ReadFloat)?;
++            set_scalar!(Value::Float, f32::from_le_bytes(buf));
++        }
++        Schema::Double => {
++            let mut buf = [0u8; std::mem::size_of::<f64>()];
++            reader.read_exact(&mut buf).map_err(Details::ReadDouble)?;
++            set_scalar!(Value::Double, f64::from_le_bytes(buf));
++        }
++        Schema::Bytes => {
++            let len = decode_len(reader)?;
++            if !matches!(value, Value::Bytes(_)) {
++                *value = Value::Bytes(Vec::new());
++            }
++            let Value::Bytes(buf) = value else {
++                unreachable!()
++            };
++            buf.resize(len, 0);
++            reader.read_exact(buf).map_err(Details::ReadBytes)?;
++        }
++        Schema::String => {
++            let len = decode_len(reader)?;
++            let old = std::mem::replace(value, Value::Null);
++            let mut buf = match old {
++                Value::String(string) => string.into_bytes(),
++                _ => Vec::new(),
++            };
++            buf.resize(len, 0);
++            match reader.read_exact(&mut buf) {
++                Ok(()) => {
++                    *value = Value::String(String::from_utf8(buf).map_err(Details::ConvertToUtf8)?);
++                }
++                Err(io_err) if io_err.kind() == ErrorKind::UnexpectedEof => {
++                    *value = Value::Null;
++                }
++                Err(io_err) => return Err(Details::ReadString(io_err).into()),
++            }
++        }
++        Schema::Fixed(FixedSchema { size, .. }) => {
++            if !matches!(value, Value::Fixed(_, _)) {
++                *value = Value::Fixed(*size, Vec::new());
++            }
++            let Value::Fixed(current_size, buf) = value else {
++                unreachable!()
++            };
++            *current_size = *size;
++            buf.resize(*size, 0);
++            reader
++                .read_exact(buf)
++                .map_err(|e| Details::ReadFixed(e, *size))?;
++        }
++        Schema::Array(inner) => {
++            if !matches!(value, Value::Array(_)) {
++                *value = Value::Array(Vec::new());
++            }
++            let Value::Array(items) = value else {
++                unreachable!()
++            };
++            let mut decoded = 0usize;
++            loop {
++                let len = decode_seq_len(reader)?;
++                if len == 0 {
++                    break;
++                }
++
++                let total = decoded.checked_add(len).ok_or(Details::IntegerOverflow)?;
++                safe_collection_len::<Value>(total)?;
++                if total > items.len() {
++                    items.reserve_exact(total - items.len());
++                }
++                for _ in 0..len {
++                    if decoded == items.len() {
++                        items.push(Value::Null);
++                    }
++                    decode_into_internal(
++                        &inner.items,
++                        names,
++                        enclosing_namespace,
++                        reader,
++                        &mut items[decoded],
++                    )?;
++                    decoded += 1;
++                }
++            }
++            items.truncate(decoded);
++        }
++        Schema::Map(_) => {
++            // A HashMap does not expose reusable ownership of stale key/value
++            // entries while it is being rebuilt from wire-order keys. A
++            // production implementation needs decoder-owned key/value pools.
++            *value = decode_internal(schema, names, enclosing_namespace, reader)?;
++        }
++        Schema::Union(inner) => {
++            let index = match zag_i64(reader).map_err(Error::into_details) {
++                Ok(index) => index,
++                Err(Details::ReadVariableIntegerBytes(io_err))
++                    if io_err.kind() == ErrorKind::UnexpectedEof =>
++                {
++                    if !matches!(value, Value::Union(_, _)) {
++                        *value = Value::Union(0, Box::new(Value::Null));
++                    }
++                    let Value::Union(index, inner_value) = value else {
++                        unreachable!()
++                    };
++                    *index = 0;
++                    **inner_value = Value::Null;
++                    return Ok(());
++                }
++                Err(details) => return Err(Error::new(details)),
++            };
++            let variants = inner.variants();
++            let index_usize =
++                usize::try_from(index).map_err(|e| Details::ConvertI64ToUsize(e, index))?;
++            let variant = variants.get(index_usize).ok_or(Details::GetUnionVariant {
++                index,
++                num_variants: variants.len(),
++            })?;
++
++            if !matches!(value, Value::Union(_, _)) {
++                *value = Value::Union(index as u32, Box::new(Value::Null));
++            }
++            let Value::Union(current_index, inner_value) = value else {
++                unreachable!()
++            };
++            *current_index = index as u32;
++            decode_into_internal(variant, names, enclosing_namespace, reader, inner_value)?;
++        }
++        Schema::Record(RecordSchema { name, fields, .. }) => {
++            let reusable = matches!(
++                value,
++                Value::Record(items)
++                    if items.len() == fields.len()
++                        && items
++                            .iter()
++                            .zip(fields)
++                            .all(|((actual, _), expected)| actual == &expected.name)
++            );
++            if !reusable {
++                let mut items = Vec::with_capacity(fields.len());
++                items.extend(fields.iter().map(|field| (field.name.clone(), Value::Null)));
++                *value = Value::Record(items);
++            }
++
++            let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);
++            let Value::Record(items) = value else {
++                unreachable!()
++            };
++            for ((_, item), field) in items.iter_mut().zip(fields) {
++                decode_into_internal(
++                    &field.schema,
++                    names,
++                    fully_qualified_name.namespace(),
++                    reader,
++                    item,
++                )?;
++            }
++        }
++        Schema::Enum(EnumSchema { symbols, .. }) => {
++            let raw_index = zag_i32(reader)?;
++            let index =
++                usize::try_from(raw_index).map_err(|e| Details::ConvertI32ToUsize(e, raw_index))?;
++            let symbol = symbols.get(index).ok_or(Details::GetEnumValue {
++                index,
++                nsymbols: symbols.len(),
++            })?;
++            match value {
++                Value::Enum(current_index, current_symbol) => {
++                    *current_index = raw_index as u32;
++                    current_symbol.clone_from(symbol);
++                }
++                _ => *value = Value::Enum(raw_index as u32, symbol.clone()),
++            }
++        }
++        Schema::Ref { name } => {
++            let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);
++            if let Some(resolved) = names.get(&fully_qualified_name) {
++                decode_into_internal(
++                    resolved.borrow(),
++                    names,
++                    fully_qualified_name.namespace(),
++                    reader,
++                    value,
++                )?;
++            } else {
++                return Err(
++                    Details::SchemaResolutionError(fully_qualified_name.into_owned()).into(),
++                );
++            }
++        }
++        // Decimal, BigDecimal, and UUID own allocation-bearing third-party
++        // representations without public in-place decode APIs. Keep their
++        // existing, fully tested decoding behavior in this prototype.
++        Schema::Decimal(_) | Schema::BigDecimal | Schema::Uuid(_) => {
++            *value = decode_internal(schema, names, enclosing_namespace, reader)?;
++        }
++    }
++    Ok(())
++}
++
+ #[cfg(test)]
+ #[allow(clippy::expect_fun_call)]
+ mod tests {
+diff --git a/avro/src/reader/block.rs b/avro/src/reader/block.rs
+index 5e9ae1b..6ce4c29 100644
+--- a/avro/src/reader/block.rs
++++ b/avro/src/reader/block.rs
+@@ -27,7 +27,7 @@ use serde_json::from_slice;
+ 
+ use crate::{
+     AvroResult, Codec, Error,
+-    decode::{decode, decode_internal},
++    decode::{decode, decode_internal, decode_into_internal},
+     error::Details,
+     schema::{Names, Schema, resolve_names, resolve_names_with_schemata},
+     serde::deser_schema::{Config, SchemaAwareDeserializer},
+@@ -215,6 +215,50 @@ impl<'r, R: Read> Block<'r, R> {
+         Ok(Some(item))
+     }
+ 
++    pub(super) fn read_next_into(
++        &mut self,
++        read_schema: Option<&Schema>,
++        value: &mut Value,
++    ) -> AvroResult<bool> {
++        if self.is_empty() {
++            self.read_block_next()?;
++            if self.is_empty() {
++                return Ok(false);
++            }
++        }
++
++        let mut block_bytes = &self.buf[self.buf_idx..];
++        let b_original = block_bytes.len();
++
++        if let Some(schema) = read_schema {
++            // Schema resolution currently consumes a Value and can change its
++            // shape. Preserve existing behavior, but do not claim allocation
++            // reuse for this path.
++            *value = decode_internal(
++                &self.writer_schema,
++                &self.names_refs,
++                None,
++                &mut block_bytes,
++            )?
++            .resolve(schema)?;
++        } else {
++            decode_into_internal(
++                &self.writer_schema,
++                &self.names_refs,
++                None,
++                &mut block_bytes,
++                value,
++            )?;
++        }
++
++        if b_original != 0 && b_original == block_bytes.len() {
++            return Err(Details::ReadBlock.into());
++        }
++        self.buf_idx += b_original - block_bytes.len();
++        self.message_count -= 1;
++        Ok(true)
++    }
++
+     pub(super) fn read_next_deser<T: DeserializeOwned>(
+         &mut self,
+         reader_schema: Option<&Schema>,
+diff --git a/avro/src/reader/datum.rs b/avro/src/reader/datum.rs
+index 4f0c31e..dfee6a8 100644
+--- a/avro/src/reader/datum.rs
++++ b/avro/src/reader/datum.rs
+@@ -22,7 +22,7 @@ use serde::de::DeserializeOwned;
+ 
+ use crate::{
+     AvroResult, AvroSchema, Schema,
+-    decode::decode_internal,
++    decode::{decode_internal, decode_into_internal},
+     schema::{ResolvedOwnedSchema, ResolvedSchema},
+     serde::deser_schema::{Config, SchemaAwareDeserializer},
+     types::Value,
+@@ -138,6 +138,21 @@ impl<'s> GenericDatumReader<'s> {
+         }
+     }
+ 
++    /// Read an Avro datum into caller-owned [`Value`] storage.
++    ///
++    /// Compatible allocations in `value` are reused. When a reader schema is
++    /// configured, schema resolution can change the value's shape, so that
++    /// path currently falls back to allocating an owned value.
++    pub fn read_value_into<R: Read>(&self, reader: &mut R, value: &mut Value) -> AvroResult<()> {
++        if let Some((reader_schema, resolved)) = &self.reader {
++            *value = decode_internal(self.writer, self.resolved.get_names(), None, reader)?
++                .resolve_internal(reader_schema, resolved.get_names(), None, None)?;
++            Ok(())
++        } else {
++            decode_into_internal(self.writer, self.resolved.get_names(), None, reader, value)
++        }
++    }
++
+     /// Read a Avro datum from the reader.
+     ///
+     /// # Panics
+@@ -161,6 +176,61 @@ impl<'s> GenericDatumReader<'s> {
+     }
+ }
+ 
++/// An owning raw-datum reader with schema references resolved once.
++///
++/// [`GenericDatumReader`] avoids cloning a borrowed schema. This variant owns
++/// the writer schema instead, which makes it suitable for storing in a
++/// long-lived container reader. Its main purpose is repeated
++/// [`read_value_into`](Self::read_value_into) calls without rebuilding schema
++/// resolution state for every datum.
++pub struct OwnedGenericDatumReader {
++    resolved: ResolvedOwnedSchema,
++}
++
++impl std::fmt::Debug for OwnedGenericDatumReader {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        formatter
++            .debug_struct("OwnedGenericDatumReader")
++            .field("writer_schema", &self.resolved.get_root_schema())
++            .finish()
++    }
++}
++
++impl OwnedGenericDatumReader {
++    /// Create a reader that owns `writer_schema` and resolves its named types.
++    pub fn new(writer_schema: Schema) -> AvroResult<Self> {
++        Ok(Self {
++            resolved: ResolvedOwnedSchema::new(writer_schema)?,
++        })
++    }
++
++    /// Return the writer schema.
++    pub fn writer_schema(&self) -> &Schema {
++        self.resolved.get_root_schema()
++    }
++
++    /// Read an owned Avro [`Value`].
++    pub fn read_value<R: Read>(&self, reader: &mut R) -> AvroResult<Value> {
++        decode_internal(
++            self.resolved.get_root_schema(),
++            self.resolved.get_names(),
++            None,
++            reader,
++        )
++    }
++
++    /// Read an Avro datum into caller-owned [`Value`] storage.
++    pub fn read_value_into<R: Read>(&self, reader: &mut R, value: &mut Value) -> AvroResult<()> {
++        decode_into_internal(
++            self.resolved.get_root_schema(),
++            self.resolved.get_names(),
++            None,
++            reader,
++            value,
++        )
++    }
++}
++
+ /// Reader for reading raw Avro data.
+ ///
+ /// This is most likely not what you need. Most users should use [`Reader`][crate::Reader],
+@@ -304,7 +374,7 @@ mod tests {
+ 
+     use crate::{
+         Schema,
+-        reader::datum::GenericDatumReader,
++        reader::datum::{GenericDatumReader, OwnedGenericDatumReader},
+         types::{Record, Value},
+     };
+ 
+@@ -343,6 +413,57 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn test_read_value_into_reuses_owned_reader_storage() -> TestResult {
++        let schema = Schema::parse_str(
++            r#"{
++                "type": "record",
++                "name": "test",
++                "fields": [
++                    {"name": "a", "type": "long"},
++                    {"name": "b", "type": "string"}
++                ]
++            }"#,
++        )?;
++        let first = [54, 6, b'f', b'o', b'o'];
++        let second = [56, 6, b'b', b'a', b'r'];
++
++        let borrowed = GenericDatumReader::builder(&schema).build()?;
++        let mut value = Value::Null;
++        borrowed.read_value_into(&mut first.as_slice(), &mut value)?;
++        assert_eq!(
++            value,
++            Value::Record(vec![
++                ("a".to_owned(), Value::Long(27)),
++                ("b".to_owned(), Value::String("foo".to_owned())),
++            ])
++        );
++
++        let owned = OwnedGenericDatumReader::new(schema)?;
++        owned.read_value_into(&mut first.as_slice(), &mut value)?;
++        let Value::Record(fields) = &value else {
++            panic!("expected a record");
++        };
++        let record_pointer = fields.as_ptr();
++        let Value::String(string) = &fields[1].1 else {
++            panic!("expected a string");
++        };
++        let string_pointer = string.as_ptr();
++
++        owned.read_value_into(&mut second.as_slice(), &mut value)?;
++        let Value::Record(fields) = &value else {
++            panic!("expected a record");
++        };
++        assert_eq!(record_pointer, fields.as_ptr());
++        let Value::String(string) = &fields[1].1 else {
++            panic!("expected a string");
++        };
++        assert_eq!(string_pointer, string.as_ptr());
++        assert_eq!(string, "bar");
++
++        Ok(())
++    }
++
+     #[test]
+     fn test_from_avro_datum_with_union_to_struct() -> TestResult {
+         const TEST_RECORD_SCHEMA_3240: &str = r#"
+diff --git a/avro/src/reader/mod.rs b/avro/src/reader/mod.rs
+index 7002fb8..2141006 100644
+--- a/avro/src/reader/mod.rs
++++ b/avro/src/reader/mod.rs
+@@ -139,6 +139,32 @@ impl<'a, R: Read> Reader<'a, R> {
+ 
+         self.block.read_next_deser(self.reader_schema)
+     }
++
++    /// Read the next datum into caller-owned [`Value`] storage.
++    ///
++    /// Returns `Ok(true)` when a datum was read and `Ok(false)` at end of
++    /// stream. Compatible string, byte, fixed, union, array, and record
++    /// allocations are reused. This experimental API falls back to ordinary
++    /// allocation for maps, allocation-owning logical types, and reader-schema
++    /// resolution.
++    pub fn read_into(&mut self, value: &mut Value) -> AvroResult<bool> {
++        if self.errored {
++            return Ok(false);
++        }
++
++        let read_schema = if self.should_resolve_schema {
++            self.reader_schema
++        } else {
++            None
++        };
++        match self.block.read_next_into(read_schema, value) {
++            Ok(read) => Ok(read),
++            Err(error) => {
++                self.errored = true;
++                Err(error)
++            }
++        }
++    }
+ }
+ 
+ impl<R: Read> Iterator for Reader<'_, R> {
+@@ -263,6 +289,44 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn test_reader_read_into_reuses_record_and_string_allocations() -> TestResult {
++        let mut reader = Reader::new(ENCODED)?;
++        let mut value = Value::Null;
++
++        assert!(reader.read_into(&mut value)?);
++        let Value::Record(fields) = &value else {
++            panic!("expected record");
++        };
++        let record_ptr = fields.as_ptr();
++        let field_name_ptrs: Vec<_> = fields.iter().map(|(name, _)| name.as_ptr()).collect();
++        let Value::String(string) = &fields[1].1 else {
++            panic!("expected string field");
++        };
++        let string_ptr = string.as_ptr();
++
++        assert!(reader.read_into(&mut value)?);
++        let Value::Record(fields) = &value else {
++            panic!("expected record");
++        };
++        assert_eq!(record_ptr, fields.as_ptr());
++        assert_eq!(
++            field_name_ptrs,
++            fields
++                .iter()
++                .map(|(name, _)| name.as_ptr())
++                .collect::<Vec<_>>()
++        );
++        let Value::String(string) = &fields[1].1 else {
++            panic!("expected string field");
++        };
++        assert_eq!(string_ptr, string.as_ptr());
++        assert_eq!(string, "bar");
++        assert!(!reader.read_into(&mut value)?);
++
++        Ok(())
++    }
++
+     #[test]
+     fn test_reader_invalid_header() -> TestResult {
+         let schema = Schema::parse_str(SCHEMA)?;
+-- 
+2.52.0
+

@@ -396,7 +396,7 @@ absl::StatusOr<AvroValue> DecodeDatumSchemata(
 // This is not DecodeDatumResolved. Schema resolution builds the whole
 // writer-schema value and *then* resolves it, so it costs more than not
 // projecting at all; a projection never touches the skipped bytes. On a
-// 20-column Iceberg manifest entry that is 8 heap allocations instead of 670,
+// 20-column Iceberg manifest entry that is 8 heap allocations instead of 464,
 // and flat in table width rather than growing with it. See
 // doc/specs/AvroTokenStream.md.
 //
@@ -554,7 +554,7 @@ class DataFileReader final {
   // Prefer this to CreateWithReaderSchema when the goal is to read less.
   // Schema resolution builds the whole writer-schema value and then resolves
   // it, so it is slower than not projecting; this skips the bytes outright.
-  // On a 20-column Iceberg manifest that is the difference between 670
+  // On a 20-column Iceberg manifest that is the difference between 464
   // heap allocations per entry and reading only what you asked for. See
   // doc/specs/AvroTokenStream.md.
   static DataFileReader CreateWithProjection(const AvroSchema& projection);
@@ -609,9 +609,9 @@ class DataFileReader final {
   // mirrors avro-cpp's reader.read(datum): consume or inspect `value` before
   // the next call. A null pointer is rejected.
   //
-  // Reader-schema resolution may change the value's shape and retains its
-  // ordinary allocating behavior. Full-schema and native-projection reads
-  // reuse records, arrays, unions, strings, bytes, fixed values and enums.
+  // Reader-schema resolution and native projection retain their ordinary
+  // allocating behavior. Full-schema reads reuse records, arrays, unions,
+  // strings, bytes, fixed values and enums through apache-avro.
   absl::StatusOr<bool> NextValueInto(AvroValue* value);
 
   // True once the file ended cleanly: header parsed, input closed and fully
