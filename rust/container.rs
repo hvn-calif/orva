@@ -26,7 +26,7 @@ use crate::vec_u8::{catch_panic, utf8, Status, VecU8};
 use apache_avro::from_avro_datum_schemata;
 use apache_avro::schema::ResolvedSchema;
 use apache_avro::types::Value;
-use apache_avro::{Codec, Schema, Writer};
+use apache_avro::{Codec, OwnedGenericDatumReader, Schema, Writer};
 use std::io::Cursor;
 
 /// Compression codec for object container files.
@@ -359,9 +359,10 @@ pub struct DataFileReader {
     /// `projection_schema` compiled against the writer schema, which is only
     /// known once the header has been parsed.
     projection: Option<AvroProjection>,
-    /// Identity plan used only by `next_value_into`. It is compiled lazily so
-    /// ordinary owned-value readers retain their existing setup cost.
-    reuse_decoder: Option<AvroProjection>,
+    /// Upstream allocation-reusing decoder used only by `next_value_into`.
+    /// It is built lazily so ordinary owned-value readers retain their
+    /// existing setup cost.
+    reuse_decoder: Option<OwnedGenericDatumReader>,
     max_block_bytes: u64,
     /// Decompressed payload of the block currently being drained, with the
     /// decode position and the number of values left in it.
@@ -804,16 +805,14 @@ impl DataFileReader {
 
     /// In-place counterpart to `decode_one`.
     fn decode_one_into(&mut self, output: &mut AvroValue) -> Result<(), VecU8> {
-        if self.projection.is_none()
-            && self.reader_schema.is_none()
-            && self.reuse_decoder.is_none()
+        if self.projection.is_none() && self.reader_schema.is_none() && self.reuse_decoder.is_none()
         {
             let Some(header) = &self.header else {
                 return Err("Internal error: no header while decoding".into());
             };
             self.reuse_decoder = Some(
-                AvroProjection::compile(&header.schema, &header.schema)
-                    .map_err(VecU8::from)?,
+                OwnedGenericDatumReader::new(header.schema.clone())
+                    .map_err(|err| VecU8::from(err.to_string()))?,
             );
         }
 
@@ -821,12 +820,17 @@ impl DataFileReader {
             return Err("Internal error: no header while decoding".into());
         };
         let remaining = &self.block[self.block_pos..];
-        let consumed = if let Some(decoder) = self.projection.as_ref().or(self.reuse_decoder.as_ref())
-        {
+        let consumed = if let Some(decoder) = self.projection.as_ref() {
             let mut cursor = remaining;
             decoder
                 .decode_into(&mut cursor, &mut output.value)
                 .map_err(VecU8::from)?;
+            remaining.len() - cursor.len()
+        } else if let Some(decoder) = self.reuse_decoder.as_ref() {
+            let mut cursor = remaining;
+            decoder
+                .read_value_into(&mut cursor, &mut output.value)
+                .map_err(|err| VecU8::from(err.to_string()))?;
             remaining.len() - cursor.len()
         } else {
             // Reader-schema resolution consumes and can reshape an owned
