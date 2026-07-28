@@ -20,6 +20,7 @@ namespace security::avro {
 class AvroValue;
 class DataFileWriter;
 class DataFileReader;
+class AvroProjection;
 
 // Compression codec for object container files. The set deliberately
 // matches avrocpp (null/deflate/snappy/zstd); bzip2 and xz are excluded.
@@ -94,6 +95,7 @@ class AvroSchema final {
   friend class AvroValue;
   friend class DataFileWriter;
   friend class DataFileReader;
+  friend class AvroProjection;
   friend absl::StatusOr<std::string> EncodeDatum(const AvroSchema& schema,
                                                  const AvroValue& value);
   friend absl::StatusOr<std::string> EncodeDatumSchemata(
@@ -114,6 +116,77 @@ class AvroSchema final {
 };
 
 // A generic Avro value tree. Replaces avrocpp's `GenericDatum`.
+// A path from the root of an AvroValue to somewhere inside it, used by the
+// AvroValue::*At readers to reach a leaf without copying anything on the way.
+//
+// GetRecordField and GetArrayItem must return an owned AvroValue, because the
+// FFI boundary cannot hand back a reference, so each one copies the subtree
+// it returns. Reaching items[3].count that way copies the whole items array
+// and then copies items[3] again. Reading every leaf of a record holding an
+// eight-item array of sub-records and a four-key map costs more than decoding
+// that record did.
+//
+// Build a path once and reuse it; SetLastIndex walks an array without
+// rebuilding or reallocating per iteration:
+//
+//   AvroPath path;
+//   path.PushField("items");
+//   const uint64_t n = *record.GetArrayLenAt(path);
+//   path.PushIndex(0);
+//   path.PushField("count");
+//   for (uint64_t i = 0; i < n; ++i) {
+//     path.Pop();
+//     path.SetLastIndex(i);
+//     path.PushField("count");
+//     total += *record.GetLongAt(path);
+//   }
+//
+// Unions are transparent: a path steps through a nullable field into the
+// branch it holds, and the leaf readers unwrap a union they land on, so
+// GetLongAt on a union of null and long yields the long (IsNullAt reports
+// the null branch).
+//
+// Use a path when reaching a leaf would otherwise copy a composite subtree.
+// Do NOT reach for one to read a top-level scalar: a path read costs an extra
+// Push and Pop, and for a two-field flat record reading both fields by path
+// measures around 45% slower than GetRecordField plus GetLong, because there
+// is no subtree worth avoiding. Cost of reading every leaf of the same 10000
+// records (benchmarks/access_probe.cc):
+//
+//   record                       cloning accessors    by path
+//   flat, two scalar fields                  78 ns     112 ns
+//   8-item array + 4-key map               1975 ns    1085 ns
+class AvroPath final {
+ public:
+  AvroPath();
+
+  AvroPath(AvroPath&&) = default;
+  AvroPath& operator=(AvroPath&&) = default;
+  AvroPath(const AvroPath&) = default;
+  AvroPath& operator=(const AvroPath&) = default;
+
+  // Appends a record field name, an array index, or a map key.
+  absl::Status PushField(absl::string_view name);
+  void PushIndex(size_t index);
+  absl::Status PushKey(absl::string_view key);
+
+  // Removes the last step. Fails if the path is empty.
+  absl::Status Pop();
+
+  // Replaces the last step with an array index. Fails if the path is empty
+  // or does not end in an index.
+  absl::Status SetLastIndex(size_t index);
+
+  void Clear();
+  uint64_t Length() const;
+  bool IsEmpty() const;
+
+ private:
+  friend class AvroValue;
+
+  rust::value::AvroPath path_;
+};
+
 class AvroValue final {
  public:
   // Constructors for primitive types.
@@ -198,6 +271,34 @@ class AvroValue final {
   absl::StatusOr<AvroValue> GetRecordField(absl::string_view name) const;
   absl::StatusOr<bool> HasRecordField(absl::string_view name) const;
 
+  // Reads at a path (see AvroPath). Each copies only the leaf it returns,
+  // not the subtrees on the way to it, so walking a decoded value does not
+  // cost more than decoding it did.
+  absl::StatusOr<bool> GetBooleanAt(const AvroPath& path) const;
+  absl::StatusOr<int32_t> GetIntAt(const AvroPath& path) const;
+  absl::StatusOr<int64_t> GetLongAt(const AvroPath& path) const;
+  absl::StatusOr<float> GetFloatAt(const AvroPath& path) const;
+  absl::StatusOr<double> GetDoubleAt(const AvroPath& path) const;
+  absl::StatusOr<std::string> GetStringAt(const AvroPath& path) const;
+  absl::StatusOr<std::string> GetBytesAt(const AvroPath& path) const;
+  absl::StatusOr<bool> IsNullAt(const AvroPath& path) const;
+  absl::StatusOr<std::string> TypeNameAt(const AvroPath& path) const;
+
+  // Container sizes and key/field listings at a path, for driving a loop
+  // without copying the container itself.
+  absl::StatusOr<uint64_t> GetArrayLenAt(const AvroPath& path) const;
+  absl::StatusOr<uint64_t> GetMapLenAt(const AvroPath& path) const;
+  absl::StatusOr<uint64_t> GetRecordLenAt(const AvroPath& path) const;
+  absl::StatusOr<std::vector<std::string>> GetMapKeysAt(
+      const AvroPath& path) const;
+  absl::StatusOr<std::vector<std::string>> GetRecordFieldNamesAt(
+      const AvroPath& path) const;
+
+  // Copies out the subtree at `path`. The escape hatch for callers that
+  // really want an owned value; the readers above exist so that reaching a
+  // leaf does not have to copy one.
+  absl::StatusOr<AvroValue> GetValueAt(const AvroPath& path) const;
+
   // Mutators. RecordPut and MapPut replace existing entries with the same
   // name/key.
   absl::Status RecordPut(absl::string_view name, const AvroValue& value);
@@ -251,6 +352,7 @@ class AvroValue final {
  private:
   friend class DataFileWriter;
   friend class DataFileReader;
+  friend class AvroProjection;
   friend absl::StatusOr<std::string> EncodeDatum(const AvroSchema& schema,
                                                  const AvroValue& value);
   friend absl::StatusOr<std::string> EncodeDatumSchemata(
@@ -286,12 +388,56 @@ absl::StatusOr<AvroValue> DecodeDatumSchemata(
     const AvroSchema& writer_schema,
     absl::Span<const AvroSchema> writer_schemata, absl::string_view data);
 
+// A projection compiled against one writer schema, for decoding a stream of
+// bare datums. `projection` must be a subset of `writer_schema`: the same
+// shape and names, with record fields optionally omitted. Fields left out are
+// stepped over at the byte level rather than built and discarded.
+//
+// This is not DecodeDatumResolved. Schema resolution builds the whole
+// writer-schema value and *then* resolves it, so it costs more than not
+// projecting at all; a projection never touches the skipped bytes. On a
+// 20-column Iceberg manifest entry that is 8 heap allocations instead of 670,
+// and flat in table width rather than growing with it. See
+// doc/specs/AvroTokenStream.md.
+//
+// Compiling walks and copies the writer schema, so hold one and reuse it
+// rather than compiling per datum. For container files use
+// DataFileReader::CreateWithProjection, which compiles one per file.
+class AvroProjection final {
+ public:
+  AvroProjection(AvroProjection&&) noexcept = default;
+  AvroProjection& operator=(AvroProjection&&) noexcept = default;
+  AvroProjection(const AvroProjection&) = delete;
+  AvroProjection& operator=(const AvroProjection&) = delete;
+
+  // Fails if `projection` is not a subset of `writer_schema`.
+  static absl::StatusOr<AvroProjection> Compile(const AvroSchema& writer_schema,
+                                                const AvroSchema& projection);
+
+  // Decodes one datum. Fails on trailing bytes, as DecodeDatum does.
+  absl::StatusOr<AvroValue> DecodeDatum(absl::string_view data) const;
+
+ private:
+  explicit AvroProjection(rust::decode::AvroProjection projection);
+
+  rust::decode::AvroProjection projection_;
+};
+
 // Bounds decoder value/length-prefix allocations on untrusted input. This
 // is a process-global that can only be set once, and must be set before the
 // first decode OR container-file read (the reader also consults it). Later
 // calls have no effect and return the value already in effect; call at
 // process startup or the 512 MiB default is locked in. Does NOT bound
 // decompression of compressed container codecs (see DataFileReader).
+//
+// Does NOT govern the projected read paths (AvroProjection and
+// DataFileReader::CreateWithProjection). Those are bounded structurally
+// instead: a container block holds a whole number of complete datums, so a
+// length prefix larger than the bytes remaining in the containing buffer is
+// malformed by definition and is rejected before anything is allocated. Their
+// effective ceiling is therefore DataFileReader::SetMaxBlockSize (128 MiB by
+// default) rather than this limit, which for container reads is the tighter of
+// the two. See doc/specs/AvroTokenStream.md.
 size_t SetMaxAllocationBytes(size_t num_bytes);
 
 // Streaming Avro object container file writer. Replaces avrocpp's
@@ -397,17 +543,37 @@ class DataFileReader final {
   // (schema evolution).
   static DataFileReader CreateWithReaderSchema(const AvroSchema& reader_schema);
 
+  // As Create, but materializes only the fields named by `projection` and
+  // steps over the rest at the byte level, so unread fields cost nothing.
+  // `projection` must be a subset of the writer schema: the same shape and
+  // names, with record fields optionally omitted. Because the writer schema
+  // only arrives with the header, a projection that does not match it
+  // surfaces as an error from the first NextReady/NextValue (or from
+  // construction, for the FromBytes/FromPath variants below).
+  //
+  // Prefer this to CreateWithReaderSchema when the goal is to read less.
+  // Schema resolution builds the whole writer-schema value and then resolves
+  // it, so it is slower than not projecting; this skips the bytes outright.
+  // On a 20-column Iceberg manifest that is the difference between 670
+  // heap allocations per entry and reading only what you asked for. See
+  // doc/specs/AvroTokenStream.md.
+  static DataFileReader CreateWithProjection(const AvroSchema& projection);
+
   // Conveniences over a complete in-memory file: feed everything, close the
   // input, and fail eagerly on garbage or a file truncated in the header or
   // first block.
   static absl::StatusOr<DataFileReader> FromBytes(absl::string_view data);
   static absl::StatusOr<DataFileReader> FromBytesWithSchema(
       const AvroSchema& reader_schema, absl::string_view data);
+  static absl::StatusOr<DataFileReader> FromBytesWithProjection(
+      const AvroSchema& projection, absl::string_view data);
 
-  // Filesystem variants of the two constructors above.
+  // Filesystem variants of the constructors above.
   static absl::StatusOr<DataFileReader> FromPath(absl::string_view path);
   static absl::StatusOr<DataFileReader> FromPathWithSchema(
       const AvroSchema& reader_schema, absl::string_view path);
+  static absl::StatusOr<DataFileReader> FromPathWithProjection(
+      const AvroSchema& projection, absl::string_view path);
 
   // Appends input bytes. Fails after CloseInput or a fatal error.
   absl::Status Feed(absl::string_view data);
@@ -426,7 +592,27 @@ class DataFileReader final {
   // ready (benign: more input may arrive, or the file ended cleanly) and
   // with kInvalidArgument for fatal framing/decode errors, which fuse the
   // reader (see HasFailed).
+  //
+  // NextValue drives the parser itself and distinguishes the two failures by
+  // code, so a whole-buffer read loop does not need NextReady at all:
+  //
+  //   while (auto value = reader.NextValue()) { use(*value); }
+  //
+  // Calling NextReady first repeats the pump for no benefit. It is worth
+  // around 5-12 ns per value, small but free to drop. NextReady earns its
+  // place when input arrives incrementally and the caller has to tell "not
+  // yet" from "done" before deciding whether to Feed more.
   absl::StatusOr<AvroValue> NextValue();
+
+  // Decodes into caller-owned storage, reusing compatible allocations.
+  // Returns true for a decoded value and false at clean end of file. This
+  // mirrors avro-cpp's reader.read(datum): consume or inspect `value` before
+  // the next call. A null pointer is rejected.
+  //
+  // Reader-schema resolution may change the value's shape and retains its
+  // ordinary allocating behavior. Full-schema and native-projection reads
+  // reuse records, arrays, unions, strings, bytes, fixed values and enums.
+  absl::StatusOr<bool> NextValueInto(AvroValue* value);
 
   // True once the file ended cleanly: header parsed, input closed and fully
   // consumed, all values drained, no error. Reflects parse progress as of
@@ -555,6 +741,12 @@ class DataFileStreamReader final {
   // (schema evolution).
   static absl::StatusOr<DataFileStreamReader> CreateWithReaderSchema(
       const AvroSchema& reader_schema, ZeroCopyInputStream* stream);
+
+  // As Create, but materializes only the fields named by `projection`. See
+  // DataFileReader::CreateWithProjection; this is the streaming form, which
+  // is the one that matters for large manifests arriving over gRPC.
+  static absl::StatusOr<DataFileStreamReader> CreateWithProjection(
+      const AvroSchema& projection, ZeroCopyInputStream* stream);
 
   // True if another value is available, pulling stream chunks as needed;
   // false at the clean end of the file. Framing/decode errors are fatal and

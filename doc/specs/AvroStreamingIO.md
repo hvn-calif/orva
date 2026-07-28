@@ -113,6 +113,10 @@ Streaming methods:
   `at_end`)
 - `next_value() -> Result<AvroValue, VecU8>` - next decoded value; errors if
   none is ready
+- `next_value_into(&mut value) -> Result<bool, VecU8>` - overwrite one
+  caller-owned value, reusing compatible allocations; true means one value
+  was decoded and false is clean EOF. The C++ `NextValueInto(AvroValue*)`
+  mirrors avro-cpp's `read(datum)`.
 - `at_end() -> bool` - clean end: header seen, input closed, all values
   drained, no error
 - `header_ready() -> bool`, `writer_schema() -> Result<AvroSchema, VecU8>`
@@ -137,9 +141,12 @@ never silently truncates).
 4. Per block: object count (long varint), compressed size (long varint),
    payload, 16-byte sync marker which must equal the header's. Payload is
    decompressed with `Codec::decompress`, then `count` datums are decoded
-   lazily (one per `next_value`) with `from_avro_datum_schemata` using the
-   writer schema (passed in `schemata` so recursive/named-type references
+   lazily (one per call). `next_value` uses `from_avro_datum_schemata` with
+   the writer schema (passed in `schemata` so recursive/named-type references
    inside a self-contained schema resolve) and the optional reader schema.
+   `next_value_into` uses a compiled identity plan from `crate::decode` to
+   overwrite compatible record, array, union, string, bytes, fixed and enum
+   storage; reader-schema resolution retains the ordinary allocating path.
 
 ## Security / untrusted input
 

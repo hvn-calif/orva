@@ -144,7 +144,9 @@ if (AVRO_BUILD_BENCHMARKS)
   #   block_probe   container block-framing cost vs per-value decode cost
   #   avro_sweep    how the read gap scales with payload size and field count
   #   append_probe  what the copy inside Append costs, and what moving saves
-  foreach(probe block_probe avro_sweep append_probe)
+  #   access_probe  what reading a decoded value back out costs
+  #   manifest_probe where the time goes on a real Iceberg v2 manifest shape
+  foreach(probe block_probe avro_sweep append_probe access_probe manifest_probe)
     add_executable(${probe} benchmarks/${probe}.cc)
     target_include_directories(${probe} PRIVATE
       ${CMAKE_SOURCE_DIR}

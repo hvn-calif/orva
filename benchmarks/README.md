@@ -67,6 +67,72 @@ Interpretation caveats:
   sync marker) after the benchmark's own `flush()`; that small one-sided
   cost is included in the avrocpp write rows.
 
+## Probes
+
+Narrower questions the matrix above cannot answer. Same build flag, one
+target each.
+
+- `block_probe`: separates container block-framing cost from per-value decode
+  cost, plus a block-count sweep and a contiguous struct-array traversal for
+  scale. Marginal cost per block came out at roughly 21 ns for this binding
+  against 37 ns for avrocpp, so block count is not a source of the read gap.
+- `avro_sweep`: how the read gap scales with payload size (0-4096 bytes) and
+  field count (1-16). Distinguishes a fixed per-record overhead from per-field
+  and per-byte costs, which the single-shape matrix rows cannot.
+- `append_probe`: what the value copy inside `Append` costs and what
+  `Append(AvroValue&&)` saves, by building each record inside the timed
+  region. The matrix rows above append the same values every iteration, so
+  they cannot show this.
+- `manifest_probe`: where the time goes on a real Apache Iceberg v2
+  `manifest_entry` shape, which is the workload that prompted the
+  investigation. Iceberg encodes its per-column metrics as
+  `array<record{key,value}>` (Avro map keys must be strings), so a table with
+  N columns puts 6N two-field sub-records in every entry. Set
+  `MANIFEST_ENTRIES` (default 2000) and `MANIFEST_COLUMNS` (default 20);
+  `MANIFEST_ENTRIES=128247` is the ~150 MB case. Findings are in
+  doc/specs/AvroTokenStream.md; the short version is that building and
+  dropping a fresh value tree is 1.3-2.3x slower than avrocpp, while reusing
+  that tree makes Rust faster on decode and planner work. Byte-level
+  projection and efficient read-back remain separate performance concerns.
+
+  The `ours/project_native` row measures the projected reader added for that
+  spec (`DataFileReader::CreateWithProjection`, rust/decode.rs). It reads the
+  same planner fields 12.2x faster than materializing the whole entry at 20
+  columns, and 1.87x faster than avrocpp's own projected read; the margin
+  widens with table width because its allocation count is flat in it. The
+  `ours/project_decode` row is kept for contrast: it is the same projection
+  expressed as a reader schema, which apache-avro resolves *after*
+  materializing everything, and is therefore slower than not projecting.
+
+  The `ours_reuse/*` rows use `DataFileReader::NextValueInto`, overwriting one
+  caller-owned `AvroValue` exactly as avro-cpp overwrites one
+  `GenericDatum`. Same-process 20-column medians (2000 entries, null codec,
+  seven repetitions):
+
+  | work | owned value | reusable value | avrocpp | reusable vs avrocpp |
+  |------|------------:|---------------:|--------:|---------------------:|
+  | decode only | 67.0k/s | **322.3k/s** | 109.5k/s | **2.94x faster** |
+  | planner walk | 61.3k/s | **229.5k/s** | 108.8k/s | **2.11x faster** |
+  | full metrics walk | 38.2k/s | **71.7k/s** | 104.6k/s | **1.46x slower** |
+
+  Reuse therefore reverses the full-materialization *decode* comparison, but
+  not an exhaustive read-back comparison: thousands of `AvroPath` leaf calls
+  still cross and re-walk the Rust value tree. Projection remains faster when
+  only planner fields are required because it does not decode the metrics
+  bytes at all. The allocation test measures **0 allocator operations and
+  0 allocated bytes** for the second same-shaped 20-column entry after
+  warm-up, against 670 operations and 34,564 bytes for an owned decode. Raw
+  throughput output and the exact command are in
+  `benchmarks/manifest_reuse_results.txt`.
+- `access_probe`: what reading a decoded value back out costs. Every other
+  benchmark here decodes a value and drops it without reading a field, which
+  hid the largest single cost in the binding: with the cloning accessors,
+  reading every leaf of a record holding an 8-item array and a 4-key map cost
+  1975 ns, more than the 1212 ns it took to decode, against 28 ns for
+  avrocpp. `AvroPath` brings that to 1085 ns. It also measures a minimal FFI
+  crossing at 1.34 ns, which is why batching the value-pulling API is not
+  worth doing: the cost is copying, not crossing.
+
 ## Exporting results as TSV
 
 ```sh

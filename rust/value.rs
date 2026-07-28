@@ -701,6 +701,349 @@ impl AvroValue {
 
 make_vec_type!(AvroValue, VecAvroValue);
 
+// ---------------------------------------------------------------------------
+// Path navigation
+// ---------------------------------------------------------------------------
+
+/// One navigation step: a record field, an array index, or a map key.
+#[derive(Debug, Clone, PartialEq)]
+enum Step {
+    Field(String),
+    Index(usize),
+    Key(String),
+}
+
+/// A path from the root of an `AvroValue` to somewhere inside it, used by the
+/// `*_at` accessors to read a leaf without copying anything on the way.
+///
+/// The plain accessors (`get_record_field`, `get_array_item`, ...) must return
+/// an owned `AvroValue`, because the FFI boundary cannot hand back a
+/// reference; each one therefore clones the subtree it returns. Reaching
+/// `items[3].count` that way copies the whole `items` array, then copies
+/// `items[3]` again. Reading every leaf of a record holding an eight-item
+/// array of sub-records and a four-key map costs more than decoding that
+/// record did.
+///
+/// A path avoids all of it: build the path once, and each read walks it
+/// against the borrowed tree and copies only the leaf. Reuse one path across
+/// a loop with `set_last_index` rather than rebuilding it per iteration.
+///
+/// Use a path when reaching a leaf would otherwise copy a composite subtree.
+/// Do *not* reach for one to read a top-level scalar: a path read costs an
+/// extra push and pop, and for a two-field flat record reading both fields by
+/// path measures around 45% slower than `get_record_field` plus `get_long`,
+/// because there is no subtree worth avoiding. Measured on the same 10000
+/// records (benchmarks/access_probe.cc), the cost of reading every leaf:
+///
+/// | record                        | cloning accessors | by path |
+/// |-------------------------------|-------------------|---------|
+/// | flat, two scalar fields       |             78 ns |  112 ns |
+/// | 8-item array + 4-key map      |           1975 ns | 1085 ns |
+#[derive(Debug, Clone, Default)]
+pub struct AvroPath {
+    /// `steps[..len]` is the path. Steps past `len` have been popped but are
+    /// kept so a later push can reuse their string allocation: the loop that
+    /// walks an array pushes and pops a field name per item, and allocating
+    /// one each time costs more than the copy the path exists to avoid.
+    steps: Vec<Step>,
+    len: usize,
+}
+
+/// Two paths are equal when they name the same location; the popped steps
+/// kept behind for reuse are not part of that.
+impl PartialEq for AvroPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.steps[..self.len] == other.steps[..other.len]
+    }
+}
+
+impl AvroPath {
+    /// Creates an empty path, which refers to the value's root. (Named
+    /// `create` rather than `new` because `new` is reserved in the generated
+    /// C++.)
+    pub fn create() -> AvroPath {
+        AvroPath { steps: Vec::new(), len: 0 }
+    }
+
+    /// Appends a record field name. Errors if `name` is not valid UTF-8.
+    pub fn push_field(&mut self, name: &[u8]) -> Status {
+        let name = utf8(name)?;
+        self.push(|text| Step::Field(text), name);
+        Ok(0)
+    }
+
+    /// Appends an array index.
+    pub fn push_index(&mut self, index: usize) {
+        if self.len < self.steps.len() {
+            self.steps[self.len] = Step::Index(index);
+        } else {
+            self.steps.push(Step::Index(index));
+        }
+        self.len += 1;
+    }
+
+    /// Appends a map key. Errors if `key` is not valid UTF-8.
+    pub fn push_key(&mut self, key: &[u8]) -> Status {
+        let key = utf8(key)?;
+        self.push(|text| Step::Key(text), key);
+        Ok(0)
+    }
+
+    /// Removes the last step. Errors if the path is already empty. The step
+    /// stays in `steps` so the next push can reuse its allocation.
+    pub fn pop(&mut self) -> Status {
+        if self.len == 0 {
+            return Err("Path is already empty".into());
+        }
+        self.len -= 1;
+        Ok(0)
+    }
+
+    /// Appends a text step, reusing the popped slot's string if there is one.
+    fn push(&mut self, make: fn(String) -> Step, text: &str) {
+        if self.len < self.steps.len() {
+            // Reuse the popped step's buffer rather than allocating.
+            let mut recycled = match std::mem::replace(&mut self.steps[self.len], Step::Index(0)) {
+                Step::Field(buffer) | Step::Key(buffer) => buffer,
+                Step::Index(_) => String::new(),
+            };
+            recycled.clear();
+            recycled.push_str(text);
+            self.steps[self.len] = make(recycled);
+        } else {
+            self.steps.push(make(text.to_string()));
+        }
+        self.len += 1;
+    }
+
+    /// Replaces the last step with an array index, so a loop can walk an
+    /// array without rebuilding the path (or reallocating) each iteration.
+    /// Errors if the path is empty or does not end in an index.
+    pub fn set_last_index(&mut self, index: usize) -> Status {
+        match self.steps[..self.len].last_mut() {
+            Some(Step::Index(last)) => {
+                *last = index;
+                Ok(0)
+            }
+            Some(_) => Err("Last path step is not an array index".into()),
+            None => Err("Path is empty".into()),
+        }
+    }
+
+    /// Empties the path, keeping the step buffers for reuse.
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// (Returns u64 because Crubit cannot bridge `usize` returns uniformly
+    /// with the rest of this API.)
+    pub fn len(&self) -> u64 {
+        self.len as u64
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Renders the path for error messages, e.g. `items[3].count`.
+    fn describe(&self) -> String {
+        let mut out = String::new();
+        for step in &self.steps[..self.len] {
+            match step {
+                Step::Field(name) => {
+                    if !out.is_empty() {
+                        out.push('.');
+                    }
+                    out.push_str(name);
+                }
+                Step::Index(index) => out.push_str(&format!("[{}]", index)),
+                Step::Key(key) => out.push_str(&format!("[\"{}\"]", key)),
+            }
+        }
+        if out.is_empty() { "<root>".to_string() } else { out }
+    }
+}
+
+impl AvroValue {
+    /// Borrows the value at `path`, walking the tree without copying.
+    /// Unions are transparent along the way: a caller reading
+    /// `contact.email` through a nullable `contact` means the branch the
+    /// union holds. The value the path lands on is returned as-is, union
+    /// included; `at_leaf` is the variant that unwraps it.
+    fn at<'a>(&'a self, path: &AvroPath) -> Result<&'a Value, VecU8> {
+        let mut current = &self.value;
+        for (depth, step) in path.steps[..path.len].iter().enumerate() {
+            current = Self::unwrap_unions(current);
+            let next = match (step, current) {
+                (Step::Field(name), Value::Record(fields)) => {
+                    fields.iter().find(|(field, _)| field == name).map(|(_, v)| v)
+                }
+                (Step::Index(index), Value::Array(items)) => items.get(*index),
+                (Step::Key(key), Value::Map(entries)) => entries.get(key),
+                _ => None,
+            };
+            match next {
+                Some(value) => current = value,
+                None => return Err(Self::path_error(path, depth)),
+            }
+        }
+        Ok(current)
+    }
+
+    /// `at`, then unwraps a union the path landed directly on, so reading a
+    /// nullable long yields the long (or null) rather than the wrapper.
+    fn at_leaf<'a>(&'a self, path: &AvroPath) -> Result<&'a Value, VecU8> {
+        Ok(Self::unwrap_unions(self.at(path)?))
+    }
+
+    fn unwrap_unions(mut value: &Value) -> &Value {
+        while let Value::Union(_, inner) = value {
+            value = inner.as_ref();
+        }
+        value
+    }
+
+    fn path_error(path: &AvroPath, depth: usize) -> VecU8 {
+        format!(
+            "No value at path {} (failed at step {} of {})",
+            path.describe(),
+            depth + 1,
+            path.len
+        )
+        .into()
+    }
+
+    fn at_type_error(path: &AvroPath, actual: &Value, expected: &str) -> VecU8 {
+        format!(
+            "Value at path {} is not {}; actual type is {}",
+            path.describe(),
+            expected,
+            AvroValue { value: actual.clone() }.type_name_str()
+        )
+        .into()
+    }
+
+    // ------------------------------------------------------------------
+    // Leaf reads at a path. Each copies the leaf and nothing else.
+    // ------------------------------------------------------------------
+
+    pub fn get_boolean_at(&self, path: &AvroPath) -> Result<bool, VecU8> {
+        match self.at_leaf(path)? {
+            Value::Boolean(v) => Ok(*v),
+            other => Err(Self::at_type_error(path, other, "boolean")),
+        }
+    }
+
+    pub fn get_int_at(&self, path: &AvroPath) -> Result<i32, VecU8> {
+        match self.at_leaf(path)? {
+            Value::Int(v) => Ok(*v),
+            other => Err(Self::at_type_error(path, other, "int")),
+        }
+    }
+
+    pub fn get_long_at(&self, path: &AvroPath) -> Result<i64, VecU8> {
+        match self.at_leaf(path)? {
+            Value::Long(v) => Ok(*v),
+            other => Err(Self::at_type_error(path, other, "long")),
+        }
+    }
+
+    pub fn get_float_at(&self, path: &AvroPath) -> Result<f32, VecU8> {
+        match self.at_leaf(path)? {
+            Value::Float(v) => Ok(*v),
+            other => Err(Self::at_type_error(path, other, "float")),
+        }
+    }
+
+    pub fn get_double_at(&self, path: &AvroPath) -> Result<f64, VecU8> {
+        match self.at_leaf(path)? {
+            Value::Double(v) => Ok(*v),
+            other => Err(Self::at_type_error(path, other, "double")),
+        }
+    }
+
+    pub fn get_string_at(&self, path: &AvroPath) -> Result<VecU8, VecU8> {
+        match self.at_leaf(path)? {
+            Value::String(v) => Ok(v.as_str().into()),
+            other => Err(Self::at_type_error(path, other, "string")),
+        }
+    }
+
+    pub fn get_bytes_at(&self, path: &AvroPath) -> Result<VecU8, VecU8> {
+        match self.at_leaf(path)? {
+            Value::Bytes(v) => Ok(v.as_slice().into()),
+            other => Err(Self::at_type_error(path, other, "bytes")),
+        }
+    }
+
+    pub fn is_null_at(&self, path: &AvroPath) -> Result<bool, VecU8> {
+        Ok(matches!(self.at_leaf(path)?, Value::Null))
+    }
+
+    /// Returns the name of the type at `path`, e.g. "record" or "int".
+    pub fn type_name_at(&self, path: &AvroPath) -> Result<VecU8, VecU8> {
+        let value = self.at_leaf(path)?.clone();
+        Ok(AvroValue { value }.type_name())
+    }
+
+    // ------------------------------------------------------------------
+    // Container sizes at a path, for driving loops without copying the
+    // container. (u64 for the same reason as get_array_len.)
+    // ------------------------------------------------------------------
+
+    pub fn get_array_len_at(&self, path: &AvroPath) -> Result<u64, VecU8> {
+        match self.at_leaf(path)? {
+            Value::Array(items) => Ok(items.len() as u64),
+            other => Err(Self::at_type_error(path, other, "array")),
+        }
+    }
+
+    pub fn get_map_len_at(&self, path: &AvroPath) -> Result<u64, VecU8> {
+        match self.at_leaf(path)? {
+            Value::Map(entries) => Ok(entries.len() as u64),
+            other => Err(Self::at_type_error(path, other, "map")),
+        }
+    }
+
+    pub fn get_record_len_at(&self, path: &AvroPath) -> Result<u64, VecU8> {
+        match self.at_leaf(path)? {
+            Value::Record(fields) => Ok(fields.len() as u64),
+            other => Err(Self::at_type_error(path, other, "record")),
+        }
+    }
+
+    /// Returns the keys of the map at `path`, sorted lexicographically.
+    pub fn get_map_keys_at(&self, path: &AvroPath) -> Result<VecVecU8, VecU8> {
+        match self.at_leaf(path)? {
+            Value::Map(entries) => {
+                let mut keys: Vec<&String> = entries.keys().collect();
+                keys.sort();
+                Ok(keys.into_iter().map(|k| k.as_str().into()).collect::<Vec<VecU8>>().into())
+            }
+            other => Err(Self::at_type_error(path, other, "map")),
+        }
+    }
+
+    /// Returns the field names of the record at `path`, in field order.
+    pub fn get_record_field_names_at(&self, path: &AvroPath) -> Result<VecVecU8, VecU8> {
+        match self.at_leaf(path)? {
+            Value::Record(fields) => Ok(fields
+                .iter()
+                .map(|(name, _)| name.as_str().into())
+                .collect::<Vec<VecU8>>()
+                .into()),
+            other => Err(Self::at_type_error(path, other, "record")),
+        }
+    }
+
+    /// Copies out the subtree at `path`. This is the escape hatch for
+    /// callers that really do want an owned value; the `*_at` leaf readers
+    /// above exist so that reaching a leaf does not have to.
+    pub fn get_value_at(&self, path: &AvroPath) -> Result<AvroValue, VecU8> {
+        Ok(AvroValue { value: self.at(path)?.clone() })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -888,6 +1231,165 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["id"], 7);
         assert_eq!(parsed["name"], "x");
+    }
+
+    /// {items: [{key, count} x2], tags: {a: 1}, maybe: union(null|long)}
+    fn nested_fixture(maybe: Value) -> AvroValue {
+        let item = |key: &str, count: i64| {
+            Value::Record(vec![
+                ("key".to_string(), Value::String(key.to_string())),
+                ("count".to_string(), Value::Long(count)),
+            ])
+        };
+        AvroValue {
+            value: Value::Record(vec![
+                (
+                    "items".to_string(),
+                    Value::Array(vec![item("first", 10), item("second", 20)]),
+                ),
+                (
+                    "tags".to_string(),
+                    Value::Map([("a".to_string(), Value::Long(7))].into_iter().collect()),
+                ),
+                ("maybe".to_string(), maybe),
+            ]),
+        }
+    }
+
+    #[test]
+    fn path_reads_leaves_without_copying_the_way_there() {
+        let record = nested_fixture(Value::Null);
+        let mut path = AvroPath::create();
+        path.push_field(b"items").unwrap();
+        assert_eq!(record.get_array_len_at(&path).unwrap(), 2);
+
+        path.push_index(1);
+        path.push_field(b"key").unwrap();
+        assert_eq!(record.get_string_at(&path).unwrap().as_slice(), b"second");
+
+        // Reuse the path across the array rather than rebuilding it.
+        path.pop().unwrap();
+        path.push_field(b"count").unwrap();
+        assert_eq!(record.get_long_at(&path).unwrap(), 20);
+        path.pop().unwrap();
+        path.set_last_index(0).unwrap();
+        path.push_field(b"count").unwrap();
+        assert_eq!(record.get_long_at(&path).unwrap(), 10);
+
+        // Map access by key.
+        let mut tags = AvroPath::create();
+        tags.push_field(b"tags").unwrap();
+        assert_eq!(record.get_map_len_at(&tags).unwrap(), 1);
+        assert_eq!(tags.len(), 1);
+        tags.push_key(b"a").unwrap();
+        assert_eq!(record.get_long_at(&tags).unwrap(), 7);
+
+        // An empty path is the root.
+        let root = AvroPath::create();
+        assert!(root.is_empty());
+        assert_eq!(record.get_record_len_at(&root).unwrap(), 3);
+        assert_eq!(record.type_name_at(&root).unwrap().as_slice(), b"record");
+    }
+
+    #[test]
+    fn path_sees_through_unions() {
+        // Reading a nullable field yields the branch, not the wrapper.
+        let present = nested_fixture(Value::Union(1, Box::new(Value::Long(99))));
+        let mut path = AvroPath::create();
+        path.push_field(b"maybe").unwrap();
+        assert_eq!(present.get_long_at(&path).unwrap(), 99);
+        assert!(!present.is_null_at(&path).unwrap());
+
+        let absent = nested_fixture(Value::Union(0, Box::new(Value::Null)));
+        assert!(absent.is_null_at(&path).unwrap());
+        assert!(absent.get_long_at(&path).is_err());
+
+        // Navigating *through* a union reaches into the branch, so a step
+        // after the union is applied to what it holds and not skipped.
+        let wrapped = AvroValue {
+            value: Value::Record(vec![(
+                "contact".to_string(),
+                Value::Union(
+                    1,
+                    Box::new(Value::Record(vec![(
+                        "email".to_string(),
+                        Value::String("x@y".to_string()),
+                    )])),
+                ),
+            )]),
+        };
+        let mut through = AvroPath::create();
+        through.push_field(b"contact").unwrap();
+        through.push_field(b"email").unwrap();
+        assert_eq!(wrapped.get_string_at(&through).unwrap().as_slice(), b"x@y");
+
+        // get_value_at keeps the union itself, so it stays inspectable.
+        let mut contact = AvroPath::create();
+        contact.push_field(b"contact").unwrap();
+        assert!(wrapped.get_value_at(&contact).unwrap().is_union());
+    }
+
+    #[test]
+    fn path_errors_name_the_path_and_the_failing_step() {
+        let record = nested_fixture(Value::Null);
+        let mut missing = AvroPath::create();
+        missing.push_field(b"items").unwrap();
+        missing.push_index(9);
+        let err = String::from_utf8(record.get_long_at(&missing).unwrap_err().into_vec()).unwrap();
+        assert!(err.contains("items[9]"), "{err}");
+        assert!(err.contains("step 2 of 2"), "{err}");
+
+        // Right path, wrong leaf type.
+        let mut wrong_type = AvroPath::create();
+        wrong_type.push_field(b"items").unwrap();
+        let err =
+            String::from_utf8(record.get_long_at(&wrong_type).unwrap_err().into_vec()).unwrap();
+        assert!(err.contains("not long"), "{err}");
+        assert!(err.contains("array"), "{err}");
+
+        // Stepping into a scalar fails rather than silently returning it.
+        let mut into_scalar = AvroPath::create();
+        into_scalar.push_field(b"tags").unwrap();
+        into_scalar.push_key(b"a").unwrap();
+        into_scalar.push_field(b"nope").unwrap();
+        assert!(record.get_long_at(&into_scalar).is_err());
+    }
+
+    #[test]
+    fn path_editing_is_checked() {
+        let mut path = AvroPath::create();
+        assert!(path.pop().is_err());
+        assert!(path.set_last_index(0).is_err());
+        path.push_field(b"items").unwrap();
+        // The last step is a field, not an index.
+        assert!(path.set_last_index(0).is_err());
+        path.push_index(3);
+        assert!(path.set_last_index(4).is_ok());
+        assert_eq!(path.len(), 2);
+        path.clear();
+        assert!(path.is_empty());
+        assert!(path.push_field(&[0xff]).is_err());
+        assert!(path.push_key(&[0xff]).is_err());
+    }
+
+    #[test]
+    fn path_and_plain_accessors_agree() {
+        let record = nested_fixture(Value::Null);
+        let mut path = AvroPath::create();
+        path.push_field(b"items").unwrap();
+        path.push_index(0);
+        path.push_field(b"key").unwrap();
+
+        let by_clone = record
+            .get_record_field(b"items")
+            .unwrap()
+            .get_array_item(0)
+            .unwrap()
+            .get_record_field(b"key")
+            .unwrap()
+            .get_string()
+            .unwrap();
+        assert_eq!(record.get_string_at(&path).unwrap().as_slice(), by_clone.as_slice());
     }
 
     #[test]

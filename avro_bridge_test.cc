@@ -412,6 +412,26 @@ INSTANTIATE_TEST_SUITE_P(AllCodecs, ContainerCodecTest,
                          ::testing::Values(Codec::kNull, Codec::kDeflate,
                                            Codec::kSnappy, Codec::kZstandard));
 
+TEST(ContainerTest, NextValueIntoReusesCallerOwnedValue) {
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  AvroValue first = MakeUser(1, "alpha");
+  AvroValue second = MakeUser(2, "bravo");
+  std::string bytes = WriteFile(*schema, Codec::kNull, {first, second});
+
+  auto reader = DataFileReader::FromBytes(bytes);
+  ASSERT_TRUE(reader.ok());
+  AvroValue value = AvroValue::CreateNull();
+  ASSERT_TRUE(reader->NextValueInto(&value).value_or(false));
+  EXPECT_TRUE(value == first);
+  ASSERT_TRUE(reader->NextValueInto(&value).value_or(false));
+  EXPECT_TRUE(value == second);
+  EXPECT_FALSE(reader->NextValueInto(&value).value_or(true));
+  EXPECT_TRUE(reader->AtEnd());
+  EXPECT_EQ(reader->NextValueInto(nullptr).status().code(),
+            absl::StatusCode::kInvalidArgument);
+}
+
 TEST(ContainerTest, ChunkedFeedRoundtrip) {
   // The streaming read path driven from C++: feed a multi-value file in
   // small chunks and drain values as they become decodable.
@@ -569,6 +589,108 @@ TEST(ContainerTest, AppendInvalidValueFailsAndWriterStaysUsable) {
   EXPECT_FALSE(reader->NextReady().value_or(true));
 }
 
+TEST(AvroPathTest, ReadsLeavesAndAgreesWithTheCloningAccessors) {
+  AvroValue item = AvroValue::CreateRecord();
+  ASSERT_TRUE(item.RecordPut("key", *AvroValue::CreateString("first")).ok());
+  ASSERT_TRUE(item.RecordPut("count", AvroValue::CreateLong(10)).ok());
+  AvroValue items = AvroValue::CreateArray();
+  ASSERT_TRUE(items.ArrayPush(item).ok());
+  AvroValue tags = AvroValue::CreateMap();
+  ASSERT_TRUE(tags.MapPut("a", AvroValue::CreateLong(7)).ok());
+  AvroValue record = AvroValue::CreateRecord();
+  ASSERT_TRUE(record.RecordPut("items", items).ok());
+  ASSERT_TRUE(record.RecordPut("tags", tags).ok());
+
+  AvroPath path;
+  EXPECT_TRUE(path.IsEmpty());
+  EXPECT_EQ(record.GetRecordLenAt(path).value_or(0), 2);
+  ASSERT_TRUE(path.PushField("items").ok());
+  EXPECT_EQ(record.GetArrayLenAt(path).value_or(0), 1);
+  path.PushIndex(0);
+  ASSERT_TRUE(path.PushField("count").ok());
+  EXPECT_EQ(path.Length(), 3);
+  EXPECT_EQ(record.GetLongAt(path).value_or(0), 10);
+
+  ASSERT_TRUE(path.Pop().ok());
+  ASSERT_TRUE(path.PushField("key").ok());
+  EXPECT_EQ(record.GetStringAt(path).value_or(""), "first");
+  EXPECT_EQ(record.TypeNameAt(path).value_or(""), "string");
+
+  // Same answer as walking with the cloning accessors.
+  auto by_clone = record.GetRecordField("items")
+                      .value()
+                      .GetArrayItem(0)
+                      .value()
+                      .GetRecordField("key")
+                      .value()
+                      .GetString();
+  ASSERT_TRUE(by_clone.ok());
+  EXPECT_EQ(record.GetStringAt(path).value_or(""), *by_clone);
+
+  AvroPath map_path;
+  ASSERT_TRUE(map_path.PushField("tags").ok());
+  EXPECT_EQ(record.GetMapLenAt(map_path).value_or(0), 1);
+  auto keys = record.GetMapKeysAt(map_path);
+  ASSERT_TRUE(keys.ok());
+  EXPECT_THAT(*keys, ::testing::ElementsAre("a"));
+  ASSERT_TRUE(map_path.PushKey("a").ok());
+  EXPECT_EQ(record.GetLongAt(map_path).value_or(0), 7);
+}
+
+TEST(AvroPathTest, MissingAndMistypedPathsFailWithTheOffendingPath) {
+  AvroValue record = AvroValue::CreateRecord();
+  ASSERT_TRUE(record.RecordPut("id", AvroValue::CreateLong(1)).ok());
+
+  AvroPath missing;
+  ASSERT_TRUE(missing.PushField("nope").ok());
+  auto err = record.GetLongAt(missing);
+  EXPECT_EQ(err.status().code(), absl::StatusCode::kNotFound);
+  EXPECT_THAT(std::string(err.status().message()), ::testing::HasSubstr("nope"));
+
+  AvroPath wrong_type;
+  ASSERT_TRUE(wrong_type.PushField("id").ok());
+  EXPECT_THAT(std::string(record.GetStringAt(wrong_type).status().message()),
+              ::testing::HasSubstr("not string"));
+
+  // Path editing is checked rather than silently ignored.
+  AvroPath empty;
+  EXPECT_FALSE(empty.Pop().ok());
+  EXPECT_FALSE(empty.SetLastIndex(0).ok());
+  ASSERT_TRUE(empty.PushField("id").ok());
+  EXPECT_FALSE(empty.SetLastIndex(0).ok()) << "last step is a field";
+  empty.PushIndex(1);
+  EXPECT_TRUE(empty.SetLastIndex(2).ok());
+  empty.Clear();
+  EXPECT_TRUE(empty.IsEmpty());
+}
+
+TEST(AvroPathTest, UnionsAreTransparent) {
+  AvroValue inner = AvroValue::CreateRecord();
+  ASSERT_TRUE(inner.RecordPut("email", *AvroValue::CreateString("x@y")).ok());
+  AvroValue record = AvroValue::CreateRecord();
+  ASSERT_TRUE(record.RecordPut("contact", AvroValue::CreateUnion(1, inner)).ok());
+  ASSERT_TRUE(
+      record.RecordPut("maybe", AvroValue::CreateUnion(0, AvroValue::CreateNull()))
+          .ok());
+
+  // A step after the union applies to the branch it holds.
+  AvroPath through;
+  ASSERT_TRUE(through.PushField("contact").ok());
+  ASSERT_TRUE(through.PushField("email").ok());
+  EXPECT_EQ(record.GetStringAt(through).value_or(""), "x@y");
+
+  AvroPath null_branch;
+  ASSERT_TRUE(null_branch.PushField("maybe").ok());
+  EXPECT_TRUE(record.IsNullAt(null_branch).value_or(false));
+
+  // GetValueAt keeps the union, so it stays inspectable.
+  AvroPath contact;
+  ASSERT_TRUE(contact.PushField("contact").ok());
+  auto raw = record.GetValueAt(contact);
+  ASSERT_TRUE(raw.ok());
+  EXPECT_TRUE(raw->IsUnion());
+}
+
 TEST(ContainerTest, AppendMoveWritesTheSameFileAndEmptiesTheValue) {
   auto schema = AvroSchema::Parse(kRecordSchema);
   ASSERT_TRUE(schema.ok());
@@ -671,6 +793,97 @@ TEST(ContainerTest, ReaderSchemaResolution) {
   EXPECT_EQ(value->GetRecordField("a")->GetLong().value_or(0), 12);
   EXPECT_EQ(value->GetRecordField("b")->GetString().value_or(""), "d");
   EXPECT_TRUE(*reader->WriterSchema() == *writer_schema);
+}
+
+TEST(ContainerTest, ProjectedReadDropsUnwantedFields) {
+  auto writer_schema =
+      AvroSchema::Parse(R"({"type": "record", "name": "R", "fields": [
+          {"name": "keep", "type": "long"},
+          {"name": "drop_map", "type": {"type": "map", "values": "long"}},
+          {"name": "drop_blob", "type": "bytes"},
+          {"name": "also_keep", "type": "string"}]})");
+  auto projection =
+      AvroSchema::Parse(R"({"type": "record", "name": "R", "fields": [
+          {"name": "keep", "type": "long"},
+          {"name": "also_keep", "type": "string"}]})");
+  ASSERT_TRUE(writer_schema.ok() && projection.ok());
+
+  std::vector<AvroValue> values;
+  for (int i = 0; i < 40; ++i) {
+    AvroValue tags = AvroValue::CreateMap();
+    ASSERT_TRUE(tags.MapPut("x", AvroValue::CreateLong(i)).ok());
+    AvroValue record = AvroValue::CreateRecord();
+    ASSERT_TRUE(record.RecordPut("keep", AvroValue::CreateLong(i)).ok());
+    ASSERT_TRUE(record.RecordPut("drop_map", tags).ok());
+    ASSERT_TRUE(
+        record.RecordPut("drop_blob", AvroValue::CreateBytes(std::string(32, 'z')))
+            .ok());
+    ASSERT_TRUE(record
+                    .RecordPut("also_keep",
+                               *AvroValue::CreateString("row-" + std::to_string(i)))
+                    .ok());
+    values.push_back(std::move(record));
+  }
+  std::string bytes = WriteFile(*writer_schema, Codec::kNull, values);
+
+  auto reader = DataFileReader::FromBytesWithProjection(*projection, bytes);
+  ASSERT_TRUE(reader.ok()) << reader.status();
+  int seen = 0;
+  while (true) {
+    auto value = reader->NextValue();
+    if (!value.ok()) break;
+    EXPECT_EQ(value->GetRecordField("keep")->GetLong().value_or(-1), seen);
+    EXPECT_EQ(value->GetRecordField("also_keep")->GetString().value_or(""),
+              "row-" + std::to_string(seen));
+    // Dropped fields are absent, not null-filled.
+    EXPECT_FALSE(value->HasRecordField("drop_map").value_or(true));
+    EXPECT_FALSE(value->HasRecordField("drop_blob").value_or(true));
+    ++seen;
+  }
+  // Reading every value proves the skipped bytes were counted exactly: a
+  // miscount would put the next datum at the wrong offset in the block.
+  EXPECT_EQ(seen, 40);
+  EXPECT_TRUE(reader->AtEnd());
+}
+
+TEST(ContainerTest, ProjectionNotMatchingWriterSchemaFails) {
+  auto writer_schema =
+      AvroSchema::Parse(R"({"type": "record", "name": "R", "fields": [
+          {"name": "a", "type": "long"}]})");
+  auto bogus =
+      AvroSchema::Parse(R"({"type": "record", "name": "R", "fields": [
+          {"name": "missing", "type": "long"}]})");
+  ASSERT_TRUE(writer_schema.ok() && bogus.ok());
+
+  AvroValue record = AvroValue::CreateRecord();
+  ASSERT_TRUE(record.RecordPut("a", AvroValue::CreateLong(1)).ok());
+  std::string bytes = WriteFile(*writer_schema, Codec::kNull, {record});
+
+  EXPECT_FALSE(DataFileReader::FromBytesWithProjection(*bogus, bytes).ok());
+}
+
+TEST(DatumTest, ProjectedDatumDecode) {
+  auto writer_schema =
+      AvroSchema::Parse(R"({"type": "record", "name": "R", "fields": [
+          {"name": "a", "type": "long"},
+          {"name": "b", "type": "string"}]})");
+  auto projection =
+      AvroSchema::Parse(R"({"type": "record", "name": "R", "fields": [
+          {"name": "b", "type": "string"}]})");
+  ASSERT_TRUE(writer_schema.ok() && projection.ok());
+
+  AvroValue record = AvroValue::CreateRecord();
+  ASSERT_TRUE(record.RecordPut("a", AvroValue::CreateLong(7)).ok());
+  ASSERT_TRUE(record.RecordPut("b", *AvroValue::CreateString("hi")).ok());
+  auto encoded = EncodeDatum(*writer_schema, record);
+  ASSERT_TRUE(encoded.ok());
+
+  auto compiled = AvroProjection::Compile(*writer_schema, *projection);
+  ASSERT_TRUE(compiled.ok()) << compiled.status();
+  auto decoded = compiled->DecodeDatum(*encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(decoded->GetRecordField("b")->GetString().value_or(""), "hi");
+  EXPECT_FALSE(decoded->HasRecordField("a").value_or(true));
 }
 
 // -- Zero-copy stream reader --------------------------------------------------

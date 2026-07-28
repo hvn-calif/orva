@@ -479,6 +479,121 @@ absl::StatusOr<std::vector<std::string>> AvroValue::GetRecordFieldNames()
   return FromVecVecU8(std::move(result).value());
 }
 
+// ---------------------------------------------------------------------------
+// AvroPath
+// ---------------------------------------------------------------------------
+
+AvroPath::AvroPath() : path_(rust::value::AvroPath::create()) {}
+
+absl::Status AvroPath::PushField(absl::string_view name) {
+  return ToStatus(path_.push_field(ToByteSpan(name)), kBadInput);
+}
+
+void AvroPath::PushIndex(size_t index) { path_.push_index(index); }
+
+absl::Status AvroPath::PushKey(absl::string_view key) {
+  return ToStatus(path_.push_key(ToByteSpan(key)), kBadInput);
+}
+
+absl::Status AvroPath::Pop() { return ToStatus(path_.pop(), kBadInput); }
+
+absl::Status AvroPath::SetLastIndex(size_t index) {
+  return ToStatus(path_.set_last_index(index), kBadInput);
+}
+
+void AvroPath::Clear() { path_.clear(); }
+
+uint64_t AvroPath::Length() const { return path_.len(); }
+
+bool AvroPath::IsEmpty() const { return path_.is_empty(); }
+
+// ---------------------------------------------------------------------------
+// AvroValue: reads at a path
+// ---------------------------------------------------------------------------
+
+// A path read fails either because the path does not lead anywhere (a
+// lookup failure) or because the leaf has a different type; the Rust side
+// distinguishes them in the message but not in the type, so both map to
+// kNotFound rather than pretending to tell them apart.
+absl::StatusOr<bool> AvroValue::GetBooleanAt(const AvroPath& path) const {
+  return Unwrap(value_.get_boolean_at(path.path_), kNotFound);
+}
+
+absl::StatusOr<int32_t> AvroValue::GetIntAt(const AvroPath& path) const {
+  return Unwrap(value_.get_int_at(path.path_), kNotFound);
+}
+
+absl::StatusOr<int64_t> AvroValue::GetLongAt(const AvroPath& path) const {
+  return Unwrap(value_.get_long_at(path.path_), kNotFound);
+}
+
+absl::StatusOr<float> AvroValue::GetFloatAt(const AvroPath& path) const {
+  return Unwrap(value_.get_float_at(path.path_), kNotFound);
+}
+
+absl::StatusOr<double> AvroValue::GetDoubleAt(const AvroPath& path) const {
+  return Unwrap(value_.get_double_at(path.path_), kNotFound);
+}
+
+absl::StatusOr<std::string> AvroValue::GetStringAt(
+    const AvroPath& path) const {
+  return UnwrapString(value_.get_string_at(path.path_), kNotFound);
+}
+
+absl::StatusOr<std::string> AvroValue::GetBytesAt(const AvroPath& path) const {
+  return UnwrapString(value_.get_bytes_at(path.path_), kNotFound);
+}
+
+absl::StatusOr<bool> AvroValue::IsNullAt(const AvroPath& path) const {
+  return Unwrap(value_.is_null_at(path.path_), kNotFound);
+}
+
+absl::StatusOr<std::string> AvroValue::TypeNameAt(const AvroPath& path) const {
+  return UnwrapString(value_.type_name_at(path.path_), kNotFound);
+}
+
+absl::StatusOr<uint64_t> AvroValue::GetArrayLenAt(const AvroPath& path) const {
+  return Unwrap(value_.get_array_len_at(path.path_), kNotFound);
+}
+
+absl::StatusOr<uint64_t> AvroValue::GetMapLenAt(const AvroPath& path) const {
+  return Unwrap(value_.get_map_len_at(path.path_), kNotFound);
+}
+
+absl::StatusOr<uint64_t> AvroValue::GetRecordLenAt(
+    const AvroPath& path) const {
+  return Unwrap(value_.get_record_len_at(path.path_), kNotFound);
+}
+
+absl::StatusOr<std::vector<std::string>> AvroValue::GetMapKeysAt(
+    const AvroPath& path) const {
+  rs_std::Result<rust::value::VecVecU8, rust::vec_u8::VecU8> result =
+      value_.get_map_keys_at(path.path_);
+  if (!result.has_value()) {
+    return absl::Status(kNotFound, FromVecU8(std::move(result).err()));
+  }
+  return FromVecVecU8(std::move(result).value());
+}
+
+absl::StatusOr<std::vector<std::string>> AvroValue::GetRecordFieldNamesAt(
+    const AvroPath& path) const {
+  rs_std::Result<rust::value::VecVecU8, rust::vec_u8::VecU8> result =
+      value_.get_record_field_names_at(path.path_);
+  if (!result.has_value()) {
+    return absl::Status(kNotFound, FromVecU8(std::move(result).err()));
+  }
+  return FromVecVecU8(std::move(result).value());
+}
+
+absl::StatusOr<AvroValue> AvroValue::GetValueAt(const AvroPath& path) const {
+  rs_std::Result<rust::value::AvroValue, rust::vec_u8::VecU8> result =
+      value_.get_value_at(path.path_);
+  if (!result.has_value()) {
+    return absl::Status(kNotFound, FromVecU8(std::move(result).err()));
+  }
+  return AvroValue(std::move(result).value());
+}
+
 absl::StatusOr<AvroValue> AvroValue::GetRecordField(
     absl::string_view name) const {
   rs_std::Result<rust::value::AvroValue, rust::vec_u8::VecU8> result =
@@ -621,6 +736,30 @@ absl::StatusOr<AvroValue> DecodeDatumResolved(const AvroSchema& writer_schema,
   return AvroValue(std::move(result).value());
 }
 
+AvroProjection::AvroProjection(rust::decode::AvroProjection projection)
+    : projection_(std::move(projection)) {}
+
+absl::StatusOr<AvroProjection> AvroProjection::Compile(
+    const AvroSchema& writer_schema, const AvroSchema& projection) {
+  rs_std::Result<rust::decode::AvroProjection, rust::vec_u8::VecU8> result =
+      rust::decode::AvroProjection::create(writer_schema.schema_,
+                                          projection.schema_);
+  if (!result.has_value()) {
+    return absl::InvalidArgumentError(FromVecU8(std::move(result).err()));
+  }
+  return AvroProjection(std::move(result).value());
+}
+
+absl::StatusOr<AvroValue> AvroProjection::DecodeDatum(
+    absl::string_view data) const {
+  rs_std::Result<rust::value::AvroValue, rust::vec_u8::VecU8> result =
+      projection_.decode_datum(ToByteSpan(data));
+  if (!result.has_value()) {
+    return absl::InvalidArgumentError(FromVecU8(std::move(result).err()));
+  }
+  return AvroValue(std::move(result).value());
+}
+
 absl::StatusOr<AvroValue> DecodeDatumSchemata(
     const AvroSchema& writer_schema,
     absl::Span<const AvroSchema> writer_schemata, absl::string_view data) {
@@ -737,6 +876,12 @@ DataFileReader DataFileReader::CreateWithReaderSchema(
           reader_schema.schema_));
 }
 
+DataFileReader DataFileReader::CreateWithProjection(
+    const AvroSchema& projection) {
+  return DataFileReader(
+      rust::container::DataFileReader::with_projection(projection.schema_));
+}
+
 absl::StatusOr<DataFileReader> DataFileReader::FromBytes(
     absl::string_view data) {
   rs_std::Result<rust::container::DataFileReader, rust::vec_u8::VecU8> result =
@@ -758,6 +903,17 @@ absl::StatusOr<DataFileReader> DataFileReader::FromBytesWithSchema(
   return DataFileReader(std::move(result).value());
 }
 
+absl::StatusOr<DataFileReader> DataFileReader::FromBytesWithProjection(
+    const AvroSchema& projection, absl::string_view data) {
+  rs_std::Result<rust::container::DataFileReader, rust::vec_u8::VecU8> result =
+      rust::container::DataFileReader::from_bytes_with_projection(
+          projection.schema_, ToByteSpan(data));
+  if (!result.has_value()) {
+    return absl::InvalidArgumentError(FromVecU8(std::move(result).err()));
+  }
+  return DataFileReader(std::move(result).value());
+}
+
 absl::StatusOr<DataFileReader> DataFileReader::FromPath(
     absl::string_view path) {
   rs_std::Result<rust::container::DataFileReader, rust::vec_u8::VecU8> result =
@@ -773,6 +929,17 @@ absl::StatusOr<DataFileReader> DataFileReader::FromPathWithSchema(
   rs_std::Result<rust::container::DataFileReader, rust::vec_u8::VecU8> result =
       rust::container::DataFileReader::from_path_with_schema(
           reader_schema.schema_, ToByteSpan(path));
+  if (!result.has_value()) {
+    return absl::InvalidArgumentError(FromVecU8(std::move(result).err()));
+  }
+  return DataFileReader(std::move(result).value());
+}
+
+absl::StatusOr<DataFileReader> DataFileReader::FromPathWithProjection(
+    const AvroSchema& projection, absl::string_view path) {
+  rs_std::Result<rust::container::DataFileReader, rust::vec_u8::VecU8> result =
+      rust::container::DataFileReader::from_path_with_projection(
+          projection.schema_, ToByteSpan(path));
   if (!result.has_value()) {
     return absl::InvalidArgumentError(FromVecU8(std::move(result).err()));
   }
@@ -805,6 +972,21 @@ absl::StatusOr<AvroValue> DataFileReader::NextValue() {
     return absl::Status(code, FromVecU8(std::move(result).err()));
   }
   return AvroValue(std::move(result).value());
+}
+
+absl::StatusOr<bool> DataFileReader::NextValueInto(AvroValue* value) {
+  if (value == nullptr) {
+    return absl::InvalidArgumentError("NextValueInto value must not be null");
+  }
+  rs_std::Result<bool, rust::vec_u8::VecU8> result =
+      reader_.next_value_into(value->value_);
+  if (!result.has_value()) {
+    const absl::StatusCode code = reader_.has_failed()
+                                      ? absl::StatusCode::kInvalidArgument
+                                      : absl::StatusCode::kOutOfRange;
+    return absl::Status(code, FromVecU8(std::move(result).err()));
+  }
+  return std::move(result).value();
 }
 
 bool DataFileReader::AtEnd() const { return reader_.at_end(); }
@@ -842,6 +1024,11 @@ absl::StatusOr<DataFileStreamReader> DataFileStreamReader::Create(
 absl::StatusOr<DataFileStreamReader> DataFileStreamReader::CreateWithReaderSchema(
     const AvroSchema& reader_schema, ZeroCopyInputStream* stream) {
   return Build(DataFileReader::CreateWithReaderSchema(reader_schema), stream);
+}
+
+absl::StatusOr<DataFileStreamReader> DataFileStreamReader::CreateWithProjection(
+    const AvroSchema& projection, ZeroCopyInputStream* stream) {
+  return Build(DataFileReader::CreateWithProjection(projection), stream);
 }
 
 absl::StatusOr<DataFileStreamReader> DataFileStreamReader::Build(

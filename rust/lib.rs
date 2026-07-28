@@ -19,3 +19,5 @@ pub mod value;
 pub mod datum;
 
 pub mod container;
+
+pub mod decode;

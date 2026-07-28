@@ -1,0 +1,42 @@
+Command:
+MANIFEST_ENTRIES=2000 MANIFEST_COLUMNS=20 taskset -c 2 ./build/manifest_probe '--benchmark_filter=^(ours|ours_reuse|avrocpp)/(decode_only|decode_planner|decode_full)$' --benchmark_min_time=0.5s --benchmark_repetitions=7 --benchmark_report_aggregates_only=true
+
+-------------------------------------------------------------------------------------------
+Benchmark                                 Time             CPU   Iterations UserCounters...
+-------------------------------------------------------------------------------------------
+ours/decode_only_mean              29907301 ns     29906946 ns            7 items_per_second=66.8756k/s
+ours/decode_only_median            29858584 ns     29858879 ns            7 items_per_second=66.9818k/s
+ours/decode_only_stddev              150685 ns       150973 ns            7 items_per_second=336.216/s
+ours/decode_only_cv                    0.50 %          0.50 %             7 items_per_second=0.50%
+avrocpp/decode_only_mean           18255385 ns     18255208 ns            7 items_per_second=109.561k/s
+avrocpp/decode_only_median         18264825 ns     18265034 ns            7 items_per_second=109.499k/s
+avrocpp/decode_only_stddev           109790 ns       109638 ns            7 items_per_second=656.535/s
+avrocpp/decode_only_cv                 0.60 %          0.60 %             7 items_per_second=0.60%
+ours/decode_planner_mean           32681518 ns     32681453 ns            7 items_per_second=61.1974k/s
+ours/decode_planner_median         32648088 ns     32648127 ns            7 items_per_second=61.2593k/s
+ours/decode_planner_stddev           111141 ns       111257 ns            7 items_per_second=207.716/s
+ours/decode_planner_cv                 0.34 %          0.34 %             7 items_per_second=0.34%
+avrocpp/decode_planner_mean        18399988 ns     18399964 ns            7 items_per_second=108.698k/s
+avrocpp/decode_planner_median      18386369 ns     18386457 ns            7 items_per_second=108.776k/s
+avrocpp/decode_planner_stddev         93924 ns        93928 ns            7 items_per_second=552.475/s
+avrocpp/decode_planner_cv              0.51 %          0.51 %             7 items_per_second=0.51%
+ours/decode_full_mean              52388263 ns     52388075 ns            7 items_per_second=38.1772k/s
+ours/decode_full_median            52394953 ns     52395240 ns            7 items_per_second=38.1714k/s
+ours/decode_full_stddev              227990 ns       227352 ns            7 items_per_second=165.221/s
+ours/decode_full_cv                    0.44 %          0.43 %             7 items_per_second=0.43%
+avrocpp/decode_full_mean           19131138 ns     19130888 ns            7 items_per_second=104.548k/s
+avrocpp/decode_full_median         19126821 ns     19126830 ns            7 items_per_second=104.565k/s
+avrocpp/decode_full_stddev           136531 ns       136542 ns            7 items_per_second=748.625/s
+avrocpp/decode_full_cv                 0.71 %          0.71 %             7 items_per_second=0.72%
+ours_reuse/decode_only_mean         6198222 ns      6198212 ns            7 items_per_second=322.721k/s
+ours_reuse/decode_only_median       6204962 ns      6204994 ns            7 items_per_second=322.321k/s
+ours_reuse/decode_only_stddev         80949 ns        80965 ns            7 items_per_second=4.20965k/s
+ours_reuse/decode_only_cv              1.31 %          1.31 %             7 items_per_second=1.30%
+ours_reuse/decode_planner_mean      8743288 ns      8743297 ns            7 items_per_second=228.779k/s
+ours_reuse/decode_planner_median    8715976 ns      8716021 ns            7 items_per_second=229.462k/s
+ours_reuse/decode_planner_stddev     112531 ns       112420 ns            7 items_per_second=2.91836k/s
+ours_reuse/decode_planner_cv           1.29 %          1.29 %             7 items_per_second=1.28%
+ours_reuse/decode_full_mean        27932122 ns     27932110 ns            7 items_per_second=71.6092k/s
+ours_reuse/decode_full_median      27885815 ns     27885950 ns            7 items_per_second=71.7207k/s
+ours_reuse/decode_full_stddev        300668 ns       300853 ns            7 items_per_second=762.879/s
+ours_reuse/decode_full_cv              1.08 %          1.08 %             7 items_per_second=1.07%

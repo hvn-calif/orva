@@ -19,6 +19,7 @@
 //!
 //! See doc/specs/AvroStreamingIO.md for the design discussion.
 
+use crate::decode::AvroProjection;
 use crate::schema::AvroSchema;
 use crate::value::AvroValue;
 use crate::vec_u8::{catch_panic, utf8, Status, VecU8};
@@ -350,6 +351,17 @@ pub struct DataFileReader {
     header: Option<Header>,
     /// When set, every value is resolved to this schema (schema evolution).
     reader_schema: Option<Schema>,
+    /// When set, only the fields it names are materialized and the rest are
+    /// stepped over at the byte level (crate::decode). Set by
+    /// `with_projection`, so it is mutually exclusive with `reader_schema`
+    /// by construction: projection is not schema resolution.
+    projection_schema: Option<Schema>,
+    /// `projection_schema` compiled against the writer schema, which is only
+    /// known once the header has been parsed.
+    projection: Option<AvroProjection>,
+    /// Identity plan used only by `next_value_into`. It is compiled lazily so
+    /// ordinary owned-value readers retain their existing setup cost.
+    reuse_decoder: Option<AvroProjection>,
     max_block_bytes: u64,
     /// Decompressed payload of the block currently being drained, with the
     /// decode position and the number of values left in it.
@@ -384,6 +396,9 @@ impl DataFileReader {
             header_parser: HeaderParser::start(),
             header: None,
             reader_schema: None,
+            projection_schema: None,
+            projection: None,
+            reuse_decoder: None,
             max_block_bytes: DEFAULT_MAX_BLOCK_BYTES,
             block: Vec::new(),
             block_pos: 0,
@@ -400,10 +415,49 @@ impl DataFileReader {
         reader
     }
 
+    /// Creates an empty reader that materializes only the fields named by
+    /// `projection` and steps over the rest without allocating.
+    ///
+    /// `projection` must be a subset of the writer schema: the same shape and
+    /// the same names, with record fields optionally omitted. It is checked
+    /// against the writer schema once the header supplies it, so a projection
+    /// that does not match surfaces as an error from the first
+    /// `next_ready`/`next_value`.
+    ///
+    /// This is not `with_reader_schema`. Schema resolution decodes the whole
+    /// writer-schema value and then resolves it, which costs more than not
+    /// projecting at all; a projection skips the unwanted bytes outright.
+    /// See doc/specs/AvroTokenStream.md.
+    pub fn with_projection(projection: &AvroSchema) -> DataFileReader {
+        let mut reader = Self::create();
+        reader.projection_schema = Some(projection.schema.clone());
+        reader
+    }
+
     /// Opens a container file from a complete byte buffer. The writer schema
     /// is read from the header. Errors on garbage or a truncated first block.
     pub fn from_bytes(data: &[u8]) -> Result<DataFileReader, VecU8> {
-        Self::build_from_bytes(None, data)
+        Self::finish_from_bytes(Self::create(), data)
+    }
+
+    /// Opens a container file from a complete byte buffer, materializing only
+    /// the fields named by `projection`.
+    pub fn from_bytes_with_projection(
+        projection: &AvroSchema,
+        data: &[u8],
+    ) -> Result<DataFileReader, VecU8> {
+        Self::finish_from_bytes(Self::with_projection(projection), data)
+    }
+
+    /// Opens a container file from the filesystem, materializing only the
+    /// fields named by `projection`.
+    pub fn from_path_with_projection(
+        projection: &AvroSchema,
+        raw_path: &[u8],
+    ) -> Result<DataFileReader, VecU8> {
+        let path = utf8(raw_path)?;
+        let data = std::fs::read(path).map_err(|err| VecU8::from(err.to_string()))?;
+        Self::from_bytes_with_projection(projection, &data)
     }
 
     /// Opens a container file from a complete byte buffer and resolves every
@@ -412,7 +466,7 @@ impl DataFileReader {
         reader_schema: &AvroSchema,
         data: &[u8],
     ) -> Result<DataFileReader, VecU8> {
-        Self::build_from_bytes(Some(reader_schema), data)
+        Self::finish_from_bytes(Self::with_reader_schema(reader_schema), data)
     }
 
     /// Opens a container file from the filesystem.
@@ -433,14 +487,10 @@ impl DataFileReader {
         Self::from_bytes_with_schema(reader_schema, &data)
     }
 
-    fn build_from_bytes(
-        reader_schema: Option<&AvroSchema>,
+    fn finish_from_bytes(
+        mut reader: DataFileReader,
         data: &[u8],
     ) -> Result<DataFileReader, VecU8> {
-        let mut reader = match reader_schema {
-            Some(schema) => Self::with_reader_schema(schema),
-            None => Self::create(),
-        };
         reader.feed(data)?;
         reader.close_input()?;
         // Parse eagerly up to the first value so garbage and files truncated
@@ -500,6 +550,28 @@ impl DataFileReader {
         }
         match catch_panic(|| self.decode_one()) {
             Ok(value) => Ok(value),
+            Err(err) => {
+                self.error = Some(err.clone());
+                Err(err)
+            }
+        }
+    }
+
+    /// Decodes the next value into caller-owned storage.
+    ///
+    /// Returns true when a value was read and false at clean end of file.
+    /// Compatible record, array, union, string, bytes, fixed, and enum
+    /// allocations are reused. This mirrors avro-cpp's `read(datum)` API:
+    /// consume or inspect `value` before the next call.
+    pub fn next_value_into(&mut self, value: &mut AvroValue) -> Result<bool, VecU8> {
+        if !self.next_ready()? {
+            if self.at_end() {
+                return Ok(false);
+            }
+            return Err("No value ready: feed more input or close_input".into());
+        }
+        match catch_panic(|| self.decode_one_into(value)) {
+            Ok(()) => Ok(true),
             Err(err) => {
                 self.error = Some(err.clone());
                 Err(err)
@@ -573,7 +645,12 @@ impl DataFileReader {
             self.consumed += consumed;
             self.compact();
             match header {
-                Some(header) => self.header = Some(header),
+                Some(header) => {
+                    self.header = Some(header);
+                    // The projection can only be checked against the writer
+                    // schema, which the header just supplied.
+                    self.compile_projection()?;
+                }
                 None => return self.need_more_input("header"),
             }
         }
@@ -674,25 +751,99 @@ impl DataFileReader {
         Ok(())
     }
 
+    /// Compiles the projection against the writer schema. A no-op unless the
+    /// reader was built with `with_projection`.
+    fn compile_projection(&mut self) -> Result<(), VecU8> {
+        let compiled = {
+            let Some(projection_schema) = &self.projection_schema else {
+                return Ok(());
+            };
+            let Some(header) = &self.header else {
+                return Err("Internal error: no header while compiling the projection".into());
+            };
+            AvroProjection::compile(&header.schema, projection_schema).map_err(VecU8::from)?
+        };
+        self.projection = Some(compiled);
+        Ok(())
+    }
+
     /// Decodes one value from the current block. Only called with
     /// `block_remaining > 0`.
     fn decode_one(&mut self) -> Result<AvroValue, VecU8> {
         let Some(header) = &self.header else {
             return Err("Internal error: no header while decoding".into());
         };
-        let mut cursor = Cursor::new(&self.block[self.block_pos..]);
-        // The writer schema is passed as its own schemata so named-type
-        // references inside a self-contained (e.g. recursive) schema resolve.
-        let value = from_avro_datum_schemata(
-            &header.schema,
-            vec![&header.schema],
-            &mut cursor,
-            self.reader_schema.as_ref(),
-        )
-        .map_err(|err| VecU8::from(err.to_string()))?;
-        self.block_pos += cursor.position() as usize;
+        let remaining = &self.block[self.block_pos..];
+        let (value, consumed) = match &self.projection {
+            // Projected: only the wanted fields are materialized, and the
+            // rest are stepped over without allocating.
+            Some(projection) => {
+                let mut cursor = remaining;
+                let value = projection.decode(&mut cursor).map_err(VecU8::from)?;
+                (value, remaining.len() - cursor.len())
+            }
+            // The writer schema is passed as its own schemata so named-type
+            // references inside a self-contained (e.g. recursive) schema
+            // resolve.
+            None => {
+                let mut cursor = Cursor::new(remaining);
+                let value = from_avro_datum_schemata(
+                    &header.schema,
+                    vec![&header.schema],
+                    &mut cursor,
+                    self.reader_schema.as_ref(),
+                )
+                .map_err(|err| VecU8::from(err.to_string()))?;
+                (value, cursor.position() as usize)
+            }
+        };
+        self.block_pos += consumed;
         self.block_remaining -= 1;
         Ok(AvroValue { value })
+    }
+
+    /// In-place counterpart to `decode_one`.
+    fn decode_one_into(&mut self, output: &mut AvroValue) -> Result<(), VecU8> {
+        if self.projection.is_none()
+            && self.reader_schema.is_none()
+            && self.reuse_decoder.is_none()
+        {
+            let Some(header) = &self.header else {
+                return Err("Internal error: no header while decoding".into());
+            };
+            self.reuse_decoder = Some(
+                AvroProjection::compile(&header.schema, &header.schema)
+                    .map_err(VecU8::from)?,
+            );
+        }
+
+        let Some(header) = &self.header else {
+            return Err("Internal error: no header while decoding".into());
+        };
+        let remaining = &self.block[self.block_pos..];
+        let consumed = if let Some(decoder) = self.projection.as_ref().or(self.reuse_decoder.as_ref())
+        {
+            let mut cursor = remaining;
+            decoder
+                .decode_into(&mut cursor, &mut output.value)
+                .map_err(VecU8::from)?;
+            remaining.len() - cursor.len()
+        } else {
+            // Reader-schema resolution consumes and can reshape an owned
+            // Value. Preserve its behavior, but do not claim reuse here.
+            let mut cursor = Cursor::new(remaining);
+            output.value = from_avro_datum_schemata(
+                &header.schema,
+                vec![&header.schema],
+                &mut cursor,
+                self.reader_schema.as_ref(),
+            )
+            .map_err(|err| VecU8::from(err.to_string()))?;
+            cursor.position() as usize
+        };
+        self.block_pos += consumed;
+        self.block_remaining -= 1;
+        Ok(())
     }
 }
 
@@ -994,6 +1145,39 @@ mod tests {
     #[test]
     fn roundtrip_zstandard_codec() {
         roundtrip_with_codec(AvroCodec::Zstandard);
+    }
+
+    #[test]
+    fn next_value_into_reuses_record_and_string_storage() {
+        let schema = AvroSchema::parse(RECORD_SCHEMA.as_bytes()).unwrap();
+        let first = measurement("alpha", 1.5);
+        let second = measurement("bravo", -2.25);
+        let bytes = write_file(&schema, AvroCodec::Null, &[first.clone(), second.clone()]);
+
+        let mut reader = DataFileReader::from_bytes(&bytes).unwrap();
+        let mut reused = AvroValue::default();
+        assert!(reader.next_value_into(&mut reused).unwrap());
+        assert!(reused.equals(&first));
+        let first_pointer = match &reused.value {
+            Value::Record(fields) => match &fields[0].1 {
+                Value::String(sensor) => sensor.as_ptr(),
+                other => panic!("expected string, found {other:?}"),
+            },
+            other => panic!("expected record, found {other:?}"),
+        };
+
+        assert!(reader.next_value_into(&mut reused).unwrap());
+        assert!(reused.equals(&second));
+        let second_pointer = match &reused.value {
+            Value::Record(fields) => match &fields[0].1 {
+                Value::String(sensor) => sensor.as_ptr(),
+                other => panic!("expected string, found {other:?}"),
+            },
+            other => panic!("expected record, found {other:?}"),
+        };
+        assert_eq!(first_pointer, second_pointer);
+        assert!(!reader.next_value_into(&mut reused).unwrap());
+        assert!(reader.at_end());
     }
 
     #[test]
@@ -1662,4 +1846,122 @@ mod tests {
         let mut pos = 0;
         assert_eq!(parse_long(&[0x80], &mut pos).unwrap(), None);
     }
+
+    // ----- Projected reads (crate::decode) --------------------------------
+
+    const WIDE_SCHEMA: &str = r#"{"type":"record","name":"Wide","fields":[
+        {"name":"id","type":"long"},
+        {"name":"metrics","type":{"type":"array","items":
+            {"type":"record","name":"KV","fields":[
+                {"name":"key","type":"int"},
+                {"name":"value","type":"long"}]}}},
+        {"name":"blob","type":"bytes"},
+        {"name":"name","type":"string"}]}"#;
+
+    const WIDE_PROJECTION: &str = r#"{"type":"record","name":"Wide","fields":[
+        {"name":"id","type":"long"},
+        {"name":"name","type":"string"}]}"#;
+
+    fn wide_record(i: i64) -> AvroValue {
+        let mut metrics = AvroValue::create_array();
+        for column in 0..6i32 {
+            let mut pair = AvroValue::create_record();
+            pair.record_put(b"key", &AvroValue::create_int(column)).unwrap();
+            pair.record_put(b"value", &AvroValue::create_long(i * 100 + i64::from(column)))
+                .unwrap();
+            metrics.array_push(&pair).unwrap();
+        }
+        let mut record = AvroValue::create_record();
+        record.record_put(b"id", &AvroValue::create_long(i)).unwrap();
+        record.record_put(b"metrics", &metrics).unwrap();
+        record.record_put(b"blob", &AvroValue::create_bytes(&vec![0xab; 24])).unwrap();
+        record
+            .record_put(b"name", &AvroValue::create_string(format!("row-{i}").as_bytes()).unwrap())
+            .unwrap();
+        record
+    }
+
+    /// The load-bearing container-level check: many values per block means a
+    /// skip that miscounts even one byte puts the next datum at the wrong
+    /// offset. Reading every value of a multi-block file proves the byte
+    /// walk stays in step with the writer.
+    #[test]
+    fn projected_read_stays_aligned_across_blocks() {
+        let schema = AvroSchema::parse(WIDE_SCHEMA.as_bytes()).unwrap();
+        let projection = AvroSchema::parse(WIDE_PROJECTION.as_bytes()).unwrap();
+        let values: Vec<AvroValue> = (0..500).map(wide_record).collect();
+        let bytes = write_file(&schema, AvroCodec::Null, &values);
+
+        let mut reader = DataFileReader::from_bytes_with_projection(&projection, &bytes).unwrap();
+        let mut seen = 0i64;
+        while reader.next_ready().unwrap() {
+            let value = reader.next_value().unwrap();
+            assert_eq!(value.get_record_field(b"id").unwrap().get_long().unwrap(), seen);
+            assert_eq!(
+                value.get_record_field(b"name").unwrap().get_string().unwrap().as_slice(),
+                format!("row-{seen}").as_bytes()
+            );
+            // The dropped fields are absent rather than null-filled.
+            assert!(!value.has_record_field(b"metrics").unwrap());
+            assert!(!value.has_record_field(b"blob").unwrap());
+            seen += 1;
+        }
+        assert!(reader.at_end());
+        assert_eq!(seen, 500);
+    }
+
+    /// A projection covering every field must agree exactly with an
+    /// unprojected read, which checks the hand-written walk against
+    /// apache-avro over real container framing rather than a single datum.
+    #[test]
+    fn identity_projection_agrees_with_unprojected_read() {
+        let schema = AvroSchema::parse(WIDE_SCHEMA.as_bytes()).unwrap();
+        let values: Vec<AvroValue> = (0..50).map(wide_record).collect();
+        let bytes = write_file(&schema, AvroCodec::Null, &values);
+
+        let expected = read_all(&bytes);
+        let mut reader = DataFileReader::from_bytes_with_projection(&schema, &bytes).unwrap();
+        let mut actual = Vec::new();
+        while reader.next_ready().unwrap() {
+            actual.push(reader.next_value().unwrap());
+        }
+        assert_eq!(actual.len(), expected.len());
+        for (got, want) in actual.iter().zip(&expected) {
+            assert!(got.equals(want), "projected identity read differs from plain read");
+        }
+    }
+
+    #[test]
+    fn projection_works_with_a_compressed_codec() {
+        let schema = AvroSchema::parse(WIDE_SCHEMA.as_bytes()).unwrap();
+        let projection = AvroSchema::parse(WIDE_PROJECTION.as_bytes()).unwrap();
+        let values: Vec<AvroValue> = (0..200).map(wide_record).collect();
+        let bytes = write_file(&schema, AvroCodec::Deflate, &values);
+
+        let mut reader = DataFileReader::from_bytes_with_projection(&projection, &bytes).unwrap();
+        let mut seen = 0i64;
+        while reader.next_ready().unwrap() {
+            let value = reader.next_value().unwrap();
+            assert_eq!(value.get_record_field(b"id").unwrap().get_long().unwrap(), seen);
+            seen += 1;
+        }
+        assert_eq!(seen, 200);
+    }
+
+    /// A projection that does not match the writer schema is only checkable
+    /// once the header arrives, so it must surface as a construction error.
+    #[test]
+    fn projection_mismatch_fails_at_construction() {
+        let schema = AvroSchema::parse(WIDE_SCHEMA.as_bytes()).unwrap();
+        let bytes = write_file(&schema, AvroCodec::Null, &[wide_record(1)]);
+        let bogus = AvroSchema::parse(
+            br#"{"type":"record","name":"Wide","fields":[{"name":"absent","type":"long"}]}"#,
+        )
+        .unwrap();
+
+        let error = DataFileReader::from_bytes_with_projection(&bogus, &bytes).unwrap_err();
+        let message = String::from_utf8(error.into_vec()).unwrap();
+        assert!(message.contains("absent"), "unexpected error: {message}");
+    }
+
 }
