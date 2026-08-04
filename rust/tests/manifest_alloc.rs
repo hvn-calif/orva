@@ -19,10 +19,23 @@
 //! the exact counts.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// The counting allocator below is process-global, so two tests measuring at
+/// once would each see the other's allocations. Every test in this file takes
+/// this lock for its whole body, not just around `measure`: an unmeasured
+/// allocation on another thread still moves the shared counters.
+static MEASURING: Mutex<()> = Mutex::new(());
+
+/// Ignores poisoning: a panicking test has already failed, and the counters
+/// are reset by the next `measure` anyway.
+fn measuring_lock() -> std::sync::MutexGuard<'static, ()> {
+    MEASURING.lock().unwrap_or_else(|err| err.into_inner())
+}
+
 use rust::container::{AvroCodec, DataFileReader, DataFileWriter};
-use rust::datum::{decode_datum, decode_datum_resolved, encode_datum};
+use rust::datum::{AvroDatumReader, decode_datum, decode_datum_resolved, encode_datum};
 use rust::decode::AvroProjection;
 use rust::schema::AvroSchema;
 use rust::value::AvroValue;
@@ -247,6 +260,7 @@ fn manifest_entry(columns: i32) -> AvroValue {
 
 #[test]
 fn manifest_decode_allocation_profile() {
+    let _measuring = measuring_lock();
     let schema = AvroSchema::parse(MANIFEST_JSON.as_bytes()).unwrap();
     let projection = AvroSchema::parse(PROJECTION_JSON.as_bytes()).unwrap();
 
@@ -392,5 +406,42 @@ fn manifest_decode_allocation_profile() {
         "reusable decode allocated {} ops against {} for an owned decode",
         reusable_cost.operations,
         twenty.2.operations
+    );
+}
+
+/// The bare-datum counterpart to the container reader's reuse claim, and
+/// success criterion 3 of doc/specs/AvroDatumReader.md: once the value tree
+/// has the right shape, a same-shaped datum decodes without touching the
+/// allocator at all.
+#[test]
+fn datum_reader_reuse_removes_steady_state_allocation() {
+    let _measuring = measuring_lock();
+    let schema = AvroSchema::parse(MANIFEST_JSON.as_bytes()).unwrap();
+    let entry = manifest_entry(20);
+    let encoded = encode_datum(&schema, &entry).unwrap();
+    let bytes = encoded.as_slice();
+
+    let (_, owned_cost) = measure(|| decode_datum(&schema, bytes).unwrap());
+
+    let reader = AvroDatumReader::create(&schema).unwrap();
+    let mut value = AvroValue::default();
+    // First call builds the tree; only the steady state is the claim.
+    reader.decode_into(bytes, &mut value).unwrap();
+    let (_, reuse_cost) = measure(|| reader.decode_into(bytes, &mut value).unwrap());
+
+    println!(
+        "20-column bare datum: owned {} ops / {} bytes, reused {} ops / {} bytes",
+        owned_cost.operations, owned_cost.bytes, reuse_cost.operations, reuse_cost.bytes
+    );
+
+    assert_eq!(
+        reuse_cost.operations, 0,
+        "expected no allocator operations for a same-shaped datum, got {}",
+        reuse_cost.operations
+    );
+    assert_eq!(reuse_cost.bytes, 0);
+    assert!(
+        owned_cost.operations > 0,
+        "the owned decode should allocate; otherwise this test proves nothing"
     );
 }

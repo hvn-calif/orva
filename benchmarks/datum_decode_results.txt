@@ -1,0 +1,56 @@
+Command (per run):
+taskset -c 2 ./avro_benchmark '--benchmark_filter=datum_decode' --benchmark_min_time=0.5s --benchmark_repetitions=7 --benchmark_report_aggregates_only=true
+
+Build: /opt/orva-build, AVRO_BUILD_BENCHMARKS=ON, avro-cpp release-1.11.4,
+apache-avro patched with patches/apache-avro-0.22-read-into.patch.
+
+Within a run the CV is under 1.5%, but run-to-run spread reaches ~10% on the
+ours_reader rows, always upward, which matches unrelated load on the pinned
+core. The medians below are across three runs; the per-run raw output for the
+pre-AvroDatumReader baseline is at the bottom.
+
+Per-datum medians of three runs:
+
+  dataset  records  ours     ours_reader  ours_reader_into  avrocpp
+  flat     100k     141.9ns   77.3ns       35.0ns            72.1ns
+  nested    10k    1034.5ns  910.0ns      464.8ns           901.6ns
+  strings   10k     156.9ns   91.7ns       52.8ns            91.9ns
+
+Versus avrocpp:
+
+  dataset  ours          ours_reader     ours_reader_into
+  flat     1.97x slower  1.07x slower    2.06x FASTER
+  nested   1.15x slower  1.01x slower    1.94x FASTER
+  strings  1.71x slower  parity          1.74x FASTER
+
+What the rows mean:
+
+- ours              DecodeDatum free function: resolves the writer schema and
+                    builds a fresh value tree on every call.
+- ours_reader       AvroDatumReader::Decode: schema resolved once at
+                    construction, still a fresh value tree per datum.
+- ours_reader_into  AvroDatumReader::DecodeInto: resolved once and decoding
+                    into one caller-owned value. This is the like-for-like
+                    comparison, since the avrocpp row also builds one
+                    GenericReader and reuses one GenericDatum.
+
+Caching schema resolution removes 64.6 ns per datum on flat and 65.2 ns on
+strings. Those two datasets differ by roughly 2x in per-record work, so a
+near-identical saving confirms the cost was fixed per call rather than
+proportional to the decode, which is what doc/specs/AvroDatumReader.md
+predicted at about 70 ns.
+
+Allocation, from rust/tests/manifest_alloc.rs
+(datum_reader_reuse_removes_steady_state_allocation), on a 20-column Iceberg
+manifest entry decoded as a bare datum: owned decode 464 operations / 32,351
+bytes; second same-shaped DecodeInto 0 operations / 0 bytes.
+
+---------------------------------------------------------------------------
+Baseline before AvroDatumReader existed, 2026-08-03, same command:
+
+ours/datum_decode/flat_median         14626872 ns   items_per_second=6.83676M/s
+avrocpp/datum_decode/flat_median       7077483 ns   items_per_second=14.1296M/s
+ours/datum_decode/nested_median       10620111 ns   items_per_second=941.615k/s
+avrocpp/datum_decode/nested_median     9048698 ns   items_per_second=1.1052M/s
+ours/datum_decode/strings_median       1600148 ns   items_per_second=6.24944M/s
+avrocpp/datum_decode/strings_median     911772 ns   items_per_second=10.968M/s

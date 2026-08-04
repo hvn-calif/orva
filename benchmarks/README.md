@@ -41,7 +41,19 @@ Operations x datasets x codecs, single-threaded, all IO in memory:
   `ours/container_read` to see the push-parser overhead and against
   `avrocpp/container_read` for the end-to-end picture.
 - `datum_encode` / `datum_decode`: raw single-datum binary encoding, no
-  container framing, no codec.
+  container framing, no codec. The decode side has three `ours*` rows:
+  `ours` is the `DecodeDatum` free function, `ours_reader` is
+  `AvroDatumReader::Decode` (writer schema resolved once), and
+  `ours_reader_into` is `AvroDatumReader::DecodeInto` (resolved once and
+  decoding into one caller-owned value). Only the last is like-for-like with
+  the avrocpp row, which builds one `GenericReader` and reuses one
+  `GenericDatum`. Findings in `benchmarks/datum_decode_results.txt`: the free
+  function is 1.15-1.97x slower than avrocpp, holding a reader brings that to
+  parity or 1.07x, and adding value reuse is 1.74-2.06x faster than avrocpp.
+  Caching schema resolution alone removes about 65 ns per datum, near-identical
+  on two datasets whose per-record work differs by 2x, which is why
+  `DecodeDatum` looked worst on the cheapest records. See
+  doc/specs/AvroDatumReader.md.
 
 Datasets: `flat` (100k small records), `nested` (10k records with an
 8-item array of sub-records and a 4-key map), `strings` (10k records with

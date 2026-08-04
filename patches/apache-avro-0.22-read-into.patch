@@ -1,14 +1,56 @@
-From 665664804707037d50845dabecdb9e72beac44e9 Mon Sep 17 00:00:00 2001
+From 621fb3b156f24728e0b2ff649f1e140832632933 Mon Sep 17 00:00:00 2001
 From: Viet Hung Nguyen <hvn@calif.io>
 Date: Tue, 28 Jul 2026 17:18:51 +0700
-Subject: [PATCH] Add allocation-reusing value decoding
+Subject: [PATCH] feat: Add allocation-reusing value decoding
 
+The generic `Reader` builds a fresh `Value` tree for every datum. Each
+record allocates a new vector, clones every field name, and recursively
+allocates its allocation-bearing children, so a caller decoding many
+records of the same shape pays for that shape over and over. In an
+allocation-heavy fixture, allocator and free functions accounted for about
+34% of exclusive sampled CPU time.
+
+Add a decoding path that writes into caller-owned storage and reuses what
+is already there:
+
+  Reader::read_into(&mut Value) -> AvroResult<bool>
+  GenericDatumReader::read_value_into(&mut R, &mut Value)
+  OwnedGenericDatumReader, an owning variant of GenericDatumReader that
+  resolves schema references once, for use in a long-lived reader
+
+Records, arrays, unions, strings, bytes, fixed values, and enums reuse
+compatible existing allocations. Maps, `Decimal`, `BigDecimal`, and `Uuid`
+own representations with no public in-place decode API and fall back to
+`decode_internal`, as does reader-schema resolution, which consumes a
+`Value` and can change its shape.
+
+This is one decode path, not two. `Block::read_next`,
+`GenericDatumReader::read_value`, and `OwnedGenericDatumReader::read_value`
+delegate to the `_into` forms with a fresh `Value::Null`, which finds
+nothing to reuse and so costs what it always did. That keeps block
+bookkeeping and error behavior from drifting between the two forms, and it
+means the existing test suite exercises the new decoder.
+
+The new methods are additive: no existing signature or behavior changes.
+
+Measured on two workloads:
+
+  Eight levels of nested records, strings, byte arrays, arrays, and
+  unions: 553,483 -> 1,699,095 records/s (3.07x), with allocation and
+  reallocation operations falling from 1,560,003 to 81.
+
+  A 2,000-entry, 20-column Iceberg v2 manifest, where each metrics map is
+  an `array<record{key,value}>`: 85.5k -> 388.2k entries/s (4.51x), with
+  allocation operations for the whole file falling from 902,003 to 455.
+
+The operations that remain are first-tree and block-buffer setup rather
+than per-datum work.
 ---
  avro/src/decode.rs       | 271 +++++++++++++++++++++++++++++++++++++++
- avro/src/reader/block.rs |  46 ++++++-
- avro/src/reader/datum.rs | 125 +++++++++++++++++-
+ avro/src/reader/block.rs |  54 ++++++--
+ avro/src/reader/datum.rs | 127 +++++++++++++++++-
  avro/src/reader/mod.rs   |  64 +++++++++
- 4 files changed, 503 insertions(+), 3 deletions(-)
+ 4 files changed, 496 insertions(+), 20 deletions(-)
 
 diff --git a/avro/src/decode.rs b/avro/src/decode.rs
 index d78da71..469fd1e 100644
@@ -293,7 +335,7 @@ index d78da71..469fd1e 100644
  #[allow(clippy::expect_fun_call)]
  mod tests {
 diff --git a/avro/src/reader/block.rs b/avro/src/reader/block.rs
-index 5e9ae1b..6ce4c29 100644
+index 5e9ae1b..2095467 100644
 --- a/avro/src/reader/block.rs
 +++ b/avro/src/reader/block.rs
 @@ -27,7 +27,7 @@ use serde_json::from_slice;
@@ -305,25 +347,49 @@ index 5e9ae1b..6ce4c29 100644
      error::Details,
      schema::{Names, Schema, resolve_names, resolve_names_with_schemata},
      serde::deser_schema::{Config, SchemaAwareDeserializer},
-@@ -215,6 +215,50 @@ impl<'r, R: Read> Block<'r, R> {
-         Ok(Some(item))
+@@ -184,35 +184,61 @@ impl<'r, R: Read> Block<'r, R> {
+         self.len() == 0
      }
  
++    /// Read the next datum as an owned `Value`.
++    ///
++    /// Decoding into a fresh `Value::Null` finds nothing to reuse, so this
++    /// costs what it always did. Sharing one decode path keeps block
++    /// bookkeeping and error behavior from drifting between the two forms.
+     pub(super) fn read_next(&mut self, read_schema: Option<&Schema>) -> AvroResult<Option<Value>> {
++        let mut item = Value::Null;
++        match self.read_next_into(read_schema, &mut item)? {
++            true => Ok(Some(item)),
++            false => Ok(None),
++        }
++    }
++
 +    pub(super) fn read_next_into(
 +        &mut self,
 +        read_schema: Option<&Schema>,
 +        value: &mut Value,
 +    ) -> AvroResult<bool> {
-+        if self.is_empty() {
-+            self.read_block_next()?;
-+            if self.is_empty() {
+         if self.is_empty() {
+             self.read_block_next()?;
+             if self.is_empty() {
+-                return Ok(None);
 +                return Ok(false);
-+            }
-+        }
-+
-+        let mut block_bytes = &self.buf[self.buf_idx..];
-+        let b_original = block_bytes.len();
-+
+             }
+         }
+ 
+         let mut block_bytes = &self.buf[self.buf_idx..];
+         let b_original = block_bytes.len();
+ 
+-        let item = decode_internal(
+-            &self.writer_schema,
+-            &self.names_refs,
+-            None,
+-            &mut block_bytes,
+-        )?;
+-        let item = match read_schema {
+-            Some(schema) => item.resolve(schema)?,
+-            None => item,
+-        };
 +        if let Some(schema) = read_schema {
 +            // Schema resolution currently consumes a Value and can change its
 +            // shape. Preserve existing behavior, but do not claim allocation
@@ -344,20 +410,20 @@ index 5e9ae1b..6ce4c29 100644
 +                value,
 +            )?;
 +        }
-+
-+        if b_original != 0 && b_original == block_bytes.len() {
-+            return Err(Details::ReadBlock.into());
-+        }
-+        self.buf_idx += b_original - block_bytes.len();
-+        self.message_count -= 1;
+ 
+         if b_original != 0 && b_original == block_bytes.len() {
+-            // from_avro_datum did not consume any bytes, so return an error to avoid an infinite loop
+             return Err(Details::ReadBlock.into());
+         }
+         self.buf_idx += b_original - block_bytes.len();
+         self.message_count -= 1;
+-        Ok(Some(item))
 +        Ok(true)
-+    }
-+
+     }
+ 
      pub(super) fn read_next_deser<T: DeserializeOwned>(
-         &mut self,
-         reader_schema: Option<&Schema>,
 diff --git a/avro/src/reader/datum.rs b/avro/src/reader/datum.rs
-index 4f0c31e..dfee6a8 100644
+index 4f0c31e..a30b97f 100644
 --- a/avro/src/reader/datum.rs
 +++ b/avro/src/reader/datum.rs
 @@ -22,7 +22,7 @@ use serde::de::DeserializeOwned;
@@ -369,10 +435,18 @@ index 4f0c31e..dfee6a8 100644
      schema::{ResolvedOwnedSchema, ResolvedSchema},
      serde::deser_schema::{Config, SchemaAwareDeserializer},
      types::Value,
-@@ -138,6 +138,21 @@ impl<'s> GenericDatumReader<'s> {
-         }
-     }
- 
+@@ -130,11 +130,23 @@ impl<'s, S: generic_datum_reader_builder::State> GenericDatumReaderBuilder<'s, S
+ impl<'s> GenericDatumReader<'s> {
+     /// Read a Avro datum from the reader.
+     pub fn read_value<R: Read>(&self, reader: &mut R) -> AvroResult<Value> {
+-        let value = decode_internal(self.writer, self.resolved.get_names(), None, reader)?;
+-        if let Some((reader, resolved)) = &self.reader {
+-            value.resolve_internal(reader, resolved.get_names(), None, None)
++        let mut value = Value::Null;
++        self.read_value_into(reader, &mut value)?;
++        Ok(value)
++    }
++
 +    /// Read an Avro datum into caller-owned [`Value`] storage.
 +    ///
 +    /// Compatible allocations in `value` are reused. When a reader schema is
@@ -383,15 +457,13 @@ index 4f0c31e..dfee6a8 100644
 +            *value = decode_internal(self.writer, self.resolved.get_names(), None, reader)?
 +                .resolve_internal(reader_schema, resolved.get_names(), None, None)?;
 +            Ok(())
-+        } else {
+         } else {
+-            Ok(value)
 +            decode_into_internal(self.writer, self.resolved.get_names(), None, reader, value)
-+        }
-+    }
-+
-     /// Read a Avro datum from the reader.
-     ///
-     /// # Panics
-@@ -161,6 +176,61 @@ impl<'s> GenericDatumReader<'s> {
+         }
+     }
+ 
+@@ -161,6 +173,58 @@ impl<'s> GenericDatumReader<'s> {
      }
  }
  
@@ -430,12 +502,9 @@ index 4f0c31e..dfee6a8 100644
 +
 +    /// Read an owned Avro [`Value`].
 +    pub fn read_value<R: Read>(&self, reader: &mut R) -> AvroResult<Value> {
-+        decode_internal(
-+            self.resolved.get_root_schema(),
-+            self.resolved.get_names(),
-+            None,
-+            reader,
-+        )
++        let mut value = Value::Null;
++        self.read_value_into(reader, &mut value)?;
++        Ok(value)
 +    }
 +
 +    /// Read an Avro datum into caller-owned [`Value`] storage.
@@ -453,7 +522,7 @@ index 4f0c31e..dfee6a8 100644
  /// Reader for reading raw Avro data.
  ///
  /// This is most likely not what you need. Most users should use [`Reader`][crate::Reader],
-@@ -304,7 +374,7 @@ mod tests {
+@@ -304,7 +368,7 @@ mod tests {
  
      use crate::{
          Schema,
@@ -462,7 +531,7 @@ index 4f0c31e..dfee6a8 100644
          types::{Record, Value},
      };
  
-@@ -343,6 +413,57 @@ mod tests {
+@@ -343,6 +407,57 @@ mod tests {
          Ok(())
      }
  

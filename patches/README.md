@@ -8,7 +8,11 @@ patched Avro checkout until the change is upstream.
 Instructions for the receiving Gemini agent:
 
 1. Check out Apache Avro commit
-   `006ac8976f52af356beb5042788370f645f6da02`.
+   `8000091350d32f4ed4d94166dcb7695a4a25e409`. The patch was regenerated
+   against this revision. It also applies to the older
+   `006ac8976f52af356beb5042788370f645f6da02` that `rust/Cargo.toml` pins,
+   because the two revisions differ only in a dependency bump and added
+   documentation, not in the files the patch touches.
 2. Apply `patches/apache-avro-0.22-read-into.patch` from this repository.
 3. In the receiving workspace only, redirect Orva's `apache-avro` dependency
    to the patched crate, for example with a path dependency or an appropriate

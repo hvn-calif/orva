@@ -924,6 +924,51 @@ absl::StatusOr<AvroValue> DecodeDatumSchemata(
   return AvroValue(std::move(result).value());
 }
 
+// ---------------------------------------------------------------------------
+// AvroDatumReader
+// ---------------------------------------------------------------------------
+
+AvroDatumReader::AvroDatumReader(rust::datum::AvroDatumReader reader)
+    : reader_(std::move(reader)) {}
+
+absl::StatusOr<AvroDatumReader> AvroDatumReader::Create(
+    const AvroSchema& writer_schema) {
+  rs_std::Result<rust::datum::AvroDatumReader, rust::vec_u8::VecU8> result =
+      rust::datum::AvroDatumReader::create(writer_schema.schema_);
+  if (!result.has_value()) {
+    return absl::InvalidArgumentError(FromVecU8(std::move(result).err()));
+  }
+  return AvroDatumReader(std::move(result).value());
+}
+
+absl::StatusOr<AvroValue> AvroDatumReader::Decode(
+    absl::string_view data) const {
+  rs_std::Result<rust::value::AvroValue, rust::vec_u8::VecU8> result =
+      reader_.decode(ToByteSpan(data));
+  if (!result.has_value()) {
+    return absl::InvalidArgumentError(FromVecU8(std::move(result).err()));
+  }
+  return AvroValue(std::move(result).value());
+}
+
+absl::Status AvroDatumReader::DecodeInto(absl::string_view data,
+                                         AvroValue* value) const {
+  if (value == nullptr) {
+    return absl::InvalidArgumentError("DecodeInto value must not be null");
+  }
+  return ToStatus(reader_.decode_into(ToByteSpan(data), value->value_),
+                  kBadInput);
+}
+
+absl::StatusOr<AvroSchema> AvroDatumReader::WriterSchema() const {
+  rs_std::Result<rust::schema::AvroSchema, rust::vec_u8::VecU8> result =
+      reader_.writer_schema();
+  if (!result.has_value()) {
+    return absl::FailedPreconditionError(FromVecU8(std::move(result).err()));
+  }
+  return AvroSchema(std::move(result).value());
+}
+
 size_t SetMaxAllocationBytes(size_t num_bytes) {
   return rust::datum::set_max_allocation_bytes(num_bytes);
 }

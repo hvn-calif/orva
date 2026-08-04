@@ -1339,6 +1339,93 @@ TEST(DatumTest, DecodeRejectsTrailingBytes) {
   EXPECT_FALSE(DecodeDatum(*schema, with_trailing).ok());
 }
 
+TEST(AvroDatumReaderTest, DecodesTheSameValuesAsTheFreeFunction) {
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  auto reader = AvroDatumReader::Create(*schema);
+  ASSERT_TRUE(reader.ok());
+
+  for (int64_t id : {int64_t{0}, int64_t{7}, std::numeric_limits<int64_t>::max()}) {
+    AvroValue value = MakeUser(id, "bob");
+    auto encoded = EncodeDatum(*schema, value);
+    ASSERT_TRUE(encoded.ok());
+    auto by_reader = reader->Decode(*encoded);
+    ASSERT_TRUE(by_reader.ok());
+    EXPECT_TRUE(*by_reader == value);
+  }
+}
+
+TEST(AvroDatumReaderTest, DecodeIntoReusesAndOverwrites) {
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  auto reader = AvroDatumReader::Create(*schema);
+  ASSERT_TRUE(reader.ok());
+  auto first = EncodeDatum(*schema, MakeUser(1, "ann"));
+  auto second = EncodeDatum(*schema, MakeUser(2, "bob"));
+  ASSERT_TRUE(first.ok());
+  ASSERT_TRUE(second.ok());
+
+  AvroValue value = AvroValue::CreateNull();
+  ASSERT_TRUE(reader->DecodeInto(*first, &value).ok());
+  EXPECT_TRUE(value == MakeUser(1, "ann"));
+  // The second decode must fully replace the first, not merge into it.
+  ASSERT_TRUE(reader->DecodeInto(*second, &value).ok());
+  EXPECT_TRUE(value == MakeUser(2, "bob"));
+}
+
+TEST(AvroDatumReaderTest, DecodeIntoRejectsNull) {
+  auto schema = AvroSchema::Parse("\"int\"");
+  ASSERT_TRUE(schema.ok());
+  auto reader = AvroDatumReader::Create(*schema);
+  ASSERT_TRUE(reader.ok());
+  auto encoded = EncodeDatum(*schema, AvroValue::CreateInt(1));
+  ASSERT_TRUE(encoded.ok());
+  EXPECT_EQ(reader->DecodeInto(*encoded, nullptr).code(),
+            absl::StatusCode::kInvalidArgument);
+}
+
+TEST(AvroDatumReaderTest, RejectsTrailingBytesAndTruncation) {
+  auto schema = AvroSchema::Parse("\"int\"");
+  ASSERT_TRUE(schema.ok());
+  auto reader = AvroDatumReader::Create(*schema);
+  ASSERT_TRUE(reader.ok());
+  auto encoded = EncodeDatum(*schema, AvroValue::CreateInt(7));
+  ASSERT_TRUE(encoded.ok());
+
+  std::string with_trailing = *encoded + std::string("\xde\xad", 2);
+  AvroValue value = AvroValue::CreateNull();
+  EXPECT_FALSE(reader->Decode(with_trailing).ok());
+  EXPECT_FALSE(reader->DecodeInto(with_trailing, &value).ok());
+  EXPECT_FALSE(reader->Decode("").ok());
+}
+
+TEST(AvroDatumReaderTest, ReportsWriterSchema) {
+  auto schema = AvroSchema::Parse(kRecordSchema);
+  ASSERT_TRUE(schema.ok());
+  auto reader = AvroDatumReader::Create(*schema);
+  ASSERT_TRUE(reader.ok());
+  auto reported = reader->WriterSchema();
+  ASSERT_TRUE(reported.ok());
+  EXPECT_TRUE(*reported == *schema);
+}
+
+TEST(AvroDatumReaderTest, MovedFromReaderFailsInsteadOfDecoding) {
+  auto schema = AvroSchema::Parse("\"int\"");
+  ASSERT_TRUE(schema.ok());
+  auto reader = AvroDatumReader::Create(*schema);
+  ASSERT_TRUE(reader.ok());
+  auto encoded = EncodeDatum(*schema, AvroValue::CreateInt(1));
+  ASSERT_TRUE(encoded.ok());
+
+  AvroDatumReader moved = *std::move(reader);
+  ASSERT_TRUE(moved.Decode(*encoded).ok());
+  // A use-after-move must error rather than behave like a fresh reader.
+  AvroValue value = AvroValue::CreateNull();
+  EXPECT_FALSE(reader->Decode(*encoded).ok());
+  EXPECT_FALSE(reader->DecodeInto(*encoded, &value).ok());
+  EXPECT_FALSE(reader->WriterSchema().ok());
+}
+
 
 }  // namespace
 }  // namespace security::avro

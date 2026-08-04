@@ -315,6 +315,36 @@ size_t OursDecodeDatums(const Dataset& dataset,
   return count;
 }
 
+// The two rows below hold one AvroDatumReader across the whole loop, so the
+// writer schema's named types resolve once rather than per datum. That is the
+// same shape as the avrocpp row, which builds one GenericReader up front.
+size_t OursReaderDecodeDatums(const bridge::AvroDatumReader& reader,
+                              const std::vector<std::string>& encoded) {
+  size_t count = 0;
+  for (const std::string& bytes : encoded) {
+    auto value = reader.Decode(bytes);
+    Require(value.ok(), "binding: AvroDatumReader::Decode");
+    benchmark::DoNotOptimize(&*value);
+    ++count;
+  }
+  return count;
+}
+
+// Also reuses one caller-owned value, exactly as the avrocpp row reuses one
+// GenericDatum. This is the like-for-like comparison.
+size_t OursReaderDecodeDatumsInto(const bridge::AvroDatumReader& reader,
+                                  const std::vector<std::string>& encoded,
+                                  bridge::AvroValue* value) {
+  size_t count = 0;
+  for (const std::string& bytes : encoded) {
+    Require(reader.DecodeInto(bytes, value).ok(),
+            "binding: AvroDatumReader::DecodeInto");
+    benchmark::DoNotOptimize(value);
+    ++count;
+  }
+  return count;
+}
+
 // avro-cpp's encoder is a stream: all datums go into one buffer. Our
 // binding's EncodeDatum/DecodeDatum is one buffer per datum. Each side is
 // benchmarked in its natural mode; the API-shape difference is part of
@@ -546,6 +576,32 @@ void RegisterDatumBenchmarks(const Dataset& dataset) {
         for (auto _ : state) {
           Require(OursDecodeDatums(dataset, *ours_encoded) == count,
                   "benchmark: short datum decode");
+        }
+        state.SetItemsProcessed(state.iterations() * count);
+        state.SetBytesProcessed(state.iterations() * ours_bytes);
+      });
+  benchmark::RegisterBenchmark(
+      BenchName("ours_reader", "datum_decode", dataset, nullptr),
+      [&dataset, ours_encoded, ours_bytes, count](benchmark::State& state) {
+        auto reader = bridge::AvroDatumReader::Create(dataset.ours_schema);
+        Require(reader.ok(), "binding: AvroDatumReader::Create");
+        for (auto _ : state) {
+          Require(OursReaderDecodeDatums(*reader, *ours_encoded) == count,
+                  "benchmark: short datum decode");
+        }
+        state.SetItemsProcessed(state.iterations() * count);
+        state.SetBytesProcessed(state.iterations() * ours_bytes);
+      });
+  benchmark::RegisterBenchmark(
+      BenchName("ours_reader_into", "datum_decode", dataset, nullptr),
+      [&dataset, ours_encoded, ours_bytes, count](benchmark::State& state) {
+        auto reader = bridge::AvroDatumReader::Create(dataset.ours_schema);
+        Require(reader.ok(), "binding: AvroDatumReader::Create");
+        bridge::AvroValue value = bridge::AvroValue::CreateNull();
+        for (auto _ : state) {
+          Require(
+              OursReaderDecodeDatumsInto(*reader, *ours_encoded, &value) == count,
+              "benchmark: short datum decode");
         }
         state.SetItemsProcessed(state.iterations() * count);
         state.SetBytesProcessed(state.iterations() * ours_bytes);

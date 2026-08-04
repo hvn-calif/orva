@@ -92,10 +92,20 @@ class AvroSchema final {
   bool operator!=(const AvroSchema& other) const;
 
  private:
+  // The friends below are declared to read `schema_` when calling into Rust,
+  // and to construct AvroSchema from the internal rust::schema::AvroSchema
+  // wrapper. Keeping both private prevents external clients from reaching the
+  // handle or instantiating AvroSchema with internal apache-avro types. Each
+  // friend function repeats a signature declared elsewhere in this header, so
+  // edit every copy: a partial edit befriends a different overload, which
+  // compiles here and fails at the call site. A single friend class that the
+  // datum functions delegate to would drop the repeats, at the cost of a
+  // delegation layer for a set of operations that does not grow.
   friend class AvroValue;
   friend class DataFileWriter;
   friend class DataFileReader;
   friend class AvroProjection;
+  friend class AvroDatumReader;
   friend absl::StatusOr<std::string> EncodeDatum(const AvroSchema& schema,
                                                  const AvroValue& value);
   friend absl::StatusOr<std::string> EncodeDatumSchemata(
@@ -350,9 +360,12 @@ class AvroValue final {
   bool operator!=(const AvroValue& other) const;
 
  private:
+  // Same rule as AvroSchema. Most friends here never read `value_`. They are
+  // declared to construct AvroValue from a handle coming back from a decode.
   friend class DataFileWriter;
   friend class DataFileReader;
   friend class AvroProjection;
+  friend class AvroDatumReader;
   friend absl::StatusOr<std::string> EncodeDatum(const AvroSchema& schema,
                                                  const AvroValue& value);
   friend absl::StatusOr<std::string> EncodeDatumSchemata(
@@ -387,6 +400,49 @@ absl::StatusOr<AvroValue> DecodeDatumResolved(const AvroSchema& writer_schema,
 absl::StatusOr<AvroValue> DecodeDatumSchemata(
     const AvroSchema& writer_schema,
     absl::Span<const AvroSchema> writer_schemata, absl::string_view data);
+
+// Decodes many bare datums that share one writer schema.
+//
+// The DecodeDatum functions above resolve the writer schema's named types on
+// every call, a fixed per-datum cost that dominates small records: measured at
+// roughly 70 ns, which is most of why DecodeDatum was 2.07x slower than
+// avro-cpp on 100k-record flat data. This resolves once at construction, so
+// prefer it whenever more than one datum shares a schema. See
+// doc/specs/AvroDatumReader.md.
+//
+// Writer schema only. Named references *within* that schema resolve (including
+// recursive ones); external schemata and reader-schema resolution are not
+// supported, so keep using DecodeDatumSchemata and DecodeDatumResolved there.
+class AvroDatumReader final {
+ public:
+  // Fails with kInvalidArgument if the schema's named types cannot be
+  // resolved.
+  static absl::StatusOr<AvroDatumReader> Create(const AvroSchema& writer_schema);
+
+  // Returns the decoded datum. Fails with kInvalidArgument on malformed input
+  // and on trailing bytes, since a correctly framed datum buffer is fully
+  // consumed.
+  absl::StatusOr<AvroValue> Decode(absl::string_view data) const;
+
+  // Decodes into caller-owned storage, reusing compatible allocations, and
+  // mirrors DataFileReader::NextValueInto: consume or inspect `value` before
+  // the next call. A null pointer is rejected.
+  //
+  // Two consequences of reuse. `value` keeps the capacity of the largest datum
+  // it has held, so a single huge datum raises this reader's memory
+  // high-water mark until the caller drops the value. And after an error
+  // `value` is left valid but unspecified: it may hold part of the failed
+  // datum.
+  absl::Status DecodeInto(absl::string_view data, AvroValue* value) const;
+
+  // The schema this reader decodes with.
+  absl::StatusOr<AvroSchema> WriterSchema() const;
+
+ private:
+  explicit AvroDatumReader(rust::datum::AvroDatumReader reader);
+
+  rust::datum::AvroDatumReader reader_;
+};
 
 // A projection compiled against one writer schema, for decoding a stream of
 // bare datums. `projection` must be a subset of `writer_schema`: the same
