@@ -53,7 +53,7 @@ operational property, not the data.
 | | |
 |---|---|
 | avrocpp | **Accepted, unvalidated.** `BinaryDecoder::decodeString` (`impl/BinaryDecoder.cc:118`) reads a length, resizes a `std::string`, and copies raw bytes into it. `std::string` is byte-oriented, so arbitrary bytes survive decode, round-trip, and re-encode intact, and no caller learns anything was wrong |
-| bridge | **Rejected on read** at `rust/decode.rs:732` via the helper at `:846`, and upstream at `src/decode.rs:217` and `:473` (`Details::ConvertToUtf8`, `src/error.rs:96`). **Also rejected on write** at `rust/value.rs:75` |
+| bridge | **Rejected on read** at `rust/decode.rs:733` via the helper at `:847`, and upstream at `src/decode.rs:217` and `:473` (`Details::ConvertToUtf8`, `src/error.rs:96`). **Also rejected on write** at `rust/value.rs:75` |
 
 Both directions matter. The write-side rejection means a caller that takes bytes from
 a non-Avro source and puts them in a `string` field fails at value construction, so
@@ -62,6 +62,14 @@ this reaches code that never reads a foreign Avro file.
 Avro `string` is specified as UTF-8, so avrocpp is out of spec here. That does not
 change the observable fact that data which decoded under avrocpp does not decode
 under the bridge.
+
+Decided in `doc/specs/AvroStringPolicy.md`: decode to `Value::Bytes`, always. That
+spec also records why Latin-1 smuggling, lossy substitution, and surrogate escaping
+were rejected.
+
+Related but **not** covered by this entry, and not yet investigated: non-UTF-8 in map
+keys, record field names, and enum symbols. Same underlying constraint, different
+representation problem.
 
 ### D2. Duplicate keys in a map
 
@@ -197,6 +205,14 @@ site and a specific call site observed different orders from the same file.
 Not a substitute for one another. If any output a user reads or any file a user
 consumes goes through `jsonEncoder`, the shape change is visible to them.
 
+Sharper than a fixed shape difference: the bridge's JSON type depends on the *value*,
+not just the schema. `Value::Bytes` renders as a JSON array of numbers and
+`Value::String` as a JSON string (`src/types.rs:325-326`), so once D1 decodes invalid
+UTF-8 to `Value::Bytes`, a single `string` field renders as `"café"` in one record and
+`[255,254]` in the next, decided by that record's bytes. avrocpp's `jsonEncoder` had no
+such per-record variation. Pinned by
+`NonUtf8StringTest.ToJsonStringSilentlyChangesTypeRatherThanFailing`.
+
 ### D12. C++ aliasing mistakes
 
 | | |
@@ -224,7 +240,7 @@ Checked, and the two agree. Listed so the divergence list above is read as bound
 rather than as a sample.
 
 - Bool byte validation: avrocpp rejects any byte other than 0 or 1
-  (`impl/BinaryDecoder.cc:69`); the bridge rejects too (`rust/decode.rs:706`).
+  (`impl/BinaryDecoder.cc:69`); the bridge rejects too (`rust/decode.rs:707`).
 - Avro `int` range checking on decode.
 - Negative length prefixes rejected.
 - Float and double byte layout on little-endian.
