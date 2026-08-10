@@ -1426,6 +1426,60 @@ TEST(AvroDatumReaderTest, MovedFromReaderFailsInsteadOfDecoding) {
   EXPECT_FALSE(reader->WriterSchema().ok());
 }
 
+// -- Non-UTF-8 strings (D1) ---------------------------------------------------
+//
+// avro-cpp accepted arbitrary bytes in a `string`, so data it wrote must keep
+// decoding. See doc/specs/AvroStringPolicy.md.
+
+// One Avro `string`: zigzag length 2, then two bytes that are not UTF-8. Hand
+// assembled because no encoder here can produce an invalid string.
+constexpr char kInvalidUtf8StringDatum[] = "\x04\xff\xfe";
+constexpr absl::string_view kInvalidUtf8Wire(kInvalidUtf8StringDatum, 3);
+
+TEST(NonUtf8StringTest, GetStringReturnsTheRawBytes) {
+  auto schema = AvroSchema::Parse(R"("string")");
+  ASSERT_TRUE(schema.ok());
+  auto projection = AvroProjection::Compile(*schema, *schema);
+  ASSERT_TRUE(projection.ok()) << projection.status();
+
+  auto decoded = projection->DecodeDatum(kInvalidUtf8Wire);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+
+  auto text = decoded->GetString();
+  ASSERT_TRUE(text.ok()) << text.status();
+  EXPECT_EQ(*text, std::string("\xff\xfe", 2));
+
+  // The value really is Bytes now, so the predicates say so even though the
+  // schema calls it a string.
+  EXPECT_FALSE(decoded->IsString());
+  EXPECT_TRUE(decoded->IsBytes());
+}
+
+// ToJsonString does not fail on these bytes, it changes the JSON *type*:
+// apache-avro renders Bytes as an array of numbers and String as a string
+// (avro-rs src/types.rs:325-326). So one field renders two ways depending on
+// the record. The argument for a real Avro JSON codec (D11).
+TEST(NonUtf8StringTest, ToJsonStringSilentlyChangesTypeRatherThanFailing) {
+  auto schema = AvroSchema::Parse(R"("string")");
+  ASSERT_TRUE(schema.ok());
+  auto projection = AvroProjection::Compile(*schema, *schema);
+  ASSERT_TRUE(projection.ok());
+
+  auto decoded = projection->DecodeDatum(kInvalidUtf8Wire);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  auto invalid_json = decoded->ToJsonString();
+  ASSERT_TRUE(invalid_json.ok()) << invalid_json.status();
+  EXPECT_EQ(*invalid_json, "[255,254]");
+
+  auto valid_encoded =
+      EncodeDatum(*schema, *AvroValue::CreateString("caf\xc3\xa9"));
+  ASSERT_TRUE(valid_encoded.ok());
+  auto valid_decoded = projection->DecodeDatum(*valid_encoded);
+  ASSERT_TRUE(valid_decoded.ok()) << valid_decoded.status();
+  auto valid_json = valid_decoded->ToJsonString();
+  ASSERT_TRUE(valid_json.ok()) << valid_json.status();
+  EXPECT_EQ(*valid_json, "\"caf\xc3\xa9\"");
+}
 
 }  // namespace
 }  // namespace security::avro

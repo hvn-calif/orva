@@ -256,9 +256,13 @@ impl AvroValue {
         }
     }
 
+    /// Returns the string's raw bytes. Also accepts `Value::Bytes`, which is
+    /// what D1 decodes an invalid-UTF-8 `string` to; `get_bytes` deliberately
+    /// does not gain the reverse. See doc/specs/AvroStringPolicy.md.
     pub fn get_string(&self) -> Result<VecU8, VecU8> {
         match &self.value {
             Value::String(v) => Ok(v.as_str().into()),
+            Value::Bytes(v) => Ok(v.as_slice().into()),
             _ => Err(self.type_error("string")),
         }
     }
@@ -925,9 +929,11 @@ impl AvroValue {
         }
     }
 
+    /// Also accepts `Value::Bytes`; see `get_string`.
     pub fn get_string_at(&self, path: &AvroPath) -> Result<VecU8, VecU8> {
         match self.at_leaf(path)? {
             Value::String(v) => Ok(v.as_str().into()),
+            Value::Bytes(v) => Ok(v.as_slice().into()),
             other => Err(Self::at_type_error(path, other, "string")),
         }
     }
@@ -1059,6 +1065,41 @@ mod tests {
     fn invalid_utf8_string_fails() {
         assert!(AvroValue::create_string(&[0xff, 0xfe]).is_err());
         assert!(AvroValue::create_enum(0, &[0xff]).is_err());
+    }
+
+    /// D1 is a read-path decision: `create_string` above still rejects, so the
+    /// `Value::Bytes` here is hand-built.
+    #[test]
+    fn get_string_accepts_bytes_but_get_bytes_does_not_accept_string() {
+        let invalid_string_field = AvroValue {
+            value: Value::Bytes(vec![0xff, 0xfe]),
+        };
+        assert_eq!(
+            invalid_string_field.get_string().unwrap().as_slice(),
+            &[0xff, 0xfe]
+        );
+        assert_eq!(
+            invalid_string_field.get_bytes().unwrap().as_slice(),
+            &[0xff, 0xfe]
+        );
+
+        let root = AvroPath::create();
+        assert_eq!(
+            invalid_string_field
+                .get_string_at(&root)
+                .unwrap()
+                .as_slice(),
+            &[0xff, 0xfe]
+        );
+        assert_eq!(
+            invalid_string_field.get_bytes_at(&root).unwrap().as_slice(),
+            &[0xff, 0xfe]
+        );
+
+        // One-directional: a real String is never handed back by get_bytes.
+        let actual_string = AvroValue::create_string(b"hi").unwrap();
+        assert!(actual_string.get_bytes().is_err());
+        assert!(actual_string.get_bytes_at(&root).is_err());
     }
 
     #[test]

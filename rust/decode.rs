@@ -26,6 +26,7 @@
 //! capped upstream of here by `DataFileReader::set_max_block_size`.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use apache_avro::Duration;
 use apache_avro::from_avro_datum_schemata;
@@ -628,9 +629,14 @@ impl Context<'_> {
     fn read(&self, plan: &Plan, schema: &Schema, input: &mut &[u8]) -> Result<Value, String> {
         match plan {
             Plan::Drop => {
+                // `skip` never validates the bytes it steps over (D1's
+                // change does not touch it), so a dropped invalid string
+                // already decoded without erroring before D1, unchanged.
                 self.skip(schema, input)?;
                 Ok(Value::Null)
             }
+            // apache-avro decodes this subtree, so D1 does not apply until
+            // patches/apache-avro-0.21-non-utf8-string.patch is in place.
             Plan::Delegate => from_avro_datum_schemata(schema, vec![self.root], input, None)
                 .map_err(|error| error.to_string()),
             Plan::Take => self.read_all(schema, input),
@@ -668,8 +674,8 @@ impl Context<'_> {
                 let mut entries = HashMap::new();
                 self.read_blocks(input, |context, input| {
                     let key = utf8(read_bytes(input)?)?;
-                    entries.insert(key, context.read(value_plan, &map.types, input)?);
-                    Ok(())
+                    let value = context.read(value_plan, &map.types, input)?;
+                    insert_map_entry(&mut entries, key, value)
                 })?;
                 Ok(Value::Map(entries))
             }
@@ -729,7 +735,7 @@ impl Context<'_> {
                 Ok(Value::Duration(Duration::from(bytes)))
             }
             Schema::Bytes => Ok(Value::Bytes(read_bytes(input)?.to_vec())),
-            Schema::String => Ok(Value::String(utf8(read_bytes(input)?)?)),
+            Schema::String => Ok(string_or_bytes(read_bytes(input)?)),
             Schema::Uuid(uuid_schema) => {
                 // apache-avro accepts both the 16-byte form and the textual
                 // form; mirror that rather than being stricter.
@@ -792,8 +798,8 @@ impl Context<'_> {
                 let mut entries = HashMap::new();
                 self.read_blocks(input, |context, input| {
                     let key = utf8(read_bytes(input)?)?;
-                    entries.insert(key, context.read_all(&map.types, input)?);
-                    Ok(())
+                    let value = context.read_all(&map.types, input)?;
+                    insert_map_entry(&mut entries, key, value)
                 })?;
                 Ok(Value::Map(entries))
             }
@@ -845,6 +851,46 @@ fn read_int(input: &mut &[u8]) -> Result<i32, String> {
 
 fn utf8(bytes: &[u8]) -> Result<String, String> {
     String::from_utf8(bytes.to_vec()).map_err(|_| "Avro string is not valid UTF-8".to_string())
+}
+
+/// D1: a `string` whose bytes are not valid UTF-8 becomes `Value::Bytes`
+/// rather than an error. Separate from `utf8` above, which must keep
+/// rejecting for map keys and uuids.
+fn string_or_bytes(bytes: &[u8]) -> Value {
+    match String::from_utf8(bytes.to_vec()) {
+        Ok(string) => Value::String(string),
+        Err(error) => Value::Bytes(error.into_bytes()),
+    }
+}
+
+/// The key comes from the wire, so the error quotes only a bounded prefix.
+const MAX_QUOTED_KEY_CHARS: usize = 64;
+
+/// D2: rejects a repeated map key rather than letting it overwrite. Without
+/// this the map silently comes out one entry short, where avro-cpp kept both
+/// (its map is a vector of pairs). Only fires on input that was already
+/// being corrupted.
+fn insert_map_entry(
+    entries: &mut HashMap<String, Value>,
+    key: String,
+    value: Value,
+) -> Result<(), String> {
+    match entries.entry(key) {
+        Entry::Occupied(entry) => {
+            let repeated = entry.key();
+            let quoted: String = repeated.chars().take(MAX_QUOTED_KEY_CHARS).collect();
+            let ellipsis = if quoted.len() < repeated.len() {
+                "..."
+            } else {
+                ""
+            };
+            Err(format!("Duplicate key '{quoted}{ellipsis}' in Avro map"))
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(value);
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -972,6 +1018,132 @@ mod tests {
             Value::Union(1, Box::new(Value::Long(42))),
         );
     }
+
+    const MAP_OF_INT: &str = r#"{"type":"map","values":"int"}"#;
+
+    fn write_long(out: &mut Vec<u8>, value: i64) {
+        let mut zigzag = ((value << 1) ^ (value >> 63)) as u64;
+        loop {
+            let byte = (zigzag & 0x7f) as u8;
+            zigzag >>= 7;
+            if zigzag == 0 {
+                return out.push(byte);
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    /// Assembles a `map` of `int` as one block of entries in wire order,
+    /// followed by the end-of-blocks marker. Needed because a repeated key
+    /// cannot be expressed as a `HashMap` and so cannot go through `encode`.
+    fn map_bytes(entries: &[(&str, i32)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_long(&mut out, entries.len() as i64);
+        for (key, value) in entries {
+            write_long(&mut out, key.len() as i64);
+            out.extend_from_slice(key.as_bytes());
+            write_long(&mut out, i64::from(*value));
+        }
+        out.push(0);
+        out
+    }
+
+    /// Assembles the wire form of a scalar `bytes` or `string` value: a
+    /// length prefix followed by the raw bytes. Generalizes `write_long` the
+    /// same way `map_bytes` does above, for the D1 fixtures below. Needed
+    /// because a valid encoder can never produce an invalid `Value::String`
+    /// to round-trip through `encode`.
+    fn length_prefixed(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_long(&mut out, bytes.len() as i64);
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    fn decode_projected(json: &str, bytes: &[u8]) -> Result<Value, String> {
+        let writer = schema(json);
+        let projection =
+            AvroProjection::compile(&writer, &writer).expect("identity projection should compile");
+        projection.decode(&mut &bytes[..])
+    }
+
+    #[test]
+    fn duplicate_map_key_is_rejected() {
+        let error = decode_projected(MAP_OF_INT, &map_bytes(&[("a", 1), ("a", 2)]))
+            .expect_err("a repeated map key should not decode");
+
+        assert!(
+            error.contains("Duplicate key 'a'"),
+            "unexpected message: {error}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D1: invalid UTF-8 in a `string` field (doc/AvrocppDivergences.md;
+    // doc/specs/AvroStringPolicy.md). Fixtures are hand-assembled because a
+    // valid encoder can never produce an invalid `Value::String`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn invalid_utf8_string_decodes_to_bytes() {
+        let invalid = [0xff, 0xfe, 0x80];
+        let decoded = decode_projected(r#""string""#, &length_prefixed(&invalid)).unwrap();
+        assert_eq!(decoded, Value::Bytes(invalid.to_vec()));
+    }
+
+    /// The property that rules out Latin-1 smuggling: byte 0xFF (invalid
+    /// UTF-8 on its own) and the two-byte sequence 0xC3 0xBF (the valid
+    /// UTF-8 encoding of U+00FF) must decode to distinguishable values. A
+    /// Latin-1-smuggled representation would collapse both onto code point
+    /// U+00FF, which makes the wire-to-value mapping non-injective and
+    /// re-encoding ambiguous -- see the "Latin-1 smuggling" sections of
+    /// doc/specs/AvroStringPolicy.md. This is the most important test in
+    /// this module's D1 coverage.
+    #[test]
+    fn latin1_collision_is_not_smuggled() {
+        let invalid = decode_projected(r#""string""#, &length_prefixed(&[0xff])).unwrap();
+        let valid = decode_projected(r#""string""#, &length_prefixed(&[0xc3, 0xbf])).unwrap();
+
+        assert_ne!(invalid, valid, "byte 0xFF collapsed onto U+00FF");
+        assert_eq!(invalid, Value::Bytes(vec![0xff]));
+        assert_eq!(valid, Value::String("\u{ff}".to_string()));
+    }
+
+    /// D1 does not touch the shared `utf8` helper, so the two call sites
+    /// that stay strict must still reject: a map key here, and a uuid
+    /// below. Both are out of scope for this spec.
+    #[test]
+    fn invalid_utf8_map_key_still_errors() {
+        let mut bytes = Vec::new();
+        write_long(&mut bytes, 1); // one entry
+        write_long(&mut bytes, 1); // key length 1
+        bytes.push(0xff); // invalid UTF-8 key
+        write_long(&mut bytes, 5); // value
+        bytes.push(0); // end of blocks
+
+        let error = decode_projected(MAP_OF_INT, &bytes).unwrap_err();
+        assert!(
+            error.contains("not valid UTF-8"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_uuid_still_errors() {
+        const UUID_SCHEMA: &str = r#"{"type":"string","logicalType":"uuid"}"#;
+        let error = decode_projected(UUID_SCHEMA, &length_prefixed(&[0xff, 0xfe])).unwrap_err();
+        assert!(
+            error.contains("not valid UTF-8"),
+            "unexpected error: {error}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D1's known limitations. Stage 2 (this task) only closes the read path;
+    // these record the gaps stage 2 leaves open, so each fails loudly rather
+    // than silently once a later stage closes it. Follows the pattern of
+    // `duplicate_map_key_still_collapses_upstream` above.
+    // -----------------------------------------------------------------------
 
     const NESTED: &str = r#"{"type":"record","name":"Outer","fields":[
         {"name":"id","type":"long"},
