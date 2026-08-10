@@ -119,6 +119,45 @@ if (AVRO_BUILD_BENCHMARKS)
   file(COPY ${avrocpp_upstream_SOURCE_DIR}/lang/c++/api/
        DESTINATION ${CMAKE_BINARY_DIR}/avrocpp_include/avro)
 
+  # avrocpp_s does not propagate its own link interface; supply the Boost
+  # pieces and snappy it depends on. Needed by avro_compare below and by
+  # avro_benchmark itself.
+  find_package(Boost REQUIRED COMPONENTS iostreams)
+
+  # Cross-implementation comparison shared by the benchmark's validation
+  # circle below and, per doc/specs/AvrocppMigration.md, by the future
+  # dual-run compat shim and differential fuzzers once those land. It needs
+  # avrocpp, so for now it lives inside this option alongside the benchmark;
+  # the migration spec makes avrocpp a non-optional dependency of the shim
+  # later, at which point this target can move out from under
+  # AVRO_BUILD_BENCHMARKS.
+  add_library(avro_compare avro_compare.cc avro_compare.h)
+  target_include_directories(avro_compare PUBLIC
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_BINARY_DIR}/avrocpp_include)
+  target_link_libraries(avro_compare PUBLIC
+    avro_bridge
+    rust
+    avrocpp_s
+    Boost::iostreams
+    ${SNAPPY_LIBRARIES}
+  )
+
+  # avro_compare's normalization branch (String vs Bytes) is only exercised
+  # by these tests: none of the benchmark datasets contain invalid UTF-8, so
+  # the validation circle above never takes that path. Lives here rather
+  # than in avro_bridge_test because it links avrocpp transitively through
+  # avro_compare.
+  add_executable(avro_compare_test avro_compare_test.cc)
+  target_link_libraries(avro_compare_test PRIVATE
+    avro_compare
+    avro_bridge
+    rust
+    GTest::gmock
+    GTest::gtest_main
+  )
+  gtest_discover_tests(avro_compare_test)
+
   add_executable(avro_benchmark benchmarks/avro_benchmark.cc)
   target_include_directories(avro_benchmark PRIVATE
     ${CMAKE_SOURCE_DIR}
@@ -128,11 +167,9 @@ if (AVRO_BUILD_BENCHMARKS)
   # prerequisite), consumers must opt in. Cross-validation at benchmark
   # startup catches a snappy-less avrocpp build with a clear error.
   target_compile_definitions(avro_benchmark PRIVATE SNAPPY_CODEC_AVAILABLE)
-  # avrocpp_s does not propagate its own link interface; supply the Boost
-  # pieces and snappy it depends on.
-  find_package(Boost REQUIRED COMPONENTS iostreams)
   target_link_libraries(avro_benchmark PRIVATE
     avro_bridge
+    avro_compare
     rust
     avrocpp_s
     Boost::iostreams

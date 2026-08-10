@@ -16,9 +16,11 @@
 #include <utility>
 #include <vector>
 
+#include "absl/types/span.h"
 #include "benchmark/benchmark.h"
 
 #include "avro_bridge.h"
+#include "avro_compare.h"
 
 #include <avro/Compiler.hh>
 #include <avro/DataFile.hh>
@@ -30,6 +32,7 @@
 #include <avro/ValidSchema.hh>
 
 namespace bridge = security::avro;
+namespace avro_compare = security::avro_compare;
 
 namespace {
 
@@ -388,68 +391,16 @@ void ValidateCrossRead(const Dataset& dataset) {
   // blocks: the circle then exercises the same block-boundary code paths
   // the timed benchmarks run through, not just a single-block file.
   const size_t sample_count = std::min<size_t>(2000, dataset.count);
+  const absl::Span<const bridge::AvroValue> sample(
+      dataset.ours_values.data(), sample_count);
   for (const CodecPair& codec : kCodecs) {
-    // Ours writes the sample.
-    auto writer =
-        bridge::DataFileWriter::Create(dataset.ours_schema, codec.ours);
-    Require(writer.ok(), "validate: our writer create");
-    for (size_t i = 0; i < sample_count; ++i) {
-      Require(writer->Append(dataset.ours_values[i]).ok(),
-              "validate: our append");
-    }
-    auto ours_file = writer->Finish();
-    Require(ours_file.ok(), "validate: our finish");
-
-    // avrocpp reads our file and re-writes it with its own writer.
-    std::vector<avro::GenericDatum> relayed;
-    {
-      auto in = avro::memoryInputStream(
-          reinterpret_cast<const uint8_t*>(ours_file->data()),
-          ours_file->size());
-      avro::DataFileReader<avro::GenericDatum> reader(std::move(in));
-      avro::GenericDatum datum(reader.dataSchema());
-      while (reader.read(datum)) relayed.push_back(datum);
-    }
-    Require(relayed.size() == sample_count,
-            "validate: avrocpp read a different value count from our file");
-    std::unique_ptr<avro::OutputStream> out = avro::memoryOutputStream();
-    avro::OutputStream* raw = out.get();
-    avro::DataFileWriter<avro::GenericDatum> cpp_writer(
-        std::move(out), dataset.cpp_schema, 16 * 1024, codec.cpp);
-    for (const avro::GenericDatum& datum : relayed) cpp_writer.write(datum);
-    cpp_writer.flush();
-    auto snapshot = avro::snapshot(*raw);
-    cpp_writer.close();
-    std::string cpp_file(snapshot->begin(), snapshot->end());
-
-    // Ours reads avrocpp's file; values must equal the originals.
-    auto reader = bridge::DataFileReader::FromBytes(cpp_file);
-    Require(reader.ok(), "validate: our reader rejected avrocpp's file");
-    for (size_t i = 0; i < sample_count; ++i) {
-      auto value = reader->NextValue();
-      Require(value.ok(), "validate: our read of avrocpp's file failed");
-      Require(*value == dataset.ours_values[i],
-              "validate: value mismatch after the cross-read circle");
-    }
-    auto trailing = reader->NextReady();
-    Require(trailing.ok(), "validate: reader failed after the last value");
-    Require(!*trailing, "validate: trailing values after the circle");
-
-    // The chunked push path timed by stream_read_64k must agree too. An
-    // odd chunk size hits arbitrary split points (mid-varint, mid-block
-    // header, mid-marker) rather than block-aligned ones.
-    ChunkedStream chunked(cpp_file, 4099);
-    auto stream_reader = bridge::DataFileStreamReader::Create(&chunked);
-    Require(stream_reader.ok(), "validate: stream reader create failed");
-    for (size_t i = 0; i < sample_count; ++i) {
-      auto value = stream_reader->NextValue();
-      Require(value.ok(), "validate: chunked stream read failed");
-      Require(*value == dataset.ours_values[i],
-              "validate: value mismatch on the chunked stream path");
-    }
-    auto more = stream_reader->HasNext();
-    Require(more.ok(), "validate: stream reader failed after the last value");
-    Require(!*more, "validate: trailing values on the chunked stream path");
+    avro_compare::CompareResult result = avro_compare::CrossReadCircle(
+        dataset.ours_schema, dataset.cpp_schema, sample, codec.ours,
+        codec.cpp);
+    Require(result.ok(),
+            (dataset.name + "/" + codec.name + ": validate: " +
+             result.diverged_at)
+                .c_str());
   }
   std::fprintf(stderr, "validated cross-read circle: %s\n",
                dataset.name.c_str());
