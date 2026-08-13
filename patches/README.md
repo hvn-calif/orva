@@ -5,7 +5,7 @@ Patches this repo maintains against `apache-avro` (avro-rs), each a normal
 
 | Patch | Base | Purpose |
 |---|---|---|
-| `apache-avro-0.21-non-utf8-string.patch` | `rel/release-0.21.0` | Decode a `string` whose wire bytes are not valid UTF-8 as `Value::Bytes` instead of failing. Closes D1; see `doc/specs/AvroStringPolicy.md` |
+| `apache-avro-0.21-non-utf8-string.patch` | `rel/release-0.21.0` | Adds `util::set_non_utf8_string_as_bytes`, off by default. On, a `string` whose wire bytes are not valid UTF-8 decodes as `Value::Bytes` instead of failing. Closes D1; see `doc/specs/AvroStringPolicy.md` |
 | `apache-avro-0.22-read-into.patch` | avro-rs `8000091350d32f4ed4d94166dcb7695a4a25e409` | Allocation-reusing value decoding: `read_into`, `read_value_into`, `OwnedGenericDatumReader` |
 
 ## apache-avro-0.21-non-utf8-string.patch
@@ -23,26 +23,48 @@ git am /path/to/apache-avro-0.21-non-utf8-string.patch
 cargo test -p apache-avro --features derive
 ```
 
-Verified: applies clean via `git am`, and the suite passes at 428 tests, the
-421 the release ships plus the 7 this patch adds. Two pre-existing failures in
-that checkout are unrelated to the patch and reproduce without it: the
-`specific_single_object` example and the `avro-rs-226` integration test both
-need the `derive` feature, so build with `--features derive`.
+Verified on 2026-08-13: applies clean to a detached worktree at `0470799`
+(`git apply --check`), `cargo fmt --check` clean, no new clippy findings in the
+changed files, and the suite goes from 541 passing on the unpatched tag to 551
+with the patch, the 10 tests it adds. Two pre-existing failures in that checkout
+are unrelated and reproduce without the patch: the `specific_single_object`
+example and the `avro-rs-226` integration test both need the `derive` feature,
+so build with `--features derive`.
+
+**The behaviour is off by default.** Nothing changes for an existing consumer of
+the crate until a caller opts in, once per process and before any decoding:
+
+```rust
+// The return value is the setting actually in effect, which differs from the
+// argument if something already set it. Check it rather than assume.
+assert!(apache_avro::util::set_non_utf8_string_as_bytes(true));
+```
 
 What it changes, all in `avro/src/`:
 
-- `decode.rs`, the `Schema::String` arm: invalid UTF-8 yields `Value::Bytes`.
-- `decode.rs`, the map-key site: still rejects, but reports UTF-8 rather than
-  reporting the key as the wrong type. Map keys cannot hold raw bytes because
-  `Value::Map` is keyed by `String`.
-- `encode.rs`, the `Value::Bytes` arm: `Schema::String` accepted, so such a
-  value round-trips byte for byte.
-- `types.rs`, `validate`: `Value::Bytes` satisfies `Schema::String`.
-- `types.rs`, `resolve_string`: invalid bytes stay `Value::Bytes`; valid bytes
-  still become a `String`.
+- `util.rs`: the `NON_UTF8_STRING_AS_BYTES` `OnceLock`, its
+  `set_non_utf8_string_as_bytes` setter and crate-internal reader. Shaped after
+  the existing `set_serde_human_readable`.
+- `decode.rs`, the `Schema::String` arm: with the setting on, invalid UTF-8
+  yields `Value::Bytes`; off, it fails as before.
+- `decode.rs`, the map-key site: still rejects either way, but reports UTF-8
+  rather than reporting the key as the wrong type. Map keys cannot hold raw
+  bytes because `Value::Map` is keyed by `String`.
+- `encode.rs`, the `Value::Bytes` arm: with the setting on, `Schema::String` is
+  accepted, so such a value round-trips byte for byte.
+- `types.rs`, `validate`: with the setting on, `Value::Bytes` satisfies
+  `Schema::String`.
+- `types.rs`, `resolve_string`: with the setting on, invalid bytes stay
+  `Value::Bytes`. Valid bytes still become a `String` either way.
 
-No public signature changes and no new error variants, so it is additive for
-any other consumer of the crate.
+Tests are split by the value of the setting, because a `OnceLock` cannot be
+reset within a process: the rejecting cases are unit tests in `decode.rs` and
+`types.rs` (default), and the accepting cases are their own test binary,
+`avro/tests/non_utf8_string_as_bytes.rs`, mirroring how upstream tests
+`serde_human_readable` with one binary per value.
+
+No public signature changes and no new error variants, and the default preserves
+every existing behaviour, so it is additive for any other consumer of the crate.
 
 ## apache-avro-0.22-read-into.patch
 

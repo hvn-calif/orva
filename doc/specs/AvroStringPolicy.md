@@ -59,6 +59,10 @@ Two properties are deliberate:
   for this case. A caller cannot ask for the old behavior, and nothing needs to be
   threaded through to get the new one. (This is the one thing worth taking from the
   Latin-1 proposal; see below.)
+
+  **Amended 2026-08-13.** This property no longer holds upstream: there is now one
+  process-global setting, off by default, and the bridge turns it on at init. The
+  behavior a bridge caller sees is unchanged. See "Amendment: the opt-in setting".
 - **Representation-honest.** `Value::Bytes` is distinct from `Value::String`, so the
   map from wire bytes to value stays injective and re-encoding is unambiguous. That
   is what preserves avrocpp's byte-exact round-trip.
@@ -92,7 +96,100 @@ Accepted costs, all three of which are real:
 Totality also removes the ability to *reject* non-UTF-8, since with the validate arm
 below a `Value::Bytes` will satisfy `Schema::String`. A future opt-in
 `RejectInvalidUtf8` for new call sites with no legacy data is a reasonable follow-up
-and is deliberately not built now.
+and is deliberately not built now. **Amended 2026-08-13:** built, but inverted. The
+setting gates acceptance rather than rejection, so rejection is the default and the
+old behavior is what a caller gets without asking. See the next section.
+
+## Amendment: the opt-in setting
+
+Added 2026-08-13, after a user asked whether a future consumer could use `avro_bridge`
+while keeping stock apache-avro UTF-8 enforcement.
+
+**Decision: one process-global setting, `util::set_non_utf8_string_as_bytes`, off by
+default upstream. The bridge turns it on during init.** Everything the Decision section
+says a bridge caller sees is unchanged; what changes is that the behavior is now
+something upstream ships as a choice rather than a redefinition.
+
+### Why a global rather than a per-reader option
+
+Not because a global is good. `SetMaxAllocationBytes` is already a set-once global and
+D9 records why that is awkward: a second library in the same process may want a
+different value and cannot have one. This inherits that.
+
+It is forced by where the decoders live. A per-reader option is easy in
+`rust/decode.rs`, which is ours, but `from_avro_datum_schemata` and
+`OwnedGenericDatumReader` take no options and `decode_internal` threads no
+configuration. A per-reader flag would therefore work on one of the three decode paths
+and not the other two, which is worse than no flag: it would make the three decoders
+disagree by construction, against migration success criterion 3. Adding a configuration
+parameter to those signatures is the change upstream is least likely to take, and it
+would cost the patch its "no public signature changes" property.
+
+The chosen shape copies `set_serde_human_readable` exactly, including returning the
+value actually in effect so a caller who requires the setting can check rather than
+assume.
+
+### Why off by default upstream, on in the bridge
+
+This is what makes the patch additive. Before it, invalid UTF-8 is an error; with the
+setting off, it still is, so no existing avro-rs consumer's behavior changes at all.
+The pitch to upstream becomes "here is a capability Java and avro-cpp already have,
+behind a switch" rather than "here is a change to the variant your callers receive for
+data they are already reading." The Java precedent (`Utf8` holds a raw `byte[]`;
+`toString` substitutes U+FFFD rather than throwing) is what makes acceptance
+reasonable; opt-in is what makes it safe.
+
+### Gating all four sites, not just decode
+
+An earlier version of this amendment proposed gating decode only, on the theory that a
+value decoded in accepting mode must stay writable even if the mode changes. With a
+set-once process global that cannot happen: the mode is fixed for the process, and a
+`Value::Bytes` at a `Schema::String` position can only exist in a process that has the
+setting on. So `validate`, `resolve_string`, and the encoder are gated too, which is
+what keeps the default a byte-for-byte behavioral no-op.
+
+### The ordering hazard, which is the real cost
+
+The setting is read on the first `string` decode, and a `OnceLock` cannot be rewritten.
+If anything in the process decodes before the bridge's init runs, the default locks in,
+the bridge silently gets strict behavior, and D1 data starts failing again with no
+signal that a setting was missed.
+
+Two consequences, both required rather than optional:
+
+1. The bridge must assert on the setter's return value at init, not call it and move
+   on. A mismatch means something already decoded, and that is a startup error.
+2. The runbook needs this next to D9's identical hazard, because the two globals fail
+   the same way for the same reason and will be debugged together.
+
+### Consequences for the three accepted costs
+
+The `IsString()`, `ToJsonString`, and dual-run normalization costs listed in the
+Decision section are unchanged for the bridge, which runs with the setting on. For a
+consumer who leaves it off, none of them apply, and neither does D1's tolerance. What
+is new is that the JSON type variation in cost 2 is now per deployment as well as per
+record, which strengthens rather than weakens the argument for implementing the real
+Avro JSON wire codec.
+
+### Testing
+
+A `OnceLock` cannot be reset within a process, so the two modes cannot share a test
+binary. Upstream already solved this: `serde_human_readable_true.rs` and
+`serde_human_readable_false.rs` are separate integration tests. The patch follows it,
+with the rejecting cases as unit tests in `decode.rs` and `types.rs` (default off) and
+the accepting cases in `avro/tests/non_utf8_string_as_bytes.rs`.
+
+For the bridge, this doubles the string-behavior matrix: three decoders times two
+settings. The migration's test port register should treat the setting-off column as
+"stock upstream behavior, no bridge-specific claims" rather than porting every case
+twice.
+
+### Still open
+
+Whether a single process ever needs both policies at once. A set-once global cannot
+express that, and no design here can without threading configuration through upstream's
+decode signatures. If that requirement appears, it reopens the per-reader option and
+the signature question with it.
 
 ## Rejected alternatives
 
@@ -252,6 +349,13 @@ at all.
 After stage 2 such a value can be read but not re-encoded or validated. Document
 that; do not leave it to be discovered.
 
+Since the 2026-08-13 amendment, both apache-avro sites are gated on
+`util::set_non_utf8_string_as_bytes`, so stage 2 also requires the bridge to enable it
+during init, before anything decodes, and to treat a returned `false` as a startup
+error rather than a warning. `rust/decode.rs` is ours and is not gated: it implements
+the policy directly. That asymmetry is deliberate and is the reason the setting is
+process-global rather than per reader.
+
 ### Stage 3: write and round-trip
 
 Only if dual-run shows read-modify-write call sites, or the product writes non-UTF-8
@@ -281,7 +385,9 @@ itself.
 ## Out of scope
 
 - `Lossy` / U+FFFD substitution, in any form.
-- An opt-in `RejectInvalidUtf8` strict mode. Reasonable later, not built now.
+- ~~An opt-in `RejectInvalidUtf8` strict mode. Reasonable later, not built now.~~
+  Built 2026-08-13, inverted: rejection is the default and acceptance is the opt-in.
+  See "Amendment: the opt-in setting".
 - Non-UTF-8 in *schema* JSON, which is a separate surface with its own rejection at
   `rust/schema.rs:99` and is not covered by D1.
 - Non-UTF-8 in map keys, record field names, and enum symbols. Same underlying

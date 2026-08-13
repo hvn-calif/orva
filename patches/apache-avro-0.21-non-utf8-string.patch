@@ -1,17 +1,21 @@
-From ebc96fa2bc9a9a2abe7cad1d97c8bcd1b43049be Mon Sep 17 00:00:00 2001
+From 6ce258cf1ca69d73ec04c370dd0107c8416e5bf7 Mon Sep 17 00:00:00 2001
 From: Viet Hung Nguyen <hvn@calif.io>
 Date: Mon, 10 Aug 2026 16:33:03 +0700
-Subject: [PATCH] feat: Decode a non-UTF-8 Avro string as Value::Bytes
+Subject: [PATCH] feat: Optionally decode a non-UTF-8 Avro string as
+ Value::Bytes
 
-Avro specifies `string` as UTF-8, but writers exist that never enforced it.
-avro-cpp is the one that matters in practice: its decoder copies the bytes
-into a byte-oriented `std::string` without validating, so a file it wrote can
-carry anything and its readers never noticed. Rejecting that input makes such
-data unreadable.
+Avro specifies `string` as UTF-8, but implementations exist that never enforced
+it. avro-cpp's decoder copies the bytes into a byte-oriented `std::string`
+without validating (`impl/BinaryDecoder.cc`), and Java's `Utf8` holds a raw
+`byte[]` that `toString` only converts lazily, so a file carrying such bytes
+round-trips through both and their readers never noticed. Rejecting that input
+makes such data unreadable here.
 
-Decode it to `Value::Bytes` instead of failing, and accept `Value::Bytes` at a
-`Schema::String` position in the three places that otherwise leave the
-tolerated value useless:
+Add `util::set_non_utf8_string_as_bytes`, off by default, so nothing changes for
+an existing caller unless they ask for it. With it on, a `string` whose bytes are
+not valid UTF-8 decodes to `Value::Bytes` instead of failing, and `Value::Bytes`
+is accepted at a `Schema::String` position in the three places that otherwise
+leave the accepted value useless:
 
   encode_internal  encodes identically to Value::String, a length prefix then
                    the bytes, so decode-then-re-encode is byte-exact
@@ -20,40 +24,51 @@ tolerated value useless:
 
 `Value::Bytes` rather than the bytes escaped into a `String`. Latin-1 is the
 tempting escape, but applied only to invalid input it is not injective: byte
-0xFF and the two bytes 0xC3 0xBF, the legitimate encoding of U+00FF, would
-both yield `Value::String("\u{ff}")`, leaving re-encoding no way to know which
-input to write back. Distinct variants keep that mapping injective, which is
-what makes the byte-exact round trip possible.
+0xFF and the two bytes 0xC3 0xBF, the legitimate encoding of U+00FF, would both
+yield `Value::String("\u{ff}")`, leaving re-encoding no way to know which input
+to write back. Distinct variants keep that mapping injective, which is what makes
+the byte-exact round trip possible.
 
-Map keys stay strict, since `Value::Map` is keyed by `String`. They are not
-decoded independently: `decode_internal` is called recursively with
+The setting follows `set_serde_human_readable`: a `OnceLock` written by the first
+caller and returning the value actually in effect, so a caller that requires it
+can check rather than assume. It is read on the first `string` decode, so it has
+to be set before decoding starts.
+
+Map keys stay strict either way, since `Value::Map` is keyed by `String`. They
+are not decoded independently: `decode_internal` is called recursively with
 `Schema::String` and the result matched for `Value::String`, so without an
-explicit arm a bad key would report `MapKeyType`, claiming the key is the
-wrong type rather than bad UTF-8. Uuid reads through `Schema::Bytes` and is
-untouched.
+explicit arm a bad key would report `MapKeyType`, claiming the key is the wrong
+type rather than bad UTF-8. Uuid reads through `Schema::Bytes` and is untouched.
 
-No public signature changes and no new error variants. Six tests; the existing
-suite passes unchanged.
+No public signature changes and no new error variants. The accepting cases live
+in their own test binary, as `serde_human_readable_true.rs` does, because the
+setting is set-once per process; the rejecting cases stay in the unit tests. The
+existing suite passes unchanged.
 ---
- avro/src/decode.rs | 91 ++++++++++++++++++++++++++++++++++++++++++++--
- avro/src/encode.rs |  8 +++-
- avro/src/types.rs  | 32 ++++++++++++++--
- 3 files changed, 122 insertions(+), 9 deletions(-)
+ avro/src/decode.rs                     |  87 +++++++++++++++-
+ avro/src/encode.rs                     |  10 +-
+ avro/src/types.rs                      |  34 ++++++-
+ avro/src/util.rs                       |  44 ++++++++
+ avro/tests/non_utf8_string_as_bytes.rs | 133 +++++++++++++++++++++++++
+ 5 files changed, 299 insertions(+), 9 deletions(-)
+ create mode 100644 avro/tests/non_utf8_string_as_bytes.rs
 
 diff --git a/avro/src/decode.rs b/avro/src/decode.rs
-index 78fefbd..7a1edce 100644
+index 78fefbd..2ecf497 100644
 --- a/avro/src/decode.rs
 +++ b/avro/src/decode.rs
-@@ -25,7 +25,7 @@ use crate::{
+@@ -25,8 +25,8 @@ use crate::{
          DecimalSchema, EnumSchema, FixedSchema, Name, Namespace, RecordSchema, ResolvedSchema,
          Schema,
      },
 -    types::Value,
+-    util::{safe_len, zag_i32, zag_i64},
 +    types::{Value, ValueKind},
-     util::{safe_len, zag_i32, zag_i64},
++    util::{non_utf8_string_as_bytes, safe_len, zag_i32, zag_i64},
  };
  use std::{
-@@ -176,9 +176,17 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
+     borrow::Borrow,
+@@ -176,9 +176,21 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
              let len = decode_len(reader)?;
              let mut buf = vec![0u8; len];
              match reader.read_exact(&mut buf) {
@@ -62,26 +77,32 @@ index 78fefbd..7a1edce 100644
 -                )),
 +                // Avro specifies `string` as UTF-8, but writers exist that
 +                // never enforced it (avro-cpp copies the bytes into a
-+                // byte-oriented `std::string` unchecked), so rejecting makes
-+                // their data unreadable. `Value::Bytes` rather than an escape
-+                // into `String`: keeping the variants distinct keeps the
-+                // wire-bytes-to-value mapping injective, so re-encoding is
-+                // unambiguous. `into_bytes` reuses the same buffer.
++                // byte-oriented `std::string` unchecked; Java's `Utf8` holds a
++                // raw `byte[]`), so rejecting makes their data unreadable.
++                // Opt-in, since accepting them changes the variant a caller
++                // gets: see `util::set_non_utf8_string_as_bytes`.
++                // `Value::Bytes` rather than an escape into `String`: keeping
++                // the variants distinct keeps the wire-bytes-to-value mapping
++                // injective, so re-encoding is unambiguous. `into_bytes`
++                // reuses the same buffer.
 +                Ok(_) => Ok(match String::from_utf8(buf) {
 +                    Ok(string) => Value::String(string),
-+                    Err(error) => Value::Bytes(error.into_bytes()),
++                    Err(error) if non_utf8_string_as_bytes() => Value::Bytes(error.into_bytes()),
++                    Err(error) => return Err(Details::ConvertToUtf8(error).into()),
 +                }),
                  Err(io_err) => {
                      if let ErrorKind::UnexpectedEof = io_err.kind() {
                          Ok(Value::Null)
-@@ -234,6 +242,16 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
+@@ -234,6 +246,18 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
                                  decode_internal(&inner.types, names, enclosing_namespace, reader)?;
                              items.insert(key, value);
                          }
 +                        // Keys stay strict: `Value::Map` is keyed by `String`,
 +                        // so there is nowhere to put raw bytes. Reports UTF-8
 +                        // rather than the `MapKeyType` below, which would say
-+                        // the key is the wrong type.
++                        // the key is the wrong type. Only reachable with
++                        // `non_utf8_string_as_bytes` enabled; without it the
++                        // key decode above already failed.
 +                        Value::Bytes(bytes) => {
 +                            return Err(match std::str::from_utf8(&bytes) {
 +                                Err(error) => Details::ConvertToUtf8Error(error).into(),
@@ -91,7 +112,7 @@ index 78fefbd..7a1edce 100644
                          value => return Err(Details::MapKeyType(value.into()).into()),
                      }
                  }
-@@ -872,4 +890,69 @@ mod tests {
+@@ -872,4 +896,57 @@ mod tests {
  
          Ok(())
      }
@@ -103,34 +124,23 @@ index 78fefbd..7a1edce 100644
 +        out
 +    }
 +
++    /// `non_utf8_string_as_bytes` is off unless a caller turns it on, so the
++    /// behaviour every previous release had is what these tests see. The
++    /// accepting side lives in `tests/non_utf8_string_as_bytes.rs`, which needs
++    /// a process of its own because the setting is set-once.
 +    #[test]
-+    fn test_decode_invalid_utf8_string_as_bytes() -> TestResult {
++    fn test_decode_invalid_utf8_string_errors_by_default() {
 +        let datum = string_datum(&[0xff, 0xfe]);
-+        assert_eq!(
-+            decode(&Schema::String, &mut &datum[..])?,
-+            Value::Bytes(vec![0xff, 0xfe])
++
++        let error = decode(&Schema::String, &mut &datum[..])
++            .expect_err("a non-UTF-8 string must fail with the setting off");
++        assert!(
++            error.to_string().to_lowercase().contains("utf-8"),
++            "unexpected error: {error}"
 +        );
-+
-+        Ok(())
 +    }
 +
-+    /// Why `Value::Bytes` and not the bytes escaped into a `String`: under
-+    /// Latin-1, byte 0xFF and the two bytes 0xC3 0xBF (the legitimate encoding
-+    /// of U+00FF) would both give `Value::String("\u{ff}")`, leaving
-+    /// re-encoding no way to know which input to write back.
-+    #[test]
-+    fn test_decode_invalid_utf8_does_not_collide_with_valid_encoding() -> TestResult {
-+        let invalid = decode(&Schema::String, &mut &string_datum(&[0xff])[..])?;
-+        let valid = decode(&Schema::String, &mut &string_datum(&[0xc3, 0xbf])[..])?;
-+
-+        assert_ne!(invalid, valid);
-+        assert_eq!(invalid, Value::Bytes(vec![0xff]));
-+        assert_eq!(valid, Value::String("\u{ff}".to_string()));
-+
-+        Ok(())
-+    }
-+
-+    /// Keys stay strict, and the error names UTF-8.
++    /// Keys stay strict with the setting either way, and the error names UTF-8.
 +    #[test]
 +    fn test_decode_invalid_utf8_map_key_still_fails() {
 +        let schema = Schema::map(Schema::Int);
@@ -146,50 +156,64 @@ index 78fefbd..7a1edce 100644
 +        );
 +    }
 +
-+    /// The point of tolerating the value: it survives a re-encode unchanged.
++    /// With the setting off, a `Value::Bytes` is not encodable at a
++    /// `Schema::String` position either, so the pair stays symmetric.
 +    #[test]
-+    fn test_invalid_utf8_string_round_trips_byte_for_byte() -> TestResult {
-+        let datum = string_datum(&[0xff, 0x00, 0xfe]);
-+        let decoded = decode(&Schema::String, &mut &datum[..])?;
++    fn test_encode_bytes_as_string_errors_by_default() {
++        let mut buffer = Vec::new();
 +
-+        let mut reencoded = Vec::new();
-+        encode(&decoded, &Schema::String, &mut reencoded)
-+            .expect(&success(&decoded, &Schema::String));
-+
-+        assert_eq!(reencoded, datum);
-+
-+        Ok(())
++        encode(
++            &Value::Bytes(vec![0xff, 0xfe]),
++            &Schema::String,
++            &mut buffer,
++        )
++        .expect_err("Value::Bytes must not encode as a string with the setting off");
 +    }
  }
 diff --git a/avro/src/encode.rs b/avro/src/encode.rs
-index 38203f9..de43768 100644
+index 38203f9..43de560 100644
 --- a/avro/src/encode.rs
 +++ b/avro/src/encode.rs
-@@ -160,13 +160,17 @@ pub(crate) fn encode_internal<W: Write, S: Borrow<Schema>>(
-                 .map_err(|e| Details::WriteBytes(e).into())
+@@ -24,7 +24,7 @@ use crate::{
+         Schema, SchemaKind, UnionSchema,
+     },
+     types::{Value, ValueKind},
+-    util::{zig_i32, zig_i64},
++    util::{non_utf8_string_as_bytes, zig_i32, zig_i64},
+ };
+ use log::error;
+ use std::{borrow::Borrow, collections::HashMap, io::Write};
+@@ -161,9 +161,17 @@ pub(crate) fn encode_internal<W: Write, S: Borrow<Schema>>(
          }
          Value::Bytes(bytes) => match *schema {
--            Schema::Bytes => encode_bytes(bytes, writer),
+             Schema::Bytes => encode_bytes(bytes, writer),
 +            // A `Value::Bytes` from the tolerated `Schema::String` decode
 +            // (see decode.rs) has to be writable again, or such data could be
 +            // read but never round-tripped. Both encode identically anyway:
 +            // length prefix, then raw bytes.
-+            Schema::Bytes | Schema::String => encode_bytes(bytes, writer),
++            Schema::String if non_utf8_string_as_bytes() => encode_bytes(bytes, writer),
              Schema::Fixed { .. } => writer
                  .write(bytes.as_slice())
                  .map_err(|e| Details::WriteBytes(e).into()),
++            // The list stays Bytes and Fixed: with the setting off, a
++            // `Schema::String` reaches here and is not supported, and with it
++            // on the arm above already took it.
              _ => Err(Details::EncodeValueAsSchemaError {
                  value_kind: ValueKind::Bytes,
--                supported_schema: vec![SchemaKind::Bytes, SchemaKind::Fixed],
-+                supported_schema: vec![SchemaKind::Bytes, SchemaKind::String, SchemaKind::Fixed],
-             }
-             .into()),
-         },
+                 supported_schema: vec![SchemaKind::Bytes, SchemaKind::Fixed],
 diff --git a/avro/src/types.rs b/avro/src/types.rs
-index 4448eef..e92e39d 100644
+index 4448eef..c88fc01 100644
 --- a/avro/src/types.rs
 +++ b/avro/src/types.rs
-@@ -446,6 +446,11 @@ impl Value {
+@@ -26,6 +26,7 @@ use crate::{
+         DecimalSchema, EnumSchema, FixedSchema, Name, Namespace, Precision, RecordField,
+         RecordSchema, ResolvedSchema, Scale, Schema, SchemaKind, UnionSchema,
+     },
++    util::non_utf8_string_as_bytes,
+ };
+ use bigdecimal::BigDecimal;
+ use log::{debug, error};
+@@ -446,6 +447,11 @@ impl Value {
              (&Value::Float(_), &Schema::Double) => None,
              (&Value::Double(_), &Schema::Double) => None,
              (&Value::Bytes(_), &Schema::Bytes) => None,
@@ -197,11 +221,11 @@ index 4448eef..e92e39d 100644
 +            // `Value::Bytes` (see decode.rs), so such a value has to validate
 +            // against the schema it was decoded from. Without this a decoded
 +            // datum could not be handed back to the writer that produced it.
-+            (&Value::Bytes(_), &Schema::String) => None,
++            (&Value::Bytes(_), &Schema::String) if non_utf8_string_as_bytes() => None,
              (&Value::Bytes(_), &Schema::Decimal { .. }) => None,
              (&Value::String(_), &Schema::String) => None,
              (&Value::String(_), &Schema::Uuid) => None,
-@@ -951,9 +956,13 @@ impl Value {
+@@ -951,9 +957,15 @@ impl Value {
      fn resolve_string(self) -> Result<Self, Error> {
          match self {
              Value::String(s) => Ok(Value::String(s)),
@@ -209,39 +233,241 @@ index 4448eef..e92e39d 100644
 -                String::from_utf8(bytes).map_err(Details::ConvertToUtf8)?,
 -            )),
 +            // Valid bytes still become a `String`, the evolution this always
-+            // performed. Invalid ones stay `Bytes` rather than failing, so
-+            // resolution is not what makes a tolerated value unusable.
++            // performed. With the setting on, invalid ones stay `Bytes` rather
++            // than failing, so resolution is not what makes a tolerated value
++            // unusable.
 +            Value::Bytes(bytes) | Value::Fixed(_, bytes) => Ok(match String::from_utf8(bytes) {
 +                Ok(string) => Value::String(string),
-+                Err(error) => Value::Bytes(error.into_bytes()),
++                Err(error) if non_utf8_string_as_bytes() => Value::Bytes(error.into_bytes()),
++                Err(error) => return Err(Details::ConvertToUtf8(error).into()),
 +            }),
              other => Err(Details::GetString(other).into()),
          }
      }
-@@ -1682,6 +1691,23 @@ Field with name '"b"' is not a member of the map items"#,
+@@ -1682,6 +1694,22 @@ Field with name '"b"' is not a member of the map items"#,
          Ok(())
      }
  
++    /// Both of these accept the value once `non_utf8_string_as_bytes` is on;
++    /// see `tests/non_utf8_string_as_bytes.rs`. Off, they behave as before.
 +    #[test]
-+    fn validate_invalid_utf8_string_as_bytes() {
++    fn validate_invalid_utf8_bytes_at_a_string_position_requires_opt_in() {
 +        let value = Value::Bytes(vec![0xff, 0xfe]);
-+        assert!(value.validate(&Schema::String));
++        assert!(!value.validate(&Schema::String));
 +    }
 +
 +    #[test]
-+    fn resolve_string_keeps_invalid_utf8_as_bytes() -> TestResult {
++    fn resolve_string_invalid_utf8_errors_by_default() {
 +        let value = Value::Bytes(vec![0xff, 0xfe]);
-+        assert_eq!(
-+            value.resolve(&Schema::String)?,
-+            Value::Bytes(vec![0xff, 0xfe])
-+        );
-+
-+        Ok(())
++        value
++            .resolve(&Schema::String)
++            .expect_err("invalid UTF-8 must not resolve to a string with the setting off");
 +    }
 +
      #[test]
      fn resolve_string_from_bytes() -> TestResult {
          let value = Value::Bytes(vec![97, 98, 99]);
+diff --git a/avro/src/util.rs b/avro/src/util.rs
+index 1c986f4..a683deb 100644
+--- a/avro/src/util.rs
++++ b/avro/src/util.rs
+@@ -39,6 +39,15 @@ pub(crate) static SERDE_HUMAN_READABLE: OnceLock<bool> = OnceLock::new();
+ /// Whether the serializer and deserializer should indicate to types that the format is human-readable.
+ pub const DEFAULT_SERDE_HUMAN_READABLE: bool = false;
+ 
++/// Whether a `string` whose wire bytes are not valid UTF-8 decodes to
++/// [`Value::Bytes`](crate::types::Value::Bytes) instead of failing.
++/// See [set_non_utf8_string_as_bytes] to change this value.
++// crate-visible for testing
++pub(crate) static NON_UTF8_STRING_AS_BYTES: OnceLock<bool> = OnceLock::new();
++/// Off by default: a non-UTF-8 `string` is an error, which is what the Avro
++/// specification calls for and what every previous release did.
++pub const DEFAULT_NON_UTF8_STRING_AS_BYTES: bool = false;
++
+ pub(crate) trait MapHelper {
+     fn string(&self, key: &str) -> Option<String>;
+ 
+@@ -190,6 +199,41 @@ pub(crate) fn is_human_readable() -> bool {
+     *SERDE_HUMAN_READABLE.get_or_init(|| DEFAULT_SERDE_HUMAN_READABLE)
+ }
+ 
++/// Set whether a `string` whose wire bytes are not valid UTF-8 decodes to
++/// [`Value::Bytes`](crate::types::Value::Bytes) rather than failing.
++///
++/// Avro specifies `string` as UTF-8, but implementations exist that never enforced it:
++/// avro-cpp copies the bytes into a byte-oriented `std::string` unchecked, and Java's
++/// `Utf8` holds a raw `byte[]` that is only converted lazily. Files carrying such bytes
++/// round-trip through both, and rejecting them makes that data unreadable. Enabling this
++/// accepts them here too, keeping the bytes in a distinct variant so that re-encoding
++/// writes back exactly what was read.
++///
++/// With it enabled, `Value::Bytes` is also accepted at a `Schema::String` position by
++/// [`Value::validate`](crate::types::Value::validate), by `resolve`, and by the encoder,
++/// so a tolerated value stays usable. Note that the decoded variant then depends on the
++/// data: a single `string` field can yield `Value::String` for one record and
++/// `Value::Bytes` for the next.
++///
++/// Map keys are unaffected and stay strict, since `Value::Map` is keyed by `String`.
++///
++/// This function only changes the setting once. On subsequent calls the value will stay
++/// the same as the first time it is called, and it is read on the first decode of a
++/// `string`, so it must be called before any decoding happens. It defaults to
++/// [`DEFAULT_NON_UTF8_STRING_AS_BYTES`].
++///
++/// # Returns
++/// The configured value, which might be different from what the function was called
++/// with if the value was already set before. Callers that require the setting should
++/// check the returned value rather than assume it took effect.
++pub fn set_non_utf8_string_as_bytes(as_bytes: bool) -> bool {
++    *NON_UTF8_STRING_AS_BYTES.get_or_init(|| as_bytes)
++}
++
++pub(crate) fn non_utf8_string_as_bytes() -> bool {
++    *NON_UTF8_STRING_AS_BYTES.get_or_init(|| DEFAULT_NON_UTF8_STRING_AS_BYTES)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/avro/tests/non_utf8_string_as_bytes.rs b/avro/tests/non_utf8_string_as_bytes.rs
+new file mode 100644
+index 0000000..b4dac53
+--- /dev/null
++++ b/avro/tests/non_utf8_string_as_bytes.rs
+@@ -0,0 +1,133 @@
++// Licensed to the Apache Software Foundation (ASF) under one
++// or more contributor license agreements.  See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership.  The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License.  You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//! The accepting side of `util::set_non_utf8_string_as_bytes`.
++//!
++//! The setting is set-once per process, so these live in their own test binary
++//! rather than beside the rejecting cases in `src/decode.rs` and `src/types.rs`.
++//! This follows `tests/serde_human_readable_true.rs`.
++
++use apache_avro::{
++    Schema, from_avro_datum, to_avro_datum, types::Value, util::set_non_utf8_string_as_bytes,
++};
++use apache_avro_test_helper::TestResult;
++
++/// Every test in this binary needs the setting on. Calling it more than once is
++/// harmless (first call wins), and the return value is the setting in effect,
++/// which is what a caller who requires it should be checking.
++fn enable() {
++    assert!(
++        set_non_utf8_string_as_bytes(true),
++        "the setting must be in effect for this test binary"
++    );
++}
++
++/// One Avro `string`: zigzag length prefix, then the payload. Only single-byte
++/// prefixes, which covers every payload below.
++fn string_datum(payload: &[u8]) -> Vec<u8> {
++    assert!(payload.len() < 64, "length would need a longer varint");
++    let mut out = vec![(payload.len() as u8) << 1];
++    out.extend_from_slice(payload);
++    out
++}
++
++fn decode(schema: &Schema, datum: &[u8]) -> Result<Value, apache_avro::Error> {
++    from_avro_datum(schema, &mut &datum[..], None)
++}
++
++#[test]
++fn invalid_utf8_string_decodes_as_bytes() -> TestResult {
++    enable();
++
++    assert_eq!(
++        decode(&Schema::String, &string_datum(&[0xff, 0xfe]))?,
++        Value::Bytes(vec![0xff, 0xfe])
++    );
++
++    Ok(())
++}
++
++/// Why `Value::Bytes` and not the bytes escaped into a `String`: under Latin-1,
++/// byte 0xFF and the two bytes 0xC3 0xBF (the legitimate encoding of U+00FF)
++/// would both give `Value::String("\u{ff}")`, leaving re-encoding no way to know
++/// which input to write back.
++#[test]
++fn invalid_utf8_does_not_collide_with_a_valid_encoding() -> TestResult {
++    enable();
++
++    let invalid = decode(&Schema::String, &string_datum(&[0xff]))?;
++    let valid = decode(&Schema::String, &string_datum(&[0xc3, 0xbf]))?;
++
++    assert_ne!(invalid, valid);
++    assert_eq!(invalid, Value::Bytes(vec![0xff]));
++    assert_eq!(valid, Value::String("\u{ff}".to_string()));
++
++    Ok(())
++}
++
++/// The point of accepting the value: it survives a re-encode unchanged.
++#[test]
++fn invalid_utf8_string_round_trips_byte_for_byte() -> TestResult {
++    enable();
++
++    let datum = string_datum(&[0xff, 0x00, 0xfe]);
++    let decoded = decode(&Schema::String, &datum)?;
++
++    assert_eq!(to_avro_datum(&Schema::String, decoded)?, datum);
++
++    Ok(())
++}
++
++/// `validate` and `resolve` accept it too, so a decoded datum can go back to the
++/// writer that produced it.
++#[test]
++fn bytes_validate_and_resolve_at_a_string_position() -> TestResult {
++    enable();
++
++    let value = Value::Bytes(vec![0xff, 0xfe]);
++    assert!(value.validate(&Schema::String));
++    assert_eq!(
++        value.resolve(&Schema::String)?,
++        Value::Bytes(vec![0xff, 0xfe])
++    );
++
++    // Valid bytes still become a `String`, the resolution this always performed.
++    assert_eq!(
++        Value::Bytes(b"abc".to_vec()).resolve(&Schema::String)?,
++        Value::String("abc".to_string())
++    );
++
++    Ok(())
++}
++
++/// Map keys stay strict even with the setting on, because `Value::Map` is keyed
++/// by `String`. The error names UTF-8 rather than claiming a wrong key type.
++#[test]
++fn invalid_utf8_map_key_still_fails() {
++    enable();
++
++    let schema = Schema::map(Schema::Int);
++    let mut datum = vec![0x02];
++    datum.extend_from_slice(&string_datum(&[0xff]));
++    datum.push(0x02);
++    datum.push(0x00);
++
++    let error = decode(&schema, &datum).expect_err("a non-UTF-8 map key must fail");
++    assert!(
++        error.to_string().to_lowercase().contains("utf-8"),
++        "unexpected error: {error}"
++    );
++}
 -- 
 2.52.0
 
