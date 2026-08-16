@@ -1,7 +1,9 @@
 # Findings from the first differential fuzzing run
 
 Baseline: worktree at `84ce4af`, avro-cpp `release-1.11.4`, empty suppression
-file, unit-test mode (about one second per property, single core).
+file. Findings 1, 3 and 4 came from unit-test mode (about one second per
+property, single core); finding 2 from a coverage-guided run at ~9,000
+executions per second.
 
 Each finding below was reached **cold from an empty corpus**, with no seed
 directing the fuzzer toward it.
@@ -46,7 +48,7 @@ investigated", so they are new information rather than rediscovery.
 
 ### 1. `CanonicalForm()` is not canonical for a logical type on a primitive
 
-**The most consequential of the three.**
+**The most consequential of the four.**
 
 ```
 schema:         {"type":"int","logicalType":"time-millis"}
@@ -74,7 +76,38 @@ affected, which is most real schemas.
 
 Pinned by `Differential.CanonicalFormIsNotCanonicalForLogicalTypes`.
 
-### 2. avro-cpp accepts a malformed namespace
+### 2. apache-avro panics on a schema that defines a name twice
+
+Found by `DatumCircleAgrees` under coverage-guided fuzzing, within a second.
+
+```
+{"type":"record","name":"foo","namespace":"ns","fields":[
+  {"name":"a","type":{"type":"record","name":"foo","namespace":"ns","fields":[]}}]}
+```
+
+Defining `ns.foo` twice is illegal Avro -- a name may be defined once. **Both**
+engines nevertheless accept it at parse time; that was worth checking rather
+than assuming, and avro-cpp accepts it too. The divergence is what happens
+next. avro-cpp carries on; apache-avro 0.21 panics at *encode* time:
+
+```
+apache-avro-0.21.0/src/types.rs:369
+Schemata didn't successfully resolve: Two named schema defined for same fullname: ns.foo
+```
+
+Two problems on the bridge side. The schema should have been rejected at parse
+time rather than accepted and blown up later, and a malformed schema should
+produce an error rather than a panic.
+
+`catch_panic` contains it, so the process survives and the caller gets an
+`absl::Status`. But that guard is the only thing standing between an untrusted
+schema and a process abort, and `rust/vec_u8.rs` already warns that apache-avro
+panics on some malformed input. Any entry point missing the guard is a denial
+of service on attacker-supplied schemas.
+
+Pinned by `Differential.DuplicateFullNameParsesThenPanicsOnEncode`.
+
+### 3. avro-cpp accepts a malformed namespace
 
 ```
 schema: {"type":"fixed","name":"B","namespace":"ns..bad","size":16}
@@ -89,7 +122,7 @@ avro-cpp will ingest schemas that other Avro implementations reject -- data
 written under such a schema may not be readable elsewhere. Arguably an avro-cpp
 bug to report upstream rather than a bridge one.
 
-### 3. The bridge rejects uuid text avro-cpp keeps verbatim
+### 4. The bridge rejects uuid text avro-cpp keeps verbatim
 
 ```
 schema: {"type":"string","logicalType":"uuid"}

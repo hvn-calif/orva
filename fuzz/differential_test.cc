@@ -340,6 +340,61 @@ TEST(Differential, CanonicalFormIsNotCanonicalForLogicalTypes) {
   EXPECT_NE(annotated->FingerprintRabin(), plain->FingerprintRabin());
 }
 
+// NEW FINDING, found by DatumCircleAgrees under coverage-guided fuzzing.
+//
+// A schema that defines the same full name twice is illegal Avro -- a name may
+// be defined once. apache-avro 0.21 nevertheless *parses* it, and only blows up
+// later, at encode time, with a panic rather than an error:
+//
+//   apache-avro-0.21.0/src/types.rs:369
+//   Schemata didn't successfully resolve: Two named schema defined for same
+//   fullname: ns.foo
+//
+// Both engines accept the illegal schema -- avro-cpp too, which was worth
+// checking rather than assuming. The divergence is in what happens next:
+// avro-cpp carries on, apache-avro panics.
+//
+// Two problems on the bridge side. The schema should have been rejected at
+// parse time, and a malformed one should yield an error rather than a panic.
+// catch_panic contains it, so the process survives and the caller sees an
+// absl::Status -- but that guard is the only thing between an untrusted schema
+// and an abort, and any entry point missing it is a denial of service.
+TEST(Differential, DuplicateFullNameParsesThenPanicsOnEncode) {
+  const std::string schema_json =
+      R"({"type":"record","name":"foo","namespace":"ns","fields":[)"
+      R"({"name":"a","type":{"type":"record","name":"foo","namespace":"ns",)"
+      R"("fields":[]}}]})";
+
+  auto bridge_schema = AvroSchema::Parse(schema_json);
+  // Parsing succeeds even though the schema is illegal.
+  ASSERT_TRUE(bridge_schema.ok())
+      << "if this now fails, apache-avro rejects duplicate full names at parse "
+         "time and the finding is fixed";
+
+  AvroValue outer = AvroValue::CreateRecord();
+  AvroValue inner = AvroValue::CreateRecord();
+  ASSERT_TRUE(outer.RecordPut("a", inner).ok());
+
+  auto encoded = security::avro::EncodeDatum(*bridge_schema, outer);
+  ASSERT_FALSE(encoded.ok()) << "encoding an illegal schema should not succeed";
+  EXPECT_NE(std::string(encoded.status().message())
+                .find("Rust panic caught while processing Avro input"),
+            std::string::npos)
+      << "expected a contained panic, got: " << encoded.status().message();
+
+  // avro-cpp accepts it too, so neither engine enforces the uniqueness rule at
+  // parse time. Only apache-avro turns that into a panic later.
+  CppOutcome parsed = CallAvrocpp("compileJsonSchemaFromMemory", [&] {
+    ::avro::compileJsonSchemaFromMemory(
+        reinterpret_cast<const uint8_t*>(schema_json.data()),
+        schema_json.size());
+  });
+  EXPECT_TRUE(parsed.ok())
+      << "if avro-cpp now rejects duplicate full names, the two engines have "
+         "stopped agreeing at parse time and this finding needs revisiting: "
+      << parsed.what;
+}
+
 // The harness's own sanity check: a plain record must survive the full circle.
 // If this fails, a lowering is wrong and every other result is suspect.
 TEST(Differential, SimpleRecordSurvivesTheCircle) {
