@@ -12,3 +12,7 @@ rust/target/
 # already existing elements were commented out
 
 #/target
+
+# ANTLR (pulled in by FuzzTest) writes its runtime libraries here during the
+# build, into the source tree rather than the build directory.
+/dist/

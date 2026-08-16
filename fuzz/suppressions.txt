@@ -1,0 +1,22 @@
+# Divergences muted for this tree. One ID per line; '#' starts a comment.
+#
+# A line may narrow a coarse ID to one substring of the finding's detail text:
+#
+#     DECODE_VERDICT_BRIDGE_LENIENT:array continuation
+#
+# Adding a line requires a rationale and, where one exists, the matching ID
+# from doc/AvrocppDivergences.md. An unknown ID is a fatal startup error, not a
+# silent no-op, so a typo cannot leave you believing something was muted.
+#
+# Two mechanisms read this file. Divergences that are a property of the input
+# (D1, D2) are removed by Normalize before either lowering runs, so both
+# engines provably see identical bytes and a suppression can never manufacture
+# a false agreement. Everything else is skipped at comparison time.
+#
+#
+# EMPTY OF ENTRIES ON PURPOSE.
+#
+# This worktree is pinned at 84ce4af, where D1 (non-UTF-8 strings) and D2
+# (duplicate map keys) are open bugs -- both were fixed twelve commits later by
+# efb7162. The harness proving itself means finding both from an empty corpus
+# without being told to look for them. Do not add them to make a run green.
