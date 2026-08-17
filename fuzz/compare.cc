@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "absl/strings/escaping.h"
 #include "avro/GenericDatum.hh"
 #include "avro/LogicalType.hh"
 #include "avro/Types.hh"
@@ -16,21 +17,6 @@ namespace security::avro_fuzz {
 namespace {
 
 using ::security::avro::AvroValue;
-
-std::string Hex(const std::string& raw) {
-  static const char* kDigits = "0123456789abcdef";
-  std::string out;
-  out.reserve(raw.size() * 2);
-  for (unsigned char c : raw) {
-    out += kDigits[c >> 4];
-    out += kDigits[c & 0xF];
-  }
-  return out;
-}
-
-std::string Hex(const std::vector<uint8_t>& raw) {
-  return Hex(std::string(raw.begin(), raw.end()));
-}
 
 // Drops redundant sign bytes from a two's-complement big-endian integer, so two
 // encodings of the same number compare equal on value even when their lengths
@@ -219,11 +205,13 @@ void Comparer::CompareMap(const AvroValue& bridge,
   for (const auto& entry : entries) {
     auto value = bridge.GetMapValue(entry.first);
     if (!value.ok()) {
-      Report(DivergenceId::kMapKeySet, Step(path, "{\"" + Hex(entry.first) + "\"}"),
+      Report(DivergenceId::kMapKeySet,
+             Step(path, "{\"" + absl::BytesToHexString(entry.first) + "\"}"),
              "the bridge has no such key");
       continue;
     }
-    Compare(*value, entry.second, Step(path, "{\"" + Hex(entry.first) + "\"}"));
+    Compare(*value, entry.second,
+            Step(path, "{\"" + absl::BytesToHexString(entry.first) + "\"}"));
   }
 }
 
@@ -416,16 +404,17 @@ void Comparer::Compare(const AvroValue& bridge_in,
         // exactly how D1 would be hidden.
         Report(DivergenceId::kStringBytesTypeMismatch, here,
                "avro-cpp holds a string of " + std::to_string(theirs.size()) +
-                   " bytes (" + Hex(theirs) + ") but the bridge holds " +
-                   bridge->TypeName(),
+                   " bytes (" + absl::BytesToHexString(theirs) +
+                   ") but the bridge holds " + bridge->TypeName(),
                "string vs bytes");
         return;
       }
       const std::string ours = TextOf(*bridge);
       if (ours != theirs) {
         Report(DivergenceId::kScalarValue, here,
-               "string payloads differ: bridge " + Hex(ours) + ", avro-cpp " +
-                   Hex(theirs));
+               "string payloads differ: bridge " +
+                   absl::BytesToHexString(ours) + ", avro-cpp " +
+                   absl::BytesToHexString(theirs));
       }
       return;
     }
@@ -437,13 +426,15 @@ void Comparer::Compare(const AvroValue& bridge_in,
         const std::string ours = TextOf(*bridge);
         if (MinimalTwosComplement(ours) != MinimalTwosComplement(theirs_text)) {
           Report(DivergenceId::kDecimalValue, here,
-                 "decimal values differ: bridge " + Hex(ours) + ", avro-cpp " +
-                     Hex(theirs_text));
+                 "decimal values differ: bridge " +
+                     absl::BytesToHexString(ours) + ", avro-cpp " +
+                     absl::BytesToHexString(theirs_text));
         } else if (ours != theirs_text) {
           Report(DivergenceId::kDecimalSignPadding, here,
                  "decimals are numerically equal but padded differently: "
                  "bridge " +
-                     Hex(ours) + ", avro-cpp " + Hex(theirs_text),
+                     absl::BytesToHexString(ours) + ", avro-cpp " +
+                     absl::BytesToHexString(theirs_text),
                  "decimal padding");
         }
         return;
@@ -457,8 +448,8 @@ void Comparer::Compare(const AvroValue& bridge_in,
       const std::string ours = TextOf(*bridge);
       if (ours != theirs_text) {
         Report(DivergenceId::kScalarValue, here,
-               "bytes differ: bridge " + Hex(ours) + ", avro-cpp " +
-                   Hex(theirs_text));
+               "bytes differ: bridge " + absl::BytesToHexString(ours) +
+                   ", avro-cpp " + absl::BytesToHexString(theirs_text));
       }
       return;
     }
@@ -503,8 +494,9 @@ void Comparer::Compare(const AvroValue& bridge_in,
       if (cpp_logical == ::avro::LogicalType::DECIMAL || bridge->IsDecimal()) {
         if (MinimalTwosComplement(ours) != MinimalTwosComplement(theirs_text)) {
           Report(DivergenceId::kDecimalValue, here,
-                 "fixed-backed decimal values differ: bridge " + Hex(ours) +
-                     ", avro-cpp " + Hex(theirs_text));
+                 "fixed-backed decimal values differ: bridge " +
+                     absl::BytesToHexString(ours) + ", avro-cpp " +
+                     absl::BytesToHexString(theirs_text));
         } else if (ours.size() != theirs_text.size()) {
           Report(DivergenceId::kDecimalSignPadding, here,
                  "fixed-backed decimal lengths differ: bridge " +
@@ -522,8 +514,8 @@ void Comparer::Compare(const AvroValue& bridge_in,
       }
       if (ours != theirs_text) {
         Report(DivergenceId::kScalarValue, here,
-               "fixed payloads differ: bridge " + Hex(ours) + ", avro-cpp " +
-                   Hex(theirs_text));
+               "fixed payloads differ: bridge " + absl::BytesToHexString(ours) +
+                   ", avro-cpp " + absl::BytesToHexString(theirs_text));
       }
       return;
     }

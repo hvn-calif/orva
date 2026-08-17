@@ -6,6 +6,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/escaping.h"
 #include "avro_bridge.h"
 #include "fuzz/ir.h"
 #include "fuzz/suppress.h"
@@ -14,19 +15,6 @@ namespace security::avro_fuzz {
 namespace {
 
 using ::security::avro::AvroValue;
-
-// Renders bytes as hex so a non-UTF-8 payload cannot corrupt a failure message
-// or make two failures look different when they are the same.
-std::string Hex(const std::string& raw) {
-  static const char* kDigits = "0123456789abcdef";
-  std::string out;
-  out.reserve(raw.size() * 2);
-  for (unsigned char c : raw) {
-    out += kDigits[c >> 4];
-    out += kDigits[c & 0xF];
-  }
-  return out;
-}
 
 std::string Extend(const std::string& path, const std::string& step) {
   return path + step;
@@ -74,13 +62,14 @@ absl::StatusOr<AvroValue> LowerMap(const Node& node, const std::string& path,
   std::set<std::string> seen;
   for (size_t i = 0; i < node.children.size(); ++i) {
     const std::string key = KeyAt(node, i);
-    const std::string here = Extend(path, "{\"" + Hex(key) + "\"}");
+    const std::string here =
+        Extend(path, "{\"" + absl::BytesToHexString(key) + "\"}");
 
     if (!seen.insert(key).second) {
       // D2. avro-cpp's GenericMap is a vector of pairs and keeps both entries;
       // the bridge's HashMap collapses them and silently loses one.
       log->Report(DivergenceId::kD2DuplicateMapKey, here,
-                  "duplicate map key " + Hex(key) +
+                  "duplicate map key " + absl::BytesToHexString(key) +
                       ": the bridge collapses it (last write wins), avro-cpp "
                       "keeps both entries",
                   "duplicate map key");
@@ -132,8 +121,9 @@ absl::StatusOr<AvroValue> Lower(const Node& node, const std::string& path,
       // divergence -- the read side surfaces when avro-cpp encodes such a
       // string and the bridge decodes it.
       log->Report(DivergenceId::kD1StringNotUtf8, path,
-                  "the bridge rejected string bytes " + Hex(node.scalars.blob) +
-                      " (" + std::string(value.status().message()) +
+                  "the bridge rejected string bytes " +
+                      absl::BytesToHexString(node.scalars.blob) + " (" +
+                      std::string(value.status().message()) +
                       "); avro-cpp stores them verbatim",
                   "non-utf8 string");
       return value.status();
@@ -143,7 +133,8 @@ absl::StatusOr<AvroValue> Lower(const Node& node, const std::string& path,
       auto value = AvroValue::CreateUuid(node.scalars.blob);
       if (value.ok()) return value;
       log->Report(DivergenceId::kUuidInvalidRejected, path,
-                  "the bridge rejected uuid text " + Hex(node.scalars.blob) +
+                  "the bridge rejected uuid text " +
+                      absl::BytesToHexString(node.scalars.blob) +
                       "; avro-cpp keeps the string as written",
                   "invalid uuid");
       return value.status();

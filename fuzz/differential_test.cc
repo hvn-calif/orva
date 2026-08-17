@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "absl/status/statusor.h"
+#include "absl/strings/escaping.h"
 #include "avro/Compiler.hh"
 #include "avro/Decoder.hh"
 #include "avro/Encoder.hh"
@@ -47,16 +48,6 @@ const bool kAllocationCeilingSet = [] {
   security::avro::SetMaxAllocationBytes(64u << 20);
   return true;
 }();
-
-std::string Hex(const std::string& raw) {
-  static const char* kDigits = "0123456789abcdef";
-  std::string out;
-  for (unsigned char c : raw) {
-    out += kDigits[c >> 4];
-    out += kDigits[c & 0xF];
-  }
-  return out;
-}
 
 // A clean absl::Status whose text says apache-avro panicked is still a
 // finding: the panic was contained at the FFI boundary, but it happened.
@@ -169,10 +160,11 @@ void DatumCircleAgrees(const Node& raw) {
     ::avro::GenericDatum round_tripped;
     CppOutcome read = DecodeWithAvrocpp(cpp_schema, *bridge_bytes, &round_tripped);
     if (!read.ok()) {
-      log.Report(DivergenceId::kBridgeCannotRepresent, "$",
-                 "avro-cpp could not decode bytes the bridge encoded: " +
-                     read.what + " [" + Hex(*bridge_bytes) + "]",
-                 "avrocpp rejected bridge output");
+      log.Report(
+          DivergenceId::kBridgeCannotRepresent, "$",
+          "avro-cpp could not decode bytes the bridge encoded: " + read.what +
+              " [" + absl::BytesToHexString(*bridge_bytes) + "]",
+          "avrocpp rejected bridge output");
     } else {
       CompareValues(*bridge_value, round_tripped, &log);
     }
@@ -192,7 +184,7 @@ void DatumCircleAgrees(const Node& raw) {
       log.Report(DivergenceId::kDecodeVerdictAvrocppLenient, "$",
                  "the bridge rejected bytes avro-cpp encoded: " +
                      std::string(decoded.status().message()) + " [" +
-                     Hex(cpp_bytes.bytes) + "]",
+                     absl::BytesToHexString(cpp_bytes.bytes) + "]",
                  LooksLikeRustPanic(decoded.status()) ? "rust panic"
                                                       : "bridge rejected");
     } else {
@@ -356,18 +348,19 @@ void DecodersAgreeOnArbitraryBytes(const Node& raw, const std::string& bytes) {
   const bool bridge_panicked =
       !bridge_decoded.ok() && LooksLikeRustPanic(bridge_decoded.status());
   if (bridge_panicked) {
-    log.Report(DivergenceId::kRustPanicCaught, "$",
-               "decoding panicked: " +
-                   std::string(bridge_decoded.status().message()) + " [" +
-                   Hex(bytes) + "]",
-               "rust panic");
+    log.Report(
+        DivergenceId::kRustPanicCaught, "$",
+        "decoding panicked: " + std::string(bridge_decoded.status().message()) +
+            " [" + absl::BytesToHexString(bytes) + "]",
+        "rust panic");
   }
 
   if (bridge_decoded.ok() && !cpp_decoded.ok()) {
-    log.Report(DivergenceId::kDecodeVerdictBridgeLenient, "$",
-               "the bridge decoded bytes avro-cpp rejected: " + cpp_decoded.what +
-                   " [" + Hex(bytes) + "]",
-               "avrocpp rejected");
+    log.Report(
+        DivergenceId::kDecodeVerdictBridgeLenient, "$",
+        "the bridge decoded bytes avro-cpp rejected: " + cpp_decoded.what +
+            " [" + absl::BytesToHexString(bytes) + "]",
+        "avrocpp rejected");
   } else if (!bridge_decoded.ok() && cpp_decoded.ok() && !bridge_panicked) {
     // Three different things can put us here, and reporting them all as one
     // divergence would mislabel two of them.
@@ -392,7 +385,7 @@ void DecodersAgreeOnArbitraryBytes(const Node& raw, const std::string& bytes) {
     log.Report(id, "$",
                "avro-cpp decoded bytes the bridge rejected: " +
                    std::string(bridge_decoded.status().message()) + " [" +
-                   Hex(bytes) + "]",
+                   absl::BytesToHexString(bytes) + "]",
                narrow);
   } else if (bridge_decoded.ok() && cpp_decoded.ok()) {
     CompareValues(*bridge_decoded, cpp_datum, &log);
