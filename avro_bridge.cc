@@ -641,6 +641,14 @@ size_t SetMaxAllocationBytes(size_t num_bytes) {
   return rust::datum::set_max_allocation_bytes(num_bytes);
 }
 
+bool SetNonUtf8StringAsBytes(bool as_bytes) {
+  return rust::datum::set_non_utf8_string_as_bytes(as_bytes);
+}
+
+bool SetUuidAsString(bool as_string) {
+  return rust::datum::set_uuid_as_string(as_string);
+}
+
 // ---------------------------------------------------------------------------
 // DataFileWriter
 // ---------------------------------------------------------------------------

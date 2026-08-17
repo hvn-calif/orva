@@ -300,6 +300,18 @@ absl::StatusOr<AvroValue> DecodeDatumSchemata(
 // decompression of compressed container codecs (see DataFileReader).
 size_t SetMaxAllocationBytes(size_t num_bytes);
 
+// EXPERIMENT, do not commit. When on, a `string` whose wire bytes are not valid
+// UTF-8 decodes as bytes instead of failing, matching what avrocpp does.
+// Process-global and first-call-wins like SetMaxAllocationBytes, and read on
+// the first string decode, so call it before decoding anything. Returns the
+// setting actually in effect.
+bool SetNonUtf8StringAsBytes(bool as_bytes);
+
+// EXPERIMENT, do not commit. When on, a `uuid` decodes as an ordinary string
+// rather than being parsed, preserving the bytes as written. Process-global and
+// first-call-wins; call before decoding anything.
+bool SetUuidAsString(bool as_string);
+
 // Writes Avro object container files. Replaces avrocpp's
 // DataFileWriter<GenericDatum>. Values are validated and buffered by
 // Append; the encoded file is produced by ToBytes or WriteToPath.

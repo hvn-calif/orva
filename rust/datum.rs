@@ -113,6 +113,25 @@ pub fn set_max_allocation_bytes(num_bytes: usize) -> usize {
     apache_avro::util::max_allocation_bytes(num_bytes)
 }
 
+/// EXPERIMENT, do not commit. When on, a `string` whose wire bytes are not
+/// valid UTF-8 decodes as `Value::Bytes` instead of failing, which is what
+/// avrocpp already does. Needs the non-UTF-8 patch on apache-avro 0.21.
+///
+/// Like the allocation ceiling this is a process-global that only the first
+/// call sets, so it returns the setting actually in effect. It is read on the
+/// first decode of a `string`, so call it before any decoding.
+pub fn set_non_utf8_string_as_bytes(as_bytes: bool) -> bool {
+    apache_avro::util::set_non_utf8_string_as_bytes(as_bytes)
+}
+
+/// EXPERIMENT, do not commit. When on, a `uuid` decodes as an ordinary string
+/// rather than being parsed, so the bytes as written survive: no canonical
+/// rewriting, no reinterpretation of a 16-byte string, no rejection of text
+/// that is not a uuid. Needs the uuid-as-string patch on apache-avro 0.21.
+pub fn set_uuid_as_string(as_string: bool) -> bool {
+    apache_avro::util::set_uuid_as_string(as_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

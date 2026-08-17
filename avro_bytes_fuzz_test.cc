@@ -61,6 +61,12 @@ const bool kAllocationCeilingSet = [] {
   return true;
 }();
 
+// EXPERIMENT, do not commit. Both patched apache-avro behaviours on: a
+// non-UTF-8 `string` decodes as bytes, and a `uuid` decodes as an ordinary
+// string. Together these are what avrocpp already does.
+const bool kNonUtf8StringAsBytes = security::avro::SetNonUtf8StringAsBytes(true);
+const bool kUuidAsString = security::avro::SetUuidAsString(true);
+
 // Inputs that declare a length above this never reach either decoder. Shared by
 // every property that generates bytes, so the properties cannot drift apart:
 // see DeclaresLengthBeyondLimit for why the guard has to exist at all.
@@ -200,11 +206,8 @@ constexpr KnownDivergence kKnownDivergences[] = {
     {"bridge-lenient", "EOF reached"},
     {"trailing-bytes", "trailing bytes"},
     {"alloc-ceiling", "Unable to allocate"},
-    {"avrocpp-lenient", "Invalid utf-8"},
-    {"avrocpp-lenient", "to UUID"},
     {"avrocpp-lenient", "failed to fill whole buffer"},
     {"reencode-failed", "decimal sign extension 0"},
-    {"reencode-case-only", R"("logicalType":"uuid")"},
 };
 
 bool IsKnown(const std::string& tag, const std::string& detail) {
@@ -735,26 +738,66 @@ TEST(AvroBytes, TrailingBytesAreAcceptedByAvrocppOnly) {
                          true);
 }
 
-// avrocpp-lenient / "Invalid utf-8"
-TEST(AvroBytes, NonUtf8StringIsAcceptedByAvrocppOnly) {
+// EXPERIMENT. Was avrocpp-lenient / "Invalid utf-8", with the bridge rejecting.
+// The non-UTF-8 patch closes it: the bridge accepts and the payload survives as
+// bytes, so both engines re-encode to what they were given.
+TEST(AvroBytes, NonUtf8StringRoundTripsThroughBothEngines) {
   // Length 1, then a lone UTF-8 continuation byte.
   const std::string bytes = Varint(1) + std::string(1, '\x80');
-  ExpectDecodeAcceptance(R"("string")", bytes, false, true);
-  // The same bytes under a bytes schema are fine on both sides, so the
-  // divergence is the string validation and not the payload.
+  ExpectDecodeAcceptance(R"("string")", bytes, true, true);
   ExpectDecodeAcceptance(R"("bytes")", bytes, true, true);
+
+  auto schema = AvroSchema::Parse(R"("string")");
+  ASSERT_TRUE(schema.ok()) << schema.status();
+  const auto value = security::avro::DecodeDatum(*schema, bytes);
+  ASSERT_TRUE(value.ok()) << value.status();
+  EXPECT_TRUE(value->IsBytes()) << "type is " << value->TypeName();
+  EXPECT_EQ(value->GetBytes().value_or(""), std::string(1, '\x80'));
+
+  // Acceptance says nothing about what was decoded, so drive the whole circle.
+  ExpectReencodingAgrees(R"("string")", bytes);
+  // Split literals: "\xffb" would lex as one out-of-range hex escape.
+  ExpectReencodingAgrees(R"("string")",
+                         Varint(4) + std::string("a\xff" "b\x80", 4));
+  // A valid UTF-8 string still decodes as a string and is unaffected.
+  ExpectReencodingAgrees(R"("string")", Varint(3) + "abc");
 }
 
-// avrocpp-lenient / "to UUID"
-TEST(AvroBytes, MalformedUuidTextIsAcceptedByAvrocppOnly) {
+// EXPERIMENT. Was avrocpp-lenient / "to UUID", with the bridge rejecting text
+// that is not a uuid. The uuid-as-string patch closes it, and closes the four
+// shapes around it that the acceptance property could never have seen because
+// both engines accepted them and only the decoded value differed.
+TEST(AvroBytes, UuidIsReadAsAnOrdinaryStringByBothEngines) {
+  const std::string uuid_schema = R"({"type":"string","logicalType":"uuid"})";
+
+  // Text that is not a uuid at all: both read it now.
   const std::string text = "not-a-uuid";
-  const std::string bytes =
-      Varint(static_cast<int64_t>(text.size())) + text;
-  ExpectDecodeAcceptance(R"({"type":"string","logicalType":"uuid"})", bytes,
-                         false, true);
-  // avro-cpp treats a uuid as an ordinary string, so the plain string schema
-  // accepts it on both sides.
-  ExpectDecodeAcceptance(R"("string")", bytes, true, true);
+  ExpectDecodeAcceptance(uuid_schema,
+                         Varint(static_cast<int64_t>(text.size())) + text, true,
+                         true);
+
+  // Every spelling below parses as a uuid, so the parsing path rewrote it to
+  // canonical hyphenated lowercase and the bytes changed. Read as a string they
+  // survive, which is what these assert.
+  for (const std::string& body : {
+           std::string("6ba7b810-9dad-11d1-80b4-00c04fd430c8"),  // canonical
+           std::string("6BA7B810-9DAD-11D1-80B4-00C04FD430C8"),  // upper case
+           std::string("urn:uuid:6ba7b810-9dad-11d1-80b4-00c04fd430c8"),
+           std::string("{6ba7b810-9dad-11d1-80b4-00c04fd430c8}"),
+           std::string("6ba7b8109dad11d180b400c04fd430c8"),  // no hyphens
+           std::string("not-a-uuid"),
+           std::string(""),
+           // Exactly 16 bytes, which the parsing path took as a raw uuid and
+           // returned as 36 characters of hex.
+           std::string("  St9exception  "),
+       }) {
+    ExpectReencodingAgrees(uuid_schema,
+                           Varint(static_cast<int64_t>(body.size())) + body);
+  }
+
+  // Non-UTF-8 under a uuid schema needs both patches: the uuid one to reach the
+  // string path at all, the other to tolerate the bytes once there.
+  ExpectReencodingAgrees(uuid_schema, Varint(3) + std::string("\xff\xfe\xfd", 3));
 }
 
 // avrocpp-lenient / "failed to fill whole buffer"
@@ -904,52 +947,38 @@ TEST(AvroBytes, EmptyDecimalDecodesToAValueTheBridgeCannotReadOrReencode) {
             absl::BytesToHexString(bytes));
 }
 
-// reencode-case-only / uuid
+// EXPERIMENT. Was reencode-case-only / uuid: the bridge lowercased uuid text
+// while avrocpp returned what it was given. With the uuid-as-string patch the
+// bridge no longer parses the text, so nothing is folded and the bytes match.
 //
-// Found within four seconds of seeding the round-trip property with valid
-// encodings, on the one schema that had reached the value comparison zero times
-// in 3.5 million unseeded inputs: a valid uuid is not something random bytes
-// spell, but it is one byte-flip away from a seed that is one.
-//
-// The bridge lowercases uuid text; avro-cpp returns what it was given. Both
-// spellings denote the same uuid, and Avro's spec does not require a canonical
-// case, so neither is wrong on its own terms. What makes it worth recording is
-// that a value decoded and re-encoded through the bridge is not the value that
-// went in: a consumer comparing bytes, checking a signature over them, or
-// diffing two records sees a change the bridge introduced.
-TEST(AvroBytes, UuidTextIsLowercasedByTheBridgeButPreservedByAvrocpp) {
+// DiffersOnlyByAsciiCase stays: it is what routes any future case-only
+// mismatch to its own tag instead of the general reencode-differs one, and the
+// unit assertions below keep it honest now that no live input exercises it.
+TEST(AvroBytes, UuidTextCaseIsPreservedByBothEngines) {
   const std::string schema = R"({"type":"string","logicalType":"uuid"})";
   const std::string mixed_case = "6BA7B810-9dad-11D1-80b4-00C04FD430C8";
-  const std::string lowercased = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
   const std::string bytes = Varint(36) + mixed_case;
 
   auto bridge_schema = AvroSchema::Parse(schema);
   ASSERT_TRUE(bridge_schema.ok()) << bridge_schema.status();
-  ::avro::ValidSchema cpp_schema;
-  ASSERT_TRUE(ParseWithAvrocpp(schema, &cpp_schema).ok()) << schema;
-
   const auto bridge_value = security::avro::DecodeDatum(*bridge_schema, bytes);
   ASSERT_TRUE(bridge_value.ok()) << bridge_value.status();
-  const auto bridge_reencoded =
+  const auto reencoded =
       security::avro::EncodeDatum(*bridge_schema, *bridge_value);
-  ASSERT_TRUE(bridge_reencoded.ok()) << bridge_reencoded.status();
-  EXPECT_EQ(*bridge_reencoded, Varint(36) + lowercased);
+  ASSERT_TRUE(reencoded.ok()) << reencoded.status();
+  EXPECT_EQ(*reencoded, bytes) << "the bridge rewrote the text it was given";
 
-  ::avro::GenericDatum cpp_value;
-  ASSERT_TRUE(DecodeWithAvrocpp(cpp_schema, bytes, &cpp_value).ok());
-  std::string cpp_reencoded;
-  ASSERT_TRUE(EncodeWithAvrocpp(cpp_schema, cpp_value, &cpp_reencoded).ok());
-  EXPECT_EQ(cpp_reencoded, bytes);
+  ExpectReencodingAgrees(schema, bytes);
 
-  // The two differ only in case, which is what routes this to its own tag.
-  EXPECT_TRUE(DiffersOnlyByAsciiCase(*bridge_reencoded, cpp_reencoded));
-  // A uuid divergence that is not case folding must not land on that tag.
-  EXPECT_FALSE(DiffersOnlyByAsciiCase(*bridge_reencoded, *bridge_reencoded));
+  EXPECT_TRUE(DiffersOnlyByAsciiCase("AbC", "aBc"));
+  EXPECT_FALSE(DiffersOnlyByAsciiCase("abc", "abc"));
+  EXPECT_FALSE(DiffersOnlyByAsciiCase("abc", "abd"));
   EXPECT_FALSE(DiffersOnlyByAsciiCase("abc", "abcd"));
 }
 
+
 TEST(AvroBytes, KnownDivergenceTableSizeIsPinned) {
-  EXPECT_EQ(std::size(kKnownDivergences), 11u)
+  EXPECT_EQ(std::size(kKnownDivergences), 8u)
       << "adding an entry means adding a test named after it above; bump this "
          "count once you have";
 }
