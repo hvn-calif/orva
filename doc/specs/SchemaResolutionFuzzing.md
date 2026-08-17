@@ -1,6 +1,6 @@
 # Spec: Differential fuzzing of schema resolution
 
-Status: DRAFT - awaiting approval
+Status: APPROVED - ready to implement
 
 ## Purpose & user problem
 
@@ -78,10 +78,26 @@ Parse both schemas with both engines. When all four parses succeed, compare:
 Report a divergence when one says the pair resolves and the other does not. Use
 a tag of `resolution-verdict`.
 
-Start here. It needs no byte domain, it is roughly forty lines, and it tests API
-that has no coverage today. Do not begin property 2 until the verdicts are
-understood, because property 2's results are hard to interpret while the two
-engines disagree about which pairs are even resolvable.
+Cover `MutualRead` in the same property. It asks whether each schema can read
+the other, so it should agree with running the one-way check both ways round:
+
+```cpp
+// Whatever MutualRead answers, it has to agree with asking twice.
+absl::Status forward = reader_schema.CanReadFrom(writer_schema);
+absl::Status backward = writer_schema.CanReadFrom(reader_schema);
+// mutual.ok() must equal forward.ok() && backward.ok()
+```
+
+That check needs no second engine, so report a mismatch under its own tag,
+`mutual-read-disagrees-with-can-read-from`, and say plainly in the report that it
+is an internal inconsistency in the bridge rather than a divergence against
+avro-cpp. It is cheap and it is the only coverage `MutualRead` has.
+
+Build this property first. It needs no byte domain, it is roughly forty lines,
+and it tests API that has no coverage today. Finish and understand it before
+turning to property 2, whose results are hard to interpret while the two engines
+still disagree about which pairs are resolvable at all. That is an ordering
+within this piece of work, not a scope boundary: both properties are in scope.
 
 ### Property 2: resolved decode agrees
 
@@ -278,14 +294,22 @@ is how `main` handles its own patched dependency.
 - Changing the three existing properties, beyond what is needed to share the
   schema-pair or seed definitions.
 
-## Open questions for the reviewer
+## Decisions
 
-1. Should `MutualRead` be covered as well as `CanReadFrom`, or is the one-way
-   verdict enough for a first pass?
-2. Property 2 compares re-encoded bytes, which cannot say whether a mismatch came
-   from the decoders or the encoders. That was an accepted trade for the existing
-   round-trip property. Does it stay accepted here, where the reader schema adds
-   a third thing that could be wrong?
-3. Aliases are in the domain table above. They are the most likely place for the
-   two engines to differ and also the most likely to need a patch rather than an
-   entry. Include them in the first pass or defer?
+Three questions were open in the draft. All three are settled the same way,
+everything in this pass, so nothing here is deferred:
+
+1. **`MutualRead` is covered**, not just `CanReadFrom`, as described under
+   property 1. It is checked for agreement with the one-way verdict taken both
+   ways, which needs no second engine.
+2. **Comparing re-encoded bytes stays the method** for property 2, with the same
+   trade the existing round-trip property accepts: a mismatch does not say which
+   step diverged. The reader schema does add a third thing that could be wrong,
+   so when a mismatch is found, narrow it before writing it up. Decoding the same
+   bytes without resolution, writer schema as reader schema, separates a
+   resolution bug from a plain decode bug, and it costs one extra call.
+3. **Aliases are in.** They are the most likely place for the two engines to
+   differ, which is the reason to include them rather than to defer them. Expect
+   a finding there to need a patch against apache-avro rather than a table entry,
+   following the two patches already in orva's `patches/`. Recording it is still
+   the first step; closing it stays out of scope per **Out of scope** above.
