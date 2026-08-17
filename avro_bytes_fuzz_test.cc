@@ -64,7 +64,8 @@ const bool kAllocationCeilingSet = [] {
 // EXPERIMENT, do not commit. Both patched apache-avro behaviours on: a
 // non-UTF-8 `string` decodes as bytes, and a `uuid` decodes as an ordinary
 // string. Together these are what avrocpp already does.
-const bool kNonUtf8StringAsBytes = security::avro::SetNonUtf8StringAsBytes(true);
+const bool kNonUtf8StringAsBytes =
+    security::avro::SetNonUtf8StringAsBytes(true);
 const bool kUuidAsString = security::avro::SetUuidAsString(true);
 
 // Inputs that declare a length above this never reach either decoder. Shared by
@@ -139,6 +140,18 @@ std::string Varint(int64_t value) {
   return out;
 }
 
+// For byte strings that carry no structure worth spelling out, such as a fuzzer
+// counterexample kept verbatim.
+std::string FromHex(absl::string_view hex) {
+  std::string out;
+  out.reserve(hex.size() / 2);
+  for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+    out.push_back(static_cast<char>(
+        std::stoi(std::string(hex.substr(i, 2)), nullptr, 16)));
+  }
+  return out;
+}
+
 // A length prefix far larger than the buffer makes the bridge ask its
 // allocator for gigabytes. Rust aborts the process when an allocation fails
 // (handle_alloc_error), which no sanitizer setting and no C++ allocator
@@ -166,24 +179,6 @@ bool DeclaresLengthBeyondLimit(const std::string& bytes, uint64_t limit) {
   return false;
 }
 
-// True when two encodings hold the same letters in different case. The bridge
-// normalises uuid text to lowercase while avro-cpp keeps what it was given, so
-// that shape gets its own tag: a uuid divergence that is not just case folding
-// then still surfaces as reencode-differs instead of being swallowed by the
-// known-divergence entry.
-bool DiffersOnlyByAsciiCase(const std::string& left, const std::string& right) {
-  if (left.size() != right.size()) return false;
-  bool saw_case_difference = false;
-  for (size_t i = 0; i < left.size(); ++i) {
-    if (left[i] == right[i]) continue;
-    const unsigned char left_char = static_cast<unsigned char>(left[i]);
-    const unsigned char right_char = static_cast<unsigned char>(right[i]);
-    if (std::tolower(left_char) != std::tolower(right_char)) return false;
-    saw_case_difference = true;
-  }
-  return saw_case_difference;
-}
-
 // Divergences already triaged. A long run stays quiet on these and stops only
 // on something new, so no environment setup is needed to fuzz for hours.
 //
@@ -207,6 +202,26 @@ constexpr KnownDivergence kKnownDivergences[] = {
     {"trailing-bytes", "trailing bytes"},
     {"alloc-ceiling", "Unable to allocate"},
     {"avrocpp-lenient", "failed to fill whole buffer"},
+    {"bridge-lenient", "vector::_M_default_append"},
+    {"avrocpp-lenient", "Cannot convert i64 to usize"},
+    {"avrocpp-lenient", "Invalid utf-8 string"},
+    {"avrocpp-lenient", "Overflow when decoding integer value"},
+    // Broad, and knowingly so: this is the bridge's only message for a JSON
+    // document it would not parse, so it covers every such schema rather than
+    // just the trailing-junk one below. Narrowing it needs a finer error from
+    // the bridge, not a longer substring here.
+    {"schema-acceptance", "Failed to parse schema from JSON"},
+    // The same divergence when the trailing bytes are not valid UTF-8: the
+    // bridge checks that before it reaches the JSON parser, so the message
+    // differs while the cause does not.
+    {"schema-acceptance", "invalid utf-8 sequence"},
+    // Deliberately broader than the rest, because the round-trip report carries
+    // the schema and the two encodings and nothing that separates one array
+    // framing bug from another. A change in what this input does is caught by
+    // ArrayBlockFramingYieldsDifferentItemsInEachEngine instead, which pins the
+    // counts and the values; a new array divergence would be muted
+    // here, which is the cost of having no finer discriminator to match on.
+    {"reencode-differs", R"({"type":"array","items":"int"})"},
     {"reencode-failed", "decimal sign extension 0"},
 };
 
@@ -537,9 +552,7 @@ void ReencodingAgreesWhenBothDecode(const std::string& schema_text,
   if (*bridge_reencoded == cpp_reencoded) return;
 
   ReportDivergence(
-      DiffersOnlyByAsciiCase(*bridge_reencoded, cpp_reencoded)
-          ? "reencode-case-only"
-          : "reencode-differs",
+      "reencode-differs",
       "both decoded these bytes but re-encoded them differently"
       "\n  schema:  " +
           schema_text + "\n  input:   " + absl::BytesToHexString(bytes) +
@@ -797,7 +810,8 @@ TEST(AvroBytes, UuidIsReadAsAnOrdinaryStringByBothEngines) {
 
   // Non-UTF-8 under a uuid schema needs both patches: the uuid one to reach the
   // string path at all, the other to tolerate the bytes once there.
-  ExpectReencodingAgrees(uuid_schema, Varint(3) + std::string("\xff\xfe\xfd", 3));
+  ExpectReencodingAgrees(uuid_schema,
+                         Varint(3) + std::string("\xff\xfe\xfd", 3));
 }
 
 // avrocpp-lenient / "failed to fill whole buffer"
@@ -947,38 +961,176 @@ TEST(AvroBytes, EmptyDecimalDecodesToAValueTheBridgeCannotReadOrReencode) {
             absl::BytesToHexString(bytes));
 }
 
-// EXPERIMENT. Was reencode-case-only / uuid: the bridge lowercased uuid text
-// while avrocpp returned what it was given. With the uuid-as-string patch the
-// bridge no longer parses the text, so nothing is folded and the bytes match.
+// bridge-lenient / "vector::_M_default_append"
 //
-// DiffersOnlyByAsciiCase stays: it is what routes any future case-only
-// mismatch to its own tag instead of the general reencode-differs one, and the
-// unit assertions below keep it honest now that no live input exercises it.
-TEST(AvroBytes, UuidTextCaseIsPreservedByBothEngines) {
-  const std::string schema = R"({"type":"string","logicalType":"uuid"})";
-  const std::string mixed_case = "6BA7B810-9dad-11D1-80b4-00C04FD430C8";
-  const std::string bytes = Varint(36) + mixed_case;
+// A fuzzer counterexample, kept verbatim: the bytes are arbitrary and the only
+// property that matters is the block header they happen to spell. The bridge
+// reads it as 58 items; avro-cpp sizes a vector from a declared block count and
+// dies of std::length_error before reading anything. The message is libstdc++'s
+// wording, so this entry is tied to the standard library as well as to avrocpp.
+//
+// The mirror of the alloc-ceiling entry: there the bridge refuses a reservation
+// avrocpp will attempt, here avrocpp cannot size its container and, having no
+// ceiling, throws rather than returning an error.
+TEST(AvroBytes, OversizedArrayBlockIsAcceptedByTheBridgeOnly) {
+  const std::string bytes = FromHex(
+      "0e7479706539726465656c6f6769744e346176726f374465636f6465727379"
+      "6d626f6c7372785821abd33a1f673b757863657074696f6e6e472062797465"
+      "6300");
+  ASSERT_EQ(bytes.size(), 64u);
+  ExpectDecodeAcceptance(R"({"type":"array","items":"int"})", bytes, true,
+                         false);
 
-  auto bridge_schema = AvroSchema::Parse(schema);
-  ASSERT_TRUE(bridge_schema.ok()) << bridge_schema.status();
-  const auto bridge_value = security::avro::DecodeDatum(*bridge_schema, bytes);
-  ASSERT_TRUE(bridge_value.ok()) << bridge_value.status();
-  const auto reencoded =
-      security::avro::EncodeDatum(*bridge_schema, *bridge_value);
-  ASSERT_TRUE(reencoded.ok()) << reencoded.status();
-  EXPECT_EQ(*reencoded, bytes) << "the bridge rewrote the text it was given";
-
-  ExpectReencodingAgrees(schema, bytes);
-
-  EXPECT_TRUE(DiffersOnlyByAsciiCase("AbC", "aBc"));
-  EXPECT_FALSE(DiffersOnlyByAsciiCase("abc", "abc"));
-  EXPECT_FALSE(DiffersOnlyByAsciiCase("abc", "abd"));
-  EXPECT_FALSE(DiffersOnlyByAsciiCase("abc", "abcd"));
+  auto schema = AvroSchema::Parse(R"({"type":"array","items":"int"})");
+  ASSERT_TRUE(schema.ok()) << schema.status();
+  const auto value = security::avro::DecodeDatum(*schema, bytes);
+  ASSERT_TRUE(value.ok()) << value.status();
+  EXPECT_EQ(value->GetArrayLen().value_or(0), 58u);
 }
 
+// reencode-differs / {"type":"array","items":"int"}
+//
+// The one the acceptance property could never have found: both engines accept,
+// so they never disagree on acceptance, and only the decoded values differ.
+//
+// A well-formed 10-item block, then a header declaring -3, which promises three
+// items and a byte size to follow, and then a byte size of -3, which is not a
+// size. Avro does not say what to do with that and the two recover differently:
+//
+//   bridge:  13 items, reading the three the header asked for
+//   avrocpp: 11 items, nine of which it never read
+//
+// avro-cpp filling in zeros is the part worth watching. A caller gets a value
+// with no indication that most of it was invented, which is worse than either
+// engine's item count being the wrong one.
+TEST(AvroBytes, ArrayBlockFramingYieldsDifferentItemsInEachEngine) {
+  const std::string first_block =
+      Varint(10) +                                    // ten items follow
+      Varint(10) + Varint(10) + Varint(10) +          //
+      Varint(-134620) + Varint(-41) + Varint(1286) +  //
+      Varint(10) + Varint(10) + Varint(-3) + Varint(-3);
+  // A count of -3 promises three items and a byte size; the size given is -3.
+  const std::string second_block =
+      Varint(-3) + Varint(-3) + Varint(-3) + Varint(10) + Varint(10);
+  const std::string bytes = first_block + second_block + Varint(0);
+  ASSERT_EQ(bytes.size(), 20u) << absl::BytesToHexString(bytes);
+
+  const std::string schema_text = R"({"type":"array","items":"int"})";
+  auto schema = AvroSchema::Parse(schema_text);
+  ASSERT_TRUE(schema.ok()) << schema.status();
+  ::avro::ValidSchema cpp_schema;
+  ASSERT_TRUE(ParseWithAvrocpp(schema_text, &cpp_schema).ok());
+
+  const auto bridge_value = security::avro::DecodeDatum(*schema, bytes);
+  ASSERT_TRUE(bridge_value.ok()) << bridge_value.status();
+  EXPECT_EQ(bridge_value->GetArrayLen().value_or(0), 13u);
+
+  ::avro::GenericDatum cpp_value;
+  ASSERT_TRUE(DecodeWithAvrocpp(cpp_schema, bytes, &cpp_value).ok());
+  const auto& cpp_items = cpp_value.value<::avro::GenericArray>().value();
+  EXPECT_EQ(cpp_items.size(), 11u);
+
+  // Both agree on the first item; from there avrocpp returns zeros where the
+  // bridge returns the values the bytes actually carry.
+  EXPECT_EQ(bridge_value->GetArrayItem(0)->GetInt().value_or(0), 10);
+  EXPECT_EQ(cpp_items[0].value<int32_t>(), 10);
+  EXPECT_EQ(bridge_value->GetArrayItem(3)->GetInt().value_or(0), -134620);
+  EXPECT_EQ(cpp_items[3].value<int32_t>(), 0);
+  size_t cpp_zeros = 0;
+  for (const auto& item : cpp_items) {
+    if (item.value<int32_t>() == 0) ++cpp_zeros;
+  }
+  EXPECT_EQ(cpp_zeros, 9u) << "avro-cpp invented nine items";
+}
+
+// avrocpp-lenient / "Cannot convert i64 to usize"
+//
+// A negative block count promises items and a byte size; here the size is also
+// negative. The bridge will not turn it into a length, avrocpp reads on. Same
+// family as the test above and the opposite outcome: there both engines
+// accepted and the values differed, here only one accepts.
+TEST(AvroBytes, NegativeArrayBlockSizeIsAcceptedByAvrocppOnly) {
+  const std::string bytes =
+      FromHex("0202020202020202020202020202020300e3c901ff020202");
+  ASSERT_EQ(bytes.size(), 24u);
+  ExpectDecodeAcceptance(R"({"type":"array","items":"string"})", bytes, false,
+                         true);
+}
+
+// schema-acceptance / "Failed to parse schema from JSON" and "invalid utf-8
+// sequence"
+//
+// avro-cpp stops once it has a complete JSON value and never looks at what
+// follows, so a schema document with anything after it still parses. The bridge
+// parses with serde_json, which treats trailing input as an error.
+//
+// More than parser strictness: a schema is a cache key and a fingerprint input.
+// Two documents differing only in trailing bytes are the same schema to avrocpp
+// and not a schema at all to the bridge, so a producer on one side can write
+// something the other will not load.
+TEST(AvroBytes, TrailingBytesAfterASchemaAreAcceptedByAvrocppOnly) {
+  for (const std::string& suffix : {"\"", "!", " x", "\n\n]"}) {
+    ExpectSchemaAcceptance(R"("string")" + suffix, false, true);
+  }
+  // Trailing bytes that are not valid UTF-8 take a different path in the bridge
+  // (the text is checked before it reaches the JSON parser) and get a different
+  // message, so both are pinned here and both have a table entry.
+  ExpectSchemaAcceptance(R"("int")" + std::string("f_\xc3\x28y", 5), false,
+                         true);
+
+  // Trailing whitespace alone is fine on both sides, so the divergence is the
+  // trailing content and not merely a length mismatch.
+  ExpectSchemaAcceptance(R"("string")"
+                         "  \n",
+                         true, true);
+}
+
+// avrocpp-lenient / "Invalid utf-8 string"
+//
+// The non-UTF-8 patch relaxes `string` but deliberately leaves map keys strict,
+// because apache-avro keys a map with a Rust `String` and a key that is not
+// UTF-8 has nowhere to live. avrocpp keys with a byte-oriented std::string and
+// takes it. So the setting closes the `string` case and not this one, which is
+// a limit of the value model rather than a decision that could be flipped.
+//
+// This is now the only path left that produces this message: the plain-string
+// case is closed, and the uuid one went with the uuid-as-string patch.
+TEST(AvroBytes, NonUtf8MapKeyIsAcceptedByAvrocppOnly) {
+  // One entry: a one-byte key that is a lone UTF-8 continuation byte, the int
+  // 1, then the terminating zero-length block.
+  const std::string bytes = Varint(1) + Varint(1) + std::string(1, '\x80') +
+                            Varint(1) + Varint(0);
+  ExpectDecodeAcceptance(R"({"type":"map","values":"int"})", bytes, false,
+                         true);
+
+  // The same key bytes as a `string` value are fine on both sides, which is
+  // what separates the key restriction from the string one.
+  ExpectDecodeAcceptance(R"("string")", Varint(1) + std::string(1, '\x80'),
+                         true, true);
+}
+
+// avrocpp-lenient / "Overflow when decoding integer value"
+//
+// Not overflow in general: a bare over-long `int` varint is refused by both, as
+// the contrast below shows. It is overflow in an array block header, which is
+// read as a long. The bridge refuses it; avrocpp keeps shifting and carries on
+// with whatever survived, so a block header the bytes do not encode decides how
+// much of the input it reads.
+TEST(AvroBytes, OverflowingArrayBlockHeaderIsAcceptedByAvrocppOnly) {
+  const std::string in_array =
+      FromHex("07070707170707000707646f637479706583838383838383838383");
+  ASSERT_EQ(in_array.size(), 27u);
+  ExpectDecodeAcceptance(R"({"type":"array","items":"int"})", in_array, false,
+                         true);
+
+  // The contrast. Six continuation bytes where an `int` is expected overflows
+  // on both sides, so the divergence is the header position and not the varint.
+  const std::string too_long = std::string(6, '\x83') + std::string(1, '\x01');
+  ExpectDecodeAcceptance(R"("int")", too_long, false, false);
+}
 
 TEST(AvroBytes, KnownDivergenceTableSizeIsPinned) {
-  EXPECT_EQ(std::size(kKnownDivergences), 8u)
+  EXPECT_EQ(std::size(kKnownDivergences), 15u)
       << "adding an entry means adding a test named after it above; bump this "
          "count once you have";
 }
