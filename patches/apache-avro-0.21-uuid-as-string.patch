@@ -1,0 +1,394 @@
+From ac9ee5b99c17dd795e9e02275337ac10f60d15b2 Mon Sep 17 00:00:00 2001
+From: Viet Hung Nguyen <hvn@calif.io>
+Date: Mon, 17 Aug 2026 16:26:46 +0700
+Subject: [PATCH] feat: Optionally decode an Avro uuid as an ordinary string
+
+Avro defines `uuid` as an annotation on `string`, and a reader is free to leave
+the annotation uninterpreted. avro-cpp does exactly that: it never parses or
+validates a uuid, so whatever text was written comes back unchanged. Java's
+behaviour is the same for a `Utf8`-backed field.
+
+Parsing it into a `Uuid` has three consequences a reader that treats it as a
+string does not have, and each of them shows up as a difference against those
+implementations:
+
+- The bytes change. `Uuid` re-encodes in canonical hyphenated lowercase, so
+  `urn:uuid:` prefixes, braces, upper-case hex and unhyphenated 32-hex forms are
+  all rewritten. A value read and written back is not the value that arrived,
+  which anyone comparing bytes or checking a signature over them will see.
+- A 16-byte string is reinterpreted. Any uuid field holding exactly 16 bytes is
+  taken as a raw `Uuid`, so an ordinary 16-character string comes back as 36
+  characters of hex. Length decides how the field is read, which also means the
+  UTF-8 check below is skipped at exactly that length.
+- Malformed text is rejected, making data such implementations wrote unreadable.
+
+`util::set_uuid_as_string` opts out of all three: with it on, `Schema::Uuid`
+decodes exactly as `Schema::String`. It is off by default, so nothing changes
+for an existing consumer until a caller asks for it, once per process and before
+any decoding.
+
+It composes with `set_non_utf8_string_as_bytes` rather than duplicating it: a
+uuid whose text is not valid UTF-8 yields `Value::Bytes` when that setting is
+also on, and still fails when it is not. The two are independent, which
+`non_utf8_still_fails_without_the_other_setting` pins.
+
+`Value::String` was already accepted at a `Schema::Uuid` position by `validate`
+and by the encoder, so the decoded value stays usable and round-trips byte for
+byte. What needed changing beyond decode is `resolve_uuid`, which would
+otherwise parse the string straight back into a `Uuid` and reintroduce the
+canonicalisation, plus the `Value::Bytes` arms of `validate` and `encode` for
+the non-UTF-8 case.
+
+Tests follow the split the other set-once settings use: the parsing behaviour
+stays covered by the existing unit tests at the default, and the accepting cases
+live in their own binary, `avro/tests/uuid_as_string.rs`, because a `OnceLock`
+cannot be reset within a process.
+
+No public signature changes and no new error variants.
+---
+ Cargo.lock                   |   4 +
+ avro/src/decode.rs           |  10 ++-
+ avro/src/encode.rs           |   4 +-
+ avro/src/types.rs            |  12 ++-
+ avro/src/util.rs             |  49 +++++++++++
+ avro/tests/uuid_as_string.rs | 162 +++++++++++++++++++++++++++++++++++
+ 6 files changed, 238 insertions(+), 3 deletions(-)
+ create mode 100644 avro/tests/uuid_as_string.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index d2fcdda..a2d8815 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1409,3 +1409,7 @@ dependencies = [
+  "cc",
+  "pkg-config",
+ ]
++
++[[patch.unused]]
++name = "apache-avro"
++version = "0.22.0"
+diff --git a/avro/src/decode.rs b/avro/src/decode.rs
+index 2ecf497..d3a0729 100644
+--- a/avro/src/decode.rs
++++ b/avro/src/decode.rs
+@@ -26,7 +26,7 @@ use crate::{
+         Schema,
+     },
+     types::{Value, ValueKind},
+-    util::{non_utf8_string_as_bytes, safe_len, zag_i32, zag_i64},
++    util::{non_utf8_string_as_bytes, safe_len, uuid_as_string, zag_i32, zag_i64},
+ };
+ use std::{
+     borrow::Borrow,
+@@ -120,6 +120,14 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
+                 value => Err(Details::BytesValue(value).into()),
+             }
+         }
++        // Avro defines `uuid` as an annotation on `string`, and a reader may leave it
++        // uninterpreted; avro-cpp does. Parsing it rewrites the bytes to canonical form,
++        // reinterprets any 16-byte string as a raw Uuid, and rejects text other writers
++        // accept. Opt-in, since it changes the variant a caller gets: see
++        // `util::set_uuid_as_string`.
++        Schema::Uuid if uuid_as_string() => {
++            decode_internal(&Schema::String, names, enclosing_namespace, reader)
++        }
+         Schema::Uuid => {
+             let Value::Bytes(bytes) =
+                 decode_internal(&Schema::Bytes, names, enclosing_namespace, reader)?
+diff --git a/avro/src/encode.rs b/avro/src/encode.rs
+index 43de560..ffcc820 100644
+--- a/avro/src/encode.rs
++++ b/avro/src/encode.rs
+@@ -24,7 +24,7 @@ use crate::{
+         Schema, SchemaKind, UnionSchema,
+     },
+     types::{Value, ValueKind},
+-    util::{non_utf8_string_as_bytes, zig_i32, zig_i64},
++    util::{non_utf8_string_as_bytes, uuid_as_string, zig_i32, zig_i64},
+ };
+ use log::error;
+ use std::{borrow::Borrow, collections::HashMap, io::Write};
+@@ -166,6 +166,8 @@ pub(crate) fn encode_internal<W: Write, S: Borrow<Schema>>(
+             // read but never round-tripped. Both encode identically anyway:
+             // length prefix, then raw bytes.
+             Schema::String if non_utf8_string_as_bytes() => encode_bytes(bytes, writer),
++            // Likewise for a `uuid` read as a string whose text was not UTF-8.
++            Schema::Uuid if uuid_as_string() => encode_bytes(bytes, writer),
+             Schema::Fixed { .. } => writer
+                 .write(bytes.as_slice())
+                 .map_err(|e| Details::WriteBytes(e).into()),
+diff --git a/avro/src/types.rs b/avro/src/types.rs
+index c88fc01..b41d257 100644
+--- a/avro/src/types.rs
++++ b/avro/src/types.rs
+@@ -26,7 +26,7 @@ use crate::{
+         DecimalSchema, EnumSchema, FixedSchema, Name, Namespace, Precision, RecordField,
+         RecordSchema, ResolvedSchema, Scale, Schema, SchemaKind, UnionSchema,
+     },
+-    util::non_utf8_string_as_bytes,
++    util::{non_utf8_string_as_bytes, uuid_as_string},
+ };
+ use bigdecimal::BigDecimal;
+ use log::{debug, error};
+@@ -452,6 +452,10 @@ impl Value {
+             // against the schema it was decoded from. Without this a decoded
+             // datum could not be handed back to the writer that produced it.
+             (&Value::Bytes(_), &Schema::String) if non_utf8_string_as_bytes() => None,
++            // Same reasoning for a `uuid` read as a string: with both settings on
++            // a non-UTF-8 one decodes to `Value::Bytes`, so it has to validate
++            // against the schema it came from.
++            (&Value::Bytes(_), &Schema::Uuid) if uuid_as_string() => None,
+             (&Value::Bytes(_), &Schema::Decimal { .. }) => None,
+             (&Value::String(_), &Schema::String) => None,
+             (&Value::String(_), &Schema::Uuid) => None,
+@@ -718,6 +722,12 @@ impl Value {
+     fn resolve_uuid(self) -> Result<Self, Error> {
+         Ok(match self {
+             uuid @ Value::Uuid(_) => uuid,
++            // With the setting on a `uuid` is an ordinary string, so leave it as
++            // one: parsing here would reintroduce the canonicalisation that
++            // decoding it as a string exists to avoid. Bytes reach this only when
++            // the text was not valid UTF-8 and that setting is on too.
++            string @ Value::String(_) if uuid_as_string() => string,
++            bytes @ Value::Bytes(_) if uuid_as_string() => bytes,
+             Value::String(ref string) => {
+                 Value::Uuid(Uuid::from_str(string).map_err(Details::ConvertStrToUuid)?)
+             }
+diff --git a/avro/src/util.rs b/avro/src/util.rs
+index a683deb..f269c06 100644
+--- a/avro/src/util.rs
++++ b/avro/src/util.rs
+@@ -48,6 +48,15 @@ pub(crate) static NON_UTF8_STRING_AS_BYTES: OnceLock<bool> = OnceLock::new();
+ /// specification calls for and what every previous release did.
+ pub const DEFAULT_NON_UTF8_STRING_AS_BYTES: bool = false;
+ 
++/// Whether a `uuid` logical type decodes as an ordinary string, preserving the
++/// bytes as written instead of parsing them into a [`Uuid`](uuid::Uuid).
++/// See [set_uuid_as_string] to change this value.
++// crate-visible for testing
++pub(crate) static UUID_AS_STRING: OnceLock<bool> = OnceLock::new();
++/// Off by default: a `uuid` is parsed and canonicalised, which is what every
++/// previous release did.
++pub const DEFAULT_UUID_AS_STRING: bool = false;
++
+ pub(crate) trait MapHelper {
+     fn string(&self, key: &str) -> Option<String>;
+ 
+@@ -234,6 +243,46 @@ pub(crate) fn non_utf8_string_as_bytes() -> bool {
+     *NON_UTF8_STRING_AS_BYTES.get_or_init(|| DEFAULT_NON_UTF8_STRING_AS_BYTES)
+ }
+ 
++/// Set whether a `uuid` logical type decodes as an ordinary string rather than
++/// being parsed into a [`Uuid`](uuid::Uuid).
++///
++/// Avro defines `uuid` as a `string` logical type, and a reader is free to leave the
++/// annotation uninterpreted. avro-cpp does exactly that: it never parses or validates a
++/// `uuid`, so whatever text was written is what comes back. Parsing it here has three
++/// visible consequences that reading it as a string does not:
++///
++/// - **The bytes change.** `Uuid` re-encodes in canonical hyphenated lowercase, so
++///   `urn:uuid:` prefixes, braces, upper-case hex and unhyphenated 32-hex forms are all
++///   rewritten. A value read and written back is then not the value that arrived.
++/// - **A 16-byte string is reinterpreted.** Any `uuid` field holding exactly 16 bytes is
++///   taken as a raw `Uuid`, so an ordinary 16-character string comes back as 36
++///   characters of hex.
++/// - **Malformed text is rejected**, making data other implementations wrote unreadable.
++///
++/// With this enabled, `Schema::Uuid` decodes exactly as `Schema::String`, so it yields
++/// `Value::String`, or `Value::Bytes` when the text is not valid UTF-8 and
++/// [`set_non_utf8_string_as_bytes`] is also on. The two settings are independent and
++/// compose. `Value::String` was already accepted at a `Schema::Uuid` position by
++/// `validate` and by the encoder, so such a value stays usable and round-trips byte for
++/// byte.
++///
++/// This function only changes the setting once. On subsequent calls the value will stay
++/// the same as the first time it is called, and it is read on the first decode of a
++/// `uuid`, so it must be called before any decoding happens. It defaults to
++/// [`DEFAULT_UUID_AS_STRING`].
++///
++/// # Returns
++/// The configured value, which might be different from what the function was called
++/// with if the value was already set before. Callers that require the setting should
++/// check the returned value rather than assume it took effect.
++pub fn set_uuid_as_string(as_string: bool) -> bool {
++    *UUID_AS_STRING.get_or_init(|| as_string)
++}
++
++pub(crate) fn uuid_as_string() -> bool {
++    *UUID_AS_STRING.get_or_init(|| DEFAULT_UUID_AS_STRING)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/avro/tests/uuid_as_string.rs b/avro/tests/uuid_as_string.rs
+new file mode 100644
+index 0000000..28eca2c
+--- /dev/null
++++ b/avro/tests/uuid_as_string.rs
+@@ -0,0 +1,162 @@
++// Licensed to the Apache Software Foundation (ASF) under one
++// or more contributor license agreements.  See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership.  The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License.  You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//! The accepting side of `util::set_uuid_as_string`.
++//!
++//! The setting is set-once per process, so these live in their own test binary
++//! rather than beside the parsing cases in `src/decode.rs` and `src/types.rs`.
++//! This follows `tests/serde_human_readable_true.rs`.
++
++use apache_avro::{Schema, from_avro_datum, to_avro_datum, types::Value, util::set_uuid_as_string};
++use apache_avro_test_helper::TestResult;
++
++/// Every test in this binary needs the setting on. Calling it more than once is
++/// harmless (first call wins), and the return value is the setting in effect,
++/// which is what a caller who requires it should be checking.
++fn enable() {
++    assert!(
++        set_uuid_as_string(true),
++        "the setting must be in effect for this test binary"
++    );
++}
++
++/// One Avro `string`: zigzag length prefix, then the payload. Only single-byte
++/// prefixes, which covers every payload below.
++fn string_datum(payload: &[u8]) -> Vec<u8> {
++    assert!(payload.len() < 64, "length would need a longer varint");
++    let mut out = vec![(payload.len() as u8) << 1];
++    out.extend_from_slice(payload);
++    out
++}
++
++/// Decodes `payload` under a `uuid` schema and re-encodes what came back,
++/// returning both so a test can assert the value and the round trip at once.
++fn decode_and_reencode(
++    payload: &[u8],
++) -> anyhow::Result<(Value, Vec<u8>), apache_avro_test_helper::TestError> {
++    let schema = Schema::Uuid;
++    let datum = string_datum(payload);
++    let value = from_avro_datum(&schema, &mut datum.as_slice(), None)?;
++    let reencoded = to_avro_datum(&schema, value.clone())?;
++    Ok((value, reencoded))
++}
++
++/// The canonical form is unchanged by the setting; it is the forms that are not
++/// canonical which the parsing path rewrites.
++#[test]
++fn canonical_uuid_is_unchanged() -> TestResult {
++    enable();
++    let text = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
++    let (value, reencoded) = decode_and_reencode(text.as_bytes())?;
++    assert_eq!(value, Value::String(text.to_string()));
++    assert_eq!(reencoded, string_datum(text.as_bytes()));
++    Ok(())
++}
++
++/// The reason the setting exists. Each of these parses as a uuid and would be
++/// written back in canonical hyphenated lowercase, changing the bytes; read as
++/// a string they survive.
++#[test]
++fn non_canonical_spellings_survive() -> TestResult {
++    enable();
++    for text in [
++        "6BA7B810-9DAD-11D1-80B4-00C04FD430C8",
++        "6ba7b810-9DAD-11d1-80B4-00c04fd430c8",
++        "urn:uuid:6ba7b810-9dad-11d1-80b4-00c04fd430c8",
++        "{6ba7b810-9dad-11d1-80b4-00c04fd430c8}",
++        "6ba7b8109dad11d180b400c04fd430c8",
++    ] {
++        let (value, reencoded) = decode_and_reencode(text.as_bytes())?;
++        assert_eq!(value, Value::String(text.to_string()), "value for {text}");
++        assert_eq!(reencoded, string_datum(text.as_bytes()), "bytes for {text}");
++    }
++    Ok(())
++}
++
++/// Without the setting a 16-byte `uuid` is taken as a raw `Uuid` and comes back
++/// as 36 characters of hex, so an ordinary 16-character string is silently
++/// rewritten. Length must not decide how the field is interpreted.
++#[test]
++fn sixteen_byte_string_is_not_reinterpreted_as_raw_bytes() -> TestResult {
++    enable();
++    let text = "  St9exception  ";
++    assert_eq!(text.len(), 16, "the case only bites at exactly 16 bytes");
++    let (value, reencoded) = decode_and_reencode(text.as_bytes())?;
++    assert_eq!(value, Value::String(text.to_string()));
++    assert_eq!(reencoded, string_datum(text.as_bytes()));
++    Ok(())
++}
++
++/// Text that is not a uuid at all is readable rather than an error, which is
++/// what makes data written by an implementation that never validated readable.
++#[test]
++fn malformed_uuid_text_is_readable() -> TestResult {
++    enable();
++    for text in ["not-a-uuid", ""] {
++        let (value, reencoded) = decode_and_reencode(text.as_bytes())?;
++        assert_eq!(value, Value::String(text.to_string()), "value for {text:?}");
++        assert_eq!(
++            reencoded,
++            string_datum(text.as_bytes()),
++            "bytes for {text:?}"
++        );
++    }
++    Ok(())
++}
++
++/// This setting alone does not accept non-UTF-8: that is
++/// `set_non_utf8_string_as_bytes`, and the two are independent. Asserted so the
++/// split between them stays deliberate rather than incidental.
++#[test]
++fn non_utf8_still_fails_without_the_other_setting() {
++    enable();
++    let payload = [0xffu8, 0xfe, 0xfd];
++    let datum = string_datum(&payload);
++    assert!(
++        from_avro_datum(&Schema::Uuid, &mut datum.as_slice(), None).is_err(),
++        "non-UTF-8 needs set_non_utf8_string_as_bytes, which this binary leaves off"
++    );
++}
++
++/// A `uuid` read as a string has to satisfy the schema it was read from, or a
++/// decoded datum could not be handed back to the writer that produced it.
++#[test]
++fn string_validates_and_resolves_against_a_uuid_schema() -> TestResult {
++    enable();
++    let text = "urn:uuid:6ba7b810-9dad-11d1-80b4-00c04fd430c8";
++    let value = Value::String(text.to_string());
++    assert!(value.validate(&Schema::Uuid));
++    // Resolving must not reintroduce the canonicalisation this setting avoids.
++    assert_eq!(
++        value.resolve(&Schema::Uuid)?,
++        Value::String(text.to_string())
++    );
++    Ok(())
++}
++
++/// A real `Value::Uuid` still encodes at a `uuid` position, so the setting does
++/// not take that away from a caller who builds one itself.
++#[test]
++fn explicit_uuid_value_still_encodes() -> TestResult {
++    enable();
++    let text = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
++    let value = Value::Uuid(uuid::Uuid::parse_str(text)?);
++    assert_eq!(
++        to_avro_datum(&Schema::Uuid, value)?,
++        string_datum(text.as_bytes())
++    );
++    Ok(())
++}
+-- 
+2.52.0
+

@@ -6,6 +6,7 @@ Patches this repo maintains against `apache-avro` (avro-rs), each a normal
 | Patch | Base | Purpose |
 |---|---|---|
 | `apache-avro-0.21-non-utf8-string.patch` | `rel/release-0.21.0` | Adds `util::set_non_utf8_string_as_bytes`, off by default. On, a `string` whose wire bytes are not valid UTF-8 decodes as `Value::Bytes` instead of failing. Closes D1; see `doc/specs/AvroStringPolicy.md` |
+| `apache-avro-0.21-uuid-as-string.patch` | the non-UTF-8 patch above | Adds `util::set_uuid_as_string`, off by default. On, a `uuid` decodes as an ordinary string, so the bytes as written survive: no canonical rewriting, no reinterpretation of a 16-byte string, no rejection of text that is not a uuid |
 | `apache-avro-0.22-read-into.patch` | avro-rs `8000091350d32f4ed4d94166dcb7695a4a25e409` | Allocation-reusing value decoding: `read_into`, `read_value_into`, `OwnedGenericDatumReader` |
 
 ## apache-avro-0.21-non-utf8-string.patch
@@ -65,6 +66,69 @@ reset within a process: the rejecting cases are unit tests in `decode.rs` and
 
 No public signature changes and no new error variants, and the default preserves
 every existing behaviour, so it is additive for any other consumer of the crate.
+
+## apache-avro-0.21-uuid-as-string.patch
+
+Base: the non-UTF-8 patch above, not the release tag. Both touch `decode.rs`,
+`encode.rs`, `types.rs` and `util.rs`, so stacking them avoids a conflict; apply
+them in order.
+
+```sh
+git clone https://github.com/apache/avro-rs && cd avro-rs
+git checkout rel/release-0.21.0
+git am /path/to/apache-avro-0.21-non-utf8-string.patch
+git am /path/to/apache-avro-0.21-uuid-as-string.patch
+cargo test -p apache-avro --features derive
+```
+
+Verified on 2026-08-17: `cargo fmt` clean, and the suite goes from 551 with the
+non-UTF-8 patch alone to 558, the 7 tests this one adds. The same two
+pre-existing failures noted above still need `--features derive`.
+
+**The behaviour is off by default**, same shape as the patch above:
+
+```rust
+assert!(apache_avro::util::set_uuid_as_string(true));
+```
+
+Why it exists. Avro defines `uuid` as an annotation on `string`, and a reader
+may leave the annotation uninterpreted; avro-cpp does, and never validates one.
+Parsing it into a `Uuid` has three effects that reading it as a string does not,
+each measured against avro-cpp with the differential fuzzer:
+
+- **The bytes change.** `Uuid` re-encodes in canonical hyphenated lowercase, so
+  `urn:uuid:` prefixes, braces, upper-case hex and unhyphenated 32-hex forms are
+  all rewritten. A value read and written back is not the value that arrived.
+- **A 16-byte string is reinterpreted.** Any `uuid` field of exactly 16 bytes is
+  taken as a raw `Uuid` and comes back as 36 characters of hex. Length decides
+  how the field is read, which also means the UTF-8 check is skipped at exactly
+  that length.
+- **Malformed text is rejected**, making data other implementations wrote
+  unreadable.
+
+What it changes, all in `avro/src/`:
+
+- `util.rs`: the `UUID_AS_STRING` `OnceLock`, its `set_uuid_as_string` setter and
+  crate-internal reader, shaped after the setting above.
+- `decode.rs`, a guarded `Schema::Uuid` arm placed before the existing one: with
+  the setting on it delegates to the `Schema::String` path.
+- `types.rs`, `resolve_uuid`: with the setting on a `String` stays a `String`,
+  which is what stops resolution reintroducing the canonicalisation.
+- `types.rs`, `validate`, and `encode.rs`, the `Value::Bytes` arm: accept
+  `Schema::Uuid`, for the non-UTF-8 case.
+
+It composes with `set_non_utf8_string_as_bytes` rather than duplicating it. A
+`uuid` whose text is not valid UTF-8 yields `Value::Bytes` when that setting is
+also on, and still fails when it is not; `non_utf8_still_fails_without_the_other_setting`
+pins that the two stay independent. `Value::String` was already accepted at a
+`Schema::Uuid` position by `validate` and the encoder, so nothing there needed
+widening.
+
+Tests follow the same split: the parsing behaviour stays covered by the existing
+unit tests at the default, and the accepting cases live in
+`avro/tests/uuid_as_string.rs`, because a `OnceLock` cannot be reset in-process.
+
+No public signature changes and no new error variants.
 
 ## apache-avro-0.22-read-into.patch
 
