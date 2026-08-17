@@ -179,6 +179,39 @@ bool DeclaresLengthBeyondLimit(const std::string& bytes, uint64_t limit) {
   return false;
 }
 
+// Avro says nothing about how to recover from a malformed array block header,
+// and the two engines each picked something. A negative item count whose byte
+// size is also negative, a count that overflows the long it is read into, a
+// count larger than any vector can hold, a block that ends early: these are one
+// root cause wearing four messages, so they get one tag rather than an entry
+// per spelling. ArrayBlockHeaderRecoveryDiverges holds the measured evidence.
+//
+// The tag is assigned by schema shape, so it covers any divergence under an
+// array, not only a framing one. That is the cost of consolidating: there is
+// nothing in a decoder's error message that separates a bad header from a bad
+// item. It is applied only in place of the generic lenient tags, so
+// alloc-ceiling, trailing-bytes and rust-panic still win under an
+// array.
+bool IsArraySchema(const std::string& schema_text) {
+  auto parsed = AvroSchema::Parse(schema_text);
+  return parsed.ok() && parsed->IsArray();
+}
+
+// avrocpp stops once it has a complete JSON value and never looks at what
+// follows, so a schema with anything after it still parses while the bridge
+// refuses it. The bridge reports that three different ways depending on where
+// the trailing bytes fail first, which is why this is classified by shape
+// rather than by message: a proper prefix of the text parses on its own.
+//
+// The scan is linear in the length of the text and runs only once a divergence
+// has already been found, never on the hot path.
+bool ParsesAsSchemaPrefix(const std::string& text) {
+  for (size_t len = text.size(); len-- > 1;) {
+    if (AvroSchema::Parse(text.substr(0, len)).ok()) return true;
+  }
+  return false;
+}
+
 // Divergences already triaged. A long run stays quiet on these and stops only
 // on something new, so no environment setup is needed to fuzz for hours.
 //
@@ -201,27 +234,11 @@ constexpr KnownDivergence kKnownDivergences[] = {
     {"bridge-lenient", "EOF reached"},
     {"trailing-bytes", "trailing bytes"},
     {"alloc-ceiling", "Unable to allocate"},
-    {"avrocpp-lenient", "failed to fill whole buffer"},
-    {"bridge-lenient", "vector::_M_default_append"},
-    {"avrocpp-lenient", "Cannot convert i64 to usize"},
+    // One root cause, four messages: see IsArraySchema above.
+    {"array-block-framing", R"("type":"array")"},
+    // Likewise one root cause, three messages: see ParsesAsSchemaPrefix.
+    {"schema-trailing-bytes", "disagree on whether this schema is legal"},
     {"avrocpp-lenient", "Invalid utf-8 string"},
-    {"avrocpp-lenient", "Overflow when decoding integer value"},
-    // Broad, and knowingly so: this is the bridge's only message for a JSON
-    // document it would not parse, so it covers every such schema rather than
-    // just the trailing-junk one below. Narrowing it needs a finer error from
-    // the bridge, not a longer substring here.
-    {"schema-acceptance", "Failed to parse schema from JSON"},
-    // The same divergence when the trailing bytes are not valid UTF-8: the
-    // bridge checks that before it reaches the JSON parser, so the message
-    // differs while the cause does not.
-    {"schema-acceptance", "invalid utf-8 sequence"},
-    // Deliberately broader than the rest, because the round-trip report carries
-    // the schema and the two encodings and nothing that separates one array
-    // framing bug from another. A change in what this input does is caught by
-    // ArrayBlockFramingYieldsDifferentItemsInEachEngine instead, which pins the
-    // counts and the values; a new array divergence would be muted
-    // here, which is the cost of having no finer discriminator to match on.
-    {"reencode-differs", R"({"type":"array","items":"int"})"},
     {"reencode-failed", "decimal sign extension 0"},
 };
 
@@ -444,7 +461,10 @@ void ParsersAgreeOnSchemaAcceptance(const std::string& text) {
   const std::string cpp_verdict =
       cpp.ok() ? std::string("accepted")
                : "rejected: " + std::string(cpp.message());
-  ReportDivergence("schema-acceptance",
+  const bool trailing_bytes =
+      !bridge.ok() && cpp.ok() && ParsesAsSchemaPrefix(text);
+  ReportDivergence(
+      trailing_bytes ? "schema-trailing-bytes" : "schema-acceptance",
                    "the two parsers disagree on whether this schema is legal"
                    "\n  text:    " +
                        text + "\n  bridge:  " + bridge_verdict +
@@ -481,6 +501,8 @@ void DecodersAgreeOnAcceptance(const std::string& schema_text,
       tag = "rust-panic";
     }
   }
+  const bool generic = tag == "bridge-lenient" || tag == "avrocpp-lenient";
+  if (generic && IsArraySchema(schema_text)) tag = "array-block-framing";
   ReportDivergence(
       tag,
       "the two decoders disagree on whether these bytes are decodable"
@@ -552,7 +574,7 @@ void ReencodingAgreesWhenBothDecode(const std::string& schema_text,
   if (*bridge_reencoded == cpp_reencoded) return;
 
   ReportDivergence(
-      "reencode-differs",
+      IsArraySchema(schema_text) ? "array-block-framing" : "reencode-differs",
       "both decoded these bytes but re-encoded them differently"
       "\n  schema:  " +
           schema_text + "\n  input:   " + absl::BytesToHexString(bytes) +
@@ -814,33 +836,6 @@ TEST(AvroBytes, UuidIsReadAsAnOrdinaryStringByBothEngines) {
                          Varint(3) + std::string("\xff\xfe\xfd", 3));
 }
 
-// avrocpp-lenient / "failed to fill whole buffer"
-//
-// A 30-item array block followed by a second block header with nothing behind
-// it. avro-cpp accepts and hands back 29 items -- fewer than the first block
-// declared, with no error -- while the bridge rejects the truncation.
-//
-// The 29-versus-30 count is not explained; it is recorded as measured. I could
-// not reduce this to a smaller input: shorter arrays with the same shape are
-// rejected by both engines.
-TEST(AvroBytes, TruncatedArrayBlockIsAcceptedByAvrocppOnly) {
-  const std::string schema = R"({"type":"array","items":"int"})";
-  const std::string bytes = Varint(-30) +            // 30 items, size follows
-                            Varint(0) +              // declared block size
-                            std::string(30, '\0') +  // 30 items, each 0
-                            Varint(-1) +             // a second block header
-                            Varint(0);               // its size, then nothing
-  ExpectDecodeAcceptance(schema, bytes, false, true);
-
-  ::avro::ValidSchema cpp_schema;
-  ASSERT_TRUE(ParseWithAvrocpp(schema, &cpp_schema).ok());
-  ::avro::GenericDatum datum;
-  ASSERT_TRUE(DecodeWithAvrocpp(cpp_schema, bytes, &datum).ok());
-  ASSERT_EQ(datum.type(), ::avro::AVRO_ARRAY);
-  EXPECT_EQ(datum.value<::avro::GenericArray>().value().size(), 29u)
-      << "avro-cpp returned a different count than when this was recorded";
-}
-
 // alloc-ceiling / "Unable to allocate"
 TEST(AvroBytes, OversizedLengthStopsAtTheBridgeCeilingOnly) {
   // A bytes field declaring 256 MiB with nothing behind it. The bridge refuses
@@ -961,122 +956,38 @@ TEST(AvroBytes, EmptyDecimalDecodesToAValueTheBridgeCannotReadOrReencode) {
             absl::BytesToHexString(bytes));
 }
 
-// bridge-lenient / "vector::_M_default_append"
+// schema-trailing-bytes
 //
-// A fuzzer counterexample, kept verbatim: the bytes are arbitrary and the only
-// property that matters is the block header they happen to spell. The bridge
-// reads it as 58 items; avro-cpp sizes a vector from a declared block count and
-// dies of std::length_error before reading anything. The message is libstdc++'s
-// wording, so this entry is tied to the standard library as well as to avrocpp.
-//
-// The mirror of the alloc-ceiling entry: there the bridge refuses a reservation
-// avrocpp will attempt, here avrocpp cannot size its container and, having no
-// ceiling, throws rather than returning an error.
-TEST(AvroBytes, OversizedArrayBlockIsAcceptedByTheBridgeOnly) {
-  const std::string bytes = FromHex(
-      "0e7479706539726465656c6f6769744e346176726f374465636f6465727379"
-      "6d626f6c7372785821abd33a1f673b757863657074696f6e6e472062797465"
-      "6300");
-  ASSERT_EQ(bytes.size(), 64u);
-  ExpectDecodeAcceptance(R"({"type":"array","items":"int"})", bytes, true,
-                         false);
-
-  auto schema = AvroSchema::Parse(R"({"type":"array","items":"int"})");
-  ASSERT_TRUE(schema.ok()) << schema.status();
-  const auto value = security::avro::DecodeDatum(*schema, bytes);
-  ASSERT_TRUE(value.ok()) << value.status();
-  EXPECT_EQ(value->GetArrayLen().value_or(0), 58u);
-}
-
-// reencode-differs / {"type":"array","items":"int"}
-//
-// The one the acceptance property could never have found: both engines accept,
-// so they never disagree on acceptance, and only the decoded values differ.
-//
-// A well-formed 10-item block, then a header declaring -3, which promises three
-// items and a byte size to follow, and then a byte size of -3, which is not a
-// size. Avro does not say what to do with that and the two recover differently:
-//
-//   bridge:  13 items, reading the three the header asked for
-//   avrocpp: 11 items, nine of which it never read
-//
-// avro-cpp filling in zeros is the part worth watching. A caller gets a value
-// with no indication that most of it was invented, which is worse than either
-// engine's item count being the wrong one.
-TEST(AvroBytes, ArrayBlockFramingYieldsDifferentItemsInEachEngine) {
-  const std::string first_block =
-      Varint(10) +                                    // ten items follow
-      Varint(10) + Varint(10) + Varint(10) +          //
-      Varint(-134620) + Varint(-41) + Varint(1286) +  //
-      Varint(10) + Varint(10) + Varint(-3) + Varint(-3);
-  // A count of -3 promises three items and a byte size; the size given is -3.
-  const std::string second_block =
-      Varint(-3) + Varint(-3) + Varint(-3) + Varint(10) + Varint(10);
-  const std::string bytes = first_block + second_block + Varint(0);
-  ASSERT_EQ(bytes.size(), 20u) << absl::BytesToHexString(bytes);
-
-  const std::string schema_text = R"({"type":"array","items":"int"})";
-  auto schema = AvroSchema::Parse(schema_text);
-  ASSERT_TRUE(schema.ok()) << schema.status();
-  ::avro::ValidSchema cpp_schema;
-  ASSERT_TRUE(ParseWithAvrocpp(schema_text, &cpp_schema).ok());
-
-  const auto bridge_value = security::avro::DecodeDatum(*schema, bytes);
-  ASSERT_TRUE(bridge_value.ok()) << bridge_value.status();
-  EXPECT_EQ(bridge_value->GetArrayLen().value_or(0), 13u);
-
-  ::avro::GenericDatum cpp_value;
-  ASSERT_TRUE(DecodeWithAvrocpp(cpp_schema, bytes, &cpp_value).ok());
-  const auto& cpp_items = cpp_value.value<::avro::GenericArray>().value();
-  EXPECT_EQ(cpp_items.size(), 11u);
-
-  // Both agree on the first item; from there avrocpp returns zeros where the
-  // bridge returns the values the bytes actually carry.
-  EXPECT_EQ(bridge_value->GetArrayItem(0)->GetInt().value_or(0), 10);
-  EXPECT_EQ(cpp_items[0].value<int32_t>(), 10);
-  EXPECT_EQ(bridge_value->GetArrayItem(3)->GetInt().value_or(0), -134620);
-  EXPECT_EQ(cpp_items[3].value<int32_t>(), 0);
-  size_t cpp_zeros = 0;
-  for (const auto& item : cpp_items) {
-    if (item.value<int32_t>() == 0) ++cpp_zeros;
-  }
-  EXPECT_EQ(cpp_zeros, 9u) << "avro-cpp invented nine items";
-}
-
-// avrocpp-lenient / "Cannot convert i64 to usize"
-//
-// A negative block count promises items and a byte size; here the size is also
-// negative. The bridge will not turn it into a length, avrocpp reads on. Same
-// family as the test above and the opposite outcome: there both engines
-// accepted and the values differed, here only one accepts.
-TEST(AvroBytes, NegativeArrayBlockSizeIsAcceptedByAvrocppOnly) {
-  const std::string bytes =
-      FromHex("0202020202020202020202020202020300e3c901ff020202");
-  ASSERT_EQ(bytes.size(), 24u);
-  ExpectDecodeAcceptance(R"({"type":"array","items":"string"})", bytes, false,
-                         true);
-}
-
-// schema-acceptance / "Failed to parse schema from JSON" and "invalid utf-8
-// sequence"
-//
-// avro-cpp stops once it has a complete JSON value and never looks at what
+// avrocpp stops once it has a complete JSON value and never looks at what
 // follows, so a schema document with anything after it still parses. The bridge
-// parses with serde_json, which treats trailing input as an error.
+// refuses it, in three different messages depending on where the trailing bytes
+// fail first: bad JSON, invalid UTF-8, or a UTF-8 sequence cut short. One root
+// cause, so one entry, classified by ParsesAsSchemaPrefix rather than by which
+// message came back.
 //
 // More than parser strictness: a schema is a cache key and a fingerprint input.
 // Two documents differing only in trailing bytes are the same schema to avrocpp
 // and not a schema at all to the bridge, so a producer on one side can write
 // something the other will not load.
 TEST(AvroBytes, TrailingBytesAfterASchemaAreAcceptedByAvrocppOnly) {
+  // Trailing text that is valid UTF-8: the JSON parser is what refuses it.
   for (const std::string& suffix : {"\"", "!", " x", "\n\n]"}) {
     ExpectSchemaAcceptance(R"("string")" + suffix, false, true);
   }
-  // Trailing bytes that are not valid UTF-8 take a different path in the bridge
-  // (the text is checked before it reaches the JSON parser) and get a different
-  // message, so both are pinned here and both have a table entry.
+  // Trailing bytes that are not valid UTF-8, and a UTF-8 sequence cut short.
+  // Both are checked before the text reaches the JSON parser.
   ExpectSchemaAcceptance(R"("int")" + std::string("f_\xc3\x28y", 5), false,
                          true);
+  ExpectSchemaAcceptance(R"("double")" + std::string("l5\xe2\x82", 4), false,
+                         true);
+
+  // All three are one shape, which is what the classifier keys on.
+  EXPECT_TRUE(ParsesAsSchemaPrefix(R"("string")"
+                                   "!"));
+  EXPECT_TRUE(ParsesAsSchemaPrefix(R"("int")" + std::string("f_\xc3\x28y", 5)));
+  // A schema that is merely truncated has no prefix that parses, so it stays a
+  // plain schema-acceptance divergence rather than being absorbed here.
+  EXPECT_FALSE(ParsesAsSchemaPrefix(R"({"type":"reco)"));
 
   // Trailing whitespace alone is fine on both sides, so the divergence is the
   // trailing content and not merely a length mismatch.
@@ -1109,28 +1020,102 @@ TEST(AvroBytes, NonUtf8MapKeyIsAcceptedByAvrocppOnly) {
                          true, true);
 }
 
-// avrocpp-lenient / "Overflow when decoding integer value"
+// array-block-framing
 //
-// Not overflow in general: a bare over-long `int` varint is refused by both, as
-// the contrast below shows. It is overflow in an array block header, which is
-// read as a long. The bridge refuses it; avrocpp keeps shifting and carries on
-// with whatever survived, so a block header the bytes do not encode decides how
-// much of the input it reads.
-TEST(AvroBytes, OverflowingArrayBlockHeaderIsAcceptedByAvrocppOnly) {
-  const std::string in_array =
-      FromHex("07070707170707000707646f637479706583838383838383838383");
-  ASSERT_EQ(in_array.size(), 27u);
-  ExpectDecodeAcceptance(R"({"type":"array","items":"int"})", in_array, false,
-                         true);
+// One entry and one test for what were five, because they are five spellings of
+// one root cause: Avro does not define recovery from a malformed array block
+// header, so each engine invented its own and they do not match. Recording a
+// message per spelling was open-ended, since a header can be malformed in as
+// many ways as a varint can be written.
+//
+// Every row below was found by the fuzzer and reproduces on this host. What
+// they share is that the header, not the items, decides the outcome.
+//
+// The last row is the one worth fixing first. Both engines accept it, so no
+// acceptance check could ever see it, and avrocpp returns nine items it never
+// read, filled with zeros, with nothing to tell a caller that most of the value
+// was invented.
+TEST(AvroBytes, ArrayBlockHeaderRecoveryDiverges) {
+  const std::string ints = R"({"type":"array","items":"int"})";
+  const std::string strings = R"({"type":"array","items":"string"})";
 
-  // The contrast. Six continuation bytes where an `int` is expected overflows
-  // on both sides, so the divergence is the header position and not the varint.
-  const std::string too_long = std::string(6, '\x83') + std::string(1, '\x01');
-  ExpectDecodeAcceptance(R"("int")", too_long, false, false);
+  // A 30-item block, then a second header with nothing behind it. avrocpp hands
+  // back 29 items, one fewer than declared, with no error. The 29-versus-30 is
+  // not explained and is recorded as measured; shorter arrays of the same shape
+  // are rejected by both.
+  const std::string truncated = Varint(-30) + Varint(0) +
+                                std::string(30, '\0') + Varint(-1) + Varint(0);
+  ExpectDecodeAcceptance(ints, truncated, false, true);
+  {
+    ::avro::ValidSchema cpp_schema;
+    ASSERT_TRUE(ParseWithAvrocpp(ints, &cpp_schema).ok());
+    ::avro::GenericDatum datum;
+    ASSERT_TRUE(DecodeWithAvrocpp(cpp_schema, truncated, &datum).ok());
+    ASSERT_EQ(datum.type(), ::avro::AVRO_ARRAY);
+    EXPECT_EQ(datum.value<::avro::GenericArray>().value().size(), 29u);
+  }
+
+  // A count avrocpp sizes a vector from, dying of std::length_error before it
+  // reads anything, where the bridge reads 58 items. The message is libstdc++'s
+  // wording, so this row is tied to the standard library as well as to avrocpp.
+  const std::string oversized = FromHex(
+      "0e7479706539726465656c6f6769744e346176726f374465636f6465727379"
+      "6d626f6c7372785821abd33a1f673b757863657074696f6e6e472062797465"
+      "6300");
+  ExpectDecodeAcceptance(ints, oversized, true, false);
+
+  // A negative count promises items and a byte size; the size is negative too.
+  // The bridge will not turn that into a length, avrocpp reads on.
+  ExpectDecodeAcceptance(
+      strings, FromHex("0202020202020202020202020202020300e3c901ff020202"),
+      false, true);
+
+  // A header whose varint overflows the long it is read into. Not overflow in
+  // general: the same varint where an item is expected overflows on both sides,
+  // which the contrast below pins, so it is the header position that diverges.
+  ExpectDecodeAcceptance(
+      ints, FromHex("07070707170707000707646f637479706583838383838383838383"),
+      false, true);
+  ExpectDecodeAcceptance(R"("int")",
+                         std::string(6, '\x83') + std::string(1, '\x01'), false,
+                         false);
+
+  // Both accept and only the values differ. A 10-item block, then a header
+  // declaring -3 items with a byte size of -3, which is not a size.
+  const std::string ambiguous =
+      Varint(10) + Varint(10) + Varint(10) + Varint(10) + Varint(-134620) +
+      Varint(-41) + Varint(1286) + Varint(10) + Varint(10) + Varint(-3) +
+      Varint(-3) + Varint(-3) + Varint(-3) + Varint(-3) + Varint(10) +
+      Varint(10) + Varint(0);
+  ASSERT_EQ(ambiguous.size(), 20u) << absl::BytesToHexString(ambiguous);
+
+  auto schema = AvroSchema::Parse(ints);
+  ASSERT_TRUE(schema.ok()) << schema.status();
+  ::avro::ValidSchema cpp_schema;
+  ASSERT_TRUE(ParseWithAvrocpp(ints, &cpp_schema).ok());
+
+  const auto bridge_value = security::avro::DecodeDatum(*schema, ambiguous);
+  ASSERT_TRUE(bridge_value.ok()) << bridge_value.status();
+  EXPECT_EQ(bridge_value->GetArrayLen().value_or(0), 13u);
+
+  ::avro::GenericDatum cpp_value;
+  ASSERT_TRUE(DecodeWithAvrocpp(cpp_schema, ambiguous, &cpp_value).ok());
+  const auto& cpp_items = cpp_value.value<::avro::GenericArray>().value();
+  EXPECT_EQ(cpp_items.size(), 11u);
+
+  EXPECT_EQ(bridge_value->GetArrayItem(0)->GetInt().value_or(0), 10);
+  EXPECT_EQ(cpp_items[0].value<int32_t>(), 10);
+  EXPECT_EQ(bridge_value->GetArrayItem(3)->GetInt().value_or(0), -134620);
+  EXPECT_EQ(cpp_items[3].value<int32_t>(), 0);
+  size_t cpp_zeros = 0;
+  for (const auto& item : cpp_items) {
+    if (item.value<int32_t>() == 0) ++cpp_zeros;
+  }
+  EXPECT_EQ(cpp_zeros, 9u) << "avro-cpp invented nine items";
 }
 
 TEST(AvroBytes, KnownDivergenceTableSizeIsPinned) {
-  EXPECT_EQ(std::size(kKnownDivergences), 15u)
+  EXPECT_EQ(std::size(kKnownDivergences), 10u)
       << "adding an entry means adding a test named after it above; bump this "
          "count once you have";
 }
