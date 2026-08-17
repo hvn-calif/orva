@@ -226,5 +226,25 @@ if (AVRO_BUILD_FUZZERS)
     endforeach()
   endforeach()
 
+  # Self-contained byte-oriented differential fuzzer. Links the two engines and
+  # nothing from fuzz/.
+  if (TARGET avrocpp_iface)
+    add_executable(avro_bytes_fuzz_test avro_bytes_fuzz_test.cc)
+    target_include_directories(avro_bytes_fuzz_test PRIVATE ${CMAKE_SOURCE_DIR})
+    target_link_libraries(avro_bytes_fuzz_test PRIVATE
+      avro_bridge rust avrocpp_iface)
+    link_fuzztest(avro_bytes_fuzz_test)
+    target_compile_options(avro_bytes_fuzz_test PRIVATE
+      ${AVRO_FUZZ_COVERAGE_FLAGS})
+    if (FUZZTEST_FUZZING_MODE)
+      target_compile_options(avro_bytes_fuzz_test PRIVATE
+        -fsanitize=undefined -fno-sanitize-recover=undefined -fno-sanitize=vptr)
+      target_link_options(avro_bytes_fuzz_test PRIVATE -fsanitize=undefined)
+    endif()
+    gtest_discover_tests(avro_bytes_fuzz_test
+      DISCOVERY_MODE PRE_TEST
+      PROPERTIES TIMEOUT 300)
+  endif()
+
   add_subdirectory(fuzz)
 endif()
