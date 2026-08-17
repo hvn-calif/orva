@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "fuzz/ir.h"
+#include "fuzz/lower_schema.h"
 #include "fuzztest/fuzztest.h"
 
 namespace security::avro_fuzz {
@@ -195,6 +196,47 @@ fuzztest::Domain<Node> AnyTree(int max_depth) {
     layer = OneOf(LeafLayer(), std::move(composite));
   }
   return layer;
+}
+
+fuzztest::Domain<std::string> AnySchemaText() {
+  // Shapes a structure-aware generator cannot reach. Empty containers and
+  // truncations are the point; the well-formed entries are here so a mutation
+  // starts from something a parser gets past its first character.
+  static const std::vector<std::string>* seeds = new std::vector<std::string>{
+      "[]",                                  // empty union
+      "[[]]",                                // union of empty union
+      R"({"type":"enum","name":"E","symbols":[]})",       // empty enum
+      R"({"type":"record","name":"R","fields":[]})",      // legal: empty record
+      R"({"type":"record","name":"R","fields":[{"name":"a","type":[]}]})",
+      R"({"type":"array"})",                 // missing items
+      R"({"type":"map"})",                   // missing values
+      R"({"type":"fixed","name":"F"})",      // missing size
+      R"({"type":"fixed","name":"F","size":-1})",
+      R"({"type":"fixed","name":"F","size":99999999999999999999})",
+      R"({"type":)",                         // truncated
+      R"({"type":"record","name":"R","fields":[)",
+      "{}",
+      "null",
+      "0",
+      R"("")",
+      R"("int")",
+      R"(["int","int"])",                    // duplicate union branch type
+      R"({"type":"int","logicalType":"unknown-logical-type"})",
+      R"({"type":"bytes","logicalType":"decimal","precision":0,"scale":1})",
+      R"({"type":"record","name":"R","fields":[{"name":"a","type":"R"}]})",
+      R"({"type":"\uD800"})",                // lone surrogate in an escape
+      "\xef\xbb\xbf\"int\"",                 // byte-order mark before a schema
+      R"({"type":"string","default":})",
+  };
+  return OneOf(ElementOf<std::string>(*seeds),
+               // Every schema the tree generator can build, as text. Gives the
+               // mutator a valid starting point to corrupt.
+               fuzztest::Map(
+                   [](const Node& node) {
+                     return ToSchemaJson(Normalize(node, NormalizeOptions{}));
+                   },
+                   AnyTree()),
+               Arbitrary<std::string>().WithMaxSize(64));
 }
 
 fuzztest::Domain<Node> AnyDeepChain(int max_depth) {

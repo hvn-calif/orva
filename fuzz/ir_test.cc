@@ -249,8 +249,9 @@ TEST(Divergence, EvidenceNarrowsASuppression) {
 }
 
 TEST(Divergence, ShippedSuppressionFileIsEmpty) {
-  // The harness's acceptance test is that it rediscovers D1 and D2 cold. If
-  // someone silences them to make a run green, this fails.
+  // The harness's acceptance test is that it rediscovers D1 and D2 starting
+  // from an empty corpus, with no seed inputs. If someone silences them to make
+  // a run green, this fails.
   SuppressionSet set;
   std::string error;
   ASSERT_TRUE(ParseSuppressions(

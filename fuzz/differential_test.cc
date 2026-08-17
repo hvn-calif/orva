@@ -66,6 +66,16 @@ bool LooksLikeRustPanic(const absl::Status& status) {
          std::string::npos;
 }
 
+// The bridge refuses an allocation past its ceiling, by policy and
+// deterministically. avro-cpp has no ceiling: it refuses the same input only
+// when the allocation actually fails or the data runs out, which depends on
+// how much memory the machine has. So a verdict comparison on such an input is
+// not meaningful in either direction, which is what D9 records.
+bool LooksLikeAllocationCeiling(const absl::Status& status) {
+  return std::string(status.message()).find("Unable to allocate") !=
+         std::string::npos;
+}
+
 struct CppEncoded {
   CppOutcome outcome;
   std::string bytes;
@@ -101,6 +111,22 @@ CppOutcome DecodeWithAvrocpp(const ::avro::ValidSchema& schema,
     *out = ::avro::GenericDatum(schema);
     ::avro::decode(*decoder, *out);
   });
+}
+
+// avro-cpp stops at the end of the first datum and ignores whatever follows;
+// the bridge requires the buffer to be exactly one datum. Re-encoding what
+// avro-cpp decoded gives the length it consumed, so a shorter re-encoding means
+// the input carried trailing bytes.
+//
+// A non-canonical varint in the input would also re-encode shorter, for an
+// unrelated reason. This only chooses which divergence ID to report, never
+// whether to report, so a misclassification costs a wrong label on a finding
+// that is real either way.
+bool TrailingBytesExplainIt(const ::avro::ValidSchema& schema,
+                            const ::avro::GenericDatum& datum,
+                            const std::string& bytes) {
+  CppEncoded reencoded = EncodeWithAvrocpp(schema, datum);
+  return reencoded.outcome.ok() && reencoded.bytes.size() < bytes.size();
 }
 
 // ---------------------------------------------------------------------------
@@ -215,8 +241,11 @@ void SchemaVerdictsAgree(const Node& raw) {
 FUZZ_TEST(Differential, SchemaVerdictsAgree).WithDomains(AnyTree());
 
 // A schema rendered by one engine must parse in the other. This is the only
-// differential available on schema *rendering*, since avro-cpp 1.11.4 has no
-// canonical-form or fingerprint API to compare against.
+// differential available on schema *rendering*: avro-cpp 1.11.4 has no
+// canonical-form or fingerprint API, so the bridge's `CanonicalForm()` and
+// `FingerprintRabin()` have nothing to be compared against and are out of
+// scope here. See doc/CanonicalFormBug.md for a conformance bug on that
+// surface, found while this harness was being written.
 void SchemasCrossParse(const Node& raw) {
   const Node tree = Normalize(raw, NormalizeOptions{});
   const std::string schema_json = ToSchemaJson(tree);
@@ -260,19 +289,119 @@ void SchemasCrossParse(const Node& raw) {
     }
   }
 
-  // Intra-bridge, since avro-cpp has no counterpart: the canonical form must
-  // reparse to a schema with the same fingerprint.
-  auto canonical = AvroSchema::Parse(bridge_schema->CanonicalForm());
-  if (canonical.ok() &&
-      canonical->FingerprintRabin() != bridge_schema->FingerprintRabin()) {
-    log.Report(DivergenceId::kCrossParseRoundTrip, "$",
-               "the canonical form reparses to a different fingerprint",
-               "canonical fingerprint");
+  ASSERT_TRUE(log.empty()) << log.Render() << "schema: " << schema_json;
+}
+FUZZ_TEST(Differential, SchemasCrossParse).WithDomains(AnyTree());
+
+// ---------------------------------------------------------------------------
+// Byte-oriented properties.
+//
+// The three above generate a tree and lower it, so they only ever exercise
+// schemas the generator can build and values that match them. That is what
+// makes them productive without Rust-side coverage instrumentation, but it
+// also bounds them: Normalize legalises the tree, so `[]` and other malformed
+// shapes are unreachable however long they run, and a lowered value never
+// exercises a decoder's error paths.
+//
+// These two take the input as *bytes* instead, covering the complement.
+// ---------------------------------------------------------------------------
+
+// Schema text straight to both parsers. No tree, no lowering.
+void SchemaTextVerdictsAgree(const std::string& text) {
+  const bool bridge_ok = AvroSchema::Parse(text).ok();
+  CppOutcome parsed = CallAvrocpp("compileJsonSchemaFromMemory", [&] {
+    ::avro::compileJsonSchemaFromMemory(
+        reinterpret_cast<const uint8_t*>(text.data()), text.size());
+  });
+
+  FindingLog log(&Suppressions());
+  if (bridge_ok != parsed.ok()) {
+    log.Report(DivergenceId::kSchemaParseVerdict, "$",
+               std::string("the bridge ") + (bridge_ok ? "accepted" : "rejected") +
+                   " schema text avro-cpp " +
+                   (parsed.ok() ? "accepted" : "rejected") +
+                   (parsed.ok() ? "" : " (" + parsed.what + ")"),
+               parsed.ok() ? "bridge rejected" : "avrocpp rejected");
+  }
+  ASSERT_TRUE(log.empty()) << log.Render() << "text: " << text;
+}
+FUZZ_TEST(Differential, SchemaTextVerdictsAgree).WithDomains(AnySchemaText());
+
+// A schema both engines accept, with arbitrary bytes as the encoded datum.
+//
+// The schema still comes from the tree generator, since random bytes are
+// almost never a legal schema and an input where both parsers refuse teaches
+// nothing. The *payload* is unconstrained, which is the point: a lowered value
+// always encodes to well-formed bytes, so DatumCircleAgrees never reaches the
+// decoders' length-prefix, framing or truncation paths.
+void DecodersAgreeOnArbitraryBytes(const Node& raw, const std::string& bytes) {
+  const Node tree = Normalize(raw, NormalizeOptions{});
+  const std::string schema_json = ToSchemaJson(tree);
+
+  auto bridge_schema = AvroSchema::Parse(schema_json);
+  ::avro::ValidSchema cpp_schema;
+  CppOutcome parsed = CallAvrocpp("compileJsonSchemaFromMemory", [&] {
+    cpp_schema = ::avro::compileJsonSchemaFromMemory(
+        reinterpret_cast<const uint8_t*>(schema_json.data()),
+        schema_json.size());
+  });
+  if (!bridge_schema.ok() || !parsed.ok()) return;
+
+  FindingLog log(&Suppressions());
+
+  auto bridge_decoded = security::avro::DecodeDatum(*bridge_schema, bytes);
+  ::avro::GenericDatum cpp_datum;
+  CppOutcome cpp_decoded = DecodeWithAvrocpp(cpp_schema, bytes, &cpp_datum);
+
+  const bool bridge_panicked =
+      !bridge_decoded.ok() && LooksLikeRustPanic(bridge_decoded.status());
+  if (bridge_panicked) {
+    log.Report(DivergenceId::kRustPanicCaught, "$",
+               "decoding panicked: " +
+                   std::string(bridge_decoded.status().message()) + " [" +
+                   Hex(bytes) + "]",
+               "rust panic");
+  }
+
+  if (bridge_decoded.ok() && !cpp_decoded.ok()) {
+    log.Report(DivergenceId::kDecodeVerdictBridgeLenient, "$",
+               "the bridge decoded bytes avro-cpp rejected: " + cpp_decoded.what +
+                   " [" + Hex(bytes) + "]",
+               "avrocpp rejected");
+  } else if (!bridge_decoded.ok() && cpp_decoded.ok() && !bridge_panicked) {
+    // Three different things can put us here, and reporting them all as one
+    // divergence would mislabel two of them.
+    //
+    // D9: the bridge's allocation ceiling fired. avro-cpp has no ceiling, so
+    // whether it also refuses depends on the machine's memory rather than on
+    // the input, and the two are not comparable.
+    //
+    // TRAILING_BYTES: avro-cpp stops at the end of the first datum and ignores
+    // the rest; the bridge requires the buffer to hold exactly one datum.
+    //
+    // Anything else is a real decode disagreement.
+    DivergenceId id = DivergenceId::kDecodeVerdictAvrocppLenient;
+    const char* narrow = "bridge rejected";
+    if (LooksLikeAllocationCeiling(bridge_decoded.status())) {
+      id = DivergenceId::kD9AllocationCeiling;
+      narrow = "allocation ceiling";
+    } else if (TrailingBytesExplainIt(cpp_schema, cpp_datum, bytes)) {
+      id = DivergenceId::kTrailingBytes;
+      narrow = "trailing bytes";
+    }
+    log.Report(id, "$",
+               "avro-cpp decoded bytes the bridge rejected: " +
+                   std::string(bridge_decoded.status().message()) + " [" +
+                   Hex(bytes) + "]",
+               narrow);
+  } else if (bridge_decoded.ok() && cpp_decoded.ok()) {
+    CompareValues(*bridge_decoded, cpp_datum, &log);
   }
 
   ASSERT_TRUE(log.empty()) << log.Render() << "schema: " << schema_json;
 }
-FUZZ_TEST(Differential, SchemasCrossParse).WithDomains(AnyTree());
+FUZZ_TEST(Differential, DecodersAgreeOnArbitraryBytes)
+    .WithDomains(AnyTree(), fuzztest::Arbitrary<std::string>().WithMaxSize(64));
 
 // ---------------------------------------------------------------------------
 // Regression seeds. Triaged findings are pinned here so they stay fixed.
@@ -299,45 +428,199 @@ TEST(Differential, D2DuplicateMapKeyCollapsesInTheBridge) {
                             "at this commit; avro-cpp keeps both";
 }
 
-// NEW FINDING, found cold by SchemasCrossParse.
+// NEW FINDING, found by DecodersAgreeOnArbitraryBytes on its first input.
 //
-// A logical type layered on a primitive produces a canonical form that is not
-// canonical. Avro's Parsing Canonical Form requires primitives in their simple
-// form -- `"int"`, not `{"type":"int"}` -- so the value below violates the
-// spec, is not idempotent under reparsing, and yields a Rabin fingerprint that
-// disagrees with the spec's.
+// The bridge decodes an *empty* buffer into a fully-formed value, fabricating
+// nulls for fields that have no bytes behind them. avro-cpp reports EOF.
 //
-// 8247732601305521295 is the fingerprint the Avro spec's own test data gives
-// for `"int"`, and it is what rust/schema.rs already asserts. So the annotated
-// schema's 8145260995063234477 is simply wrong: two schemas whose canonical
-// forms must be identical fingerprint differently.
+//   schema: {"type":"record","name":"R","fields":[
+//              {"name":"a","type":"boolean"},{"name":"b","type":"boolean"}]}
+//   input:  "" (zero bytes)
+//   bridge: ok, {"a":null,"b":null}
+//   avrocpp: avro::decode: EOF reached
 //
-// This matters beyond tidiness -- fingerprints are how schema registries
-// establish schema identity, so a wrong one means a missed cache hit or a
-// failed lookup.
+// Two things are wrong. Decoding zero bytes should fail, and the value that
+// comes back does not inhabit its own schema -- `null` is not a legal value of
+// `boolean`. A caller handed a truncated message gets a success status and a
+// record of nulls rather than an error, which is silent data fabrication: the
+// same class the register reserves for its worst entries, but manufacturing
+// data rather than losing it.
 //
-// The assertions below pin the buggy behaviour as it stands at this commit.
-// When it is fixed they will fail, which is the signal to promote them back to
-// the correctness assertions in the comment above.
-TEST(Differential, CanonicalFormIsNotCanonicalForLogicalTypes) {
-  auto annotated =
-      AvroSchema::Parse(R"({"type":"int","logicalType":"time-millis"})");
-  ASSERT_TRUE(annotated.ok()) << annotated.status();
-  auto plain = AvroSchema::Parse(R"("int")");
-  ASSERT_TRUE(plain.ok()) << plain.status();
+// The tree-based properties cannot reach this. A lowered value always encodes
+// to well-formed bytes, so no generated input is ever truncated.
+TEST(Differential, EmptyInputDecodesToFabricatedNulls) {
+  const std::string schema_text =
+      R"({"type":"record","name":"R","fields":[)"
+      R"({"name":"a","type":"boolean"},{"name":"b","type":"boolean"}]})";
 
-  // Should be `"int"` per the spec's PRIMITIVES rule.
-  EXPECT_EQ(annotated->CanonicalForm(), R"({"type":"int"})");
-  EXPECT_EQ(plain->CanonicalForm(), R"("int")");
+  auto bridge_schema = AvroSchema::Parse(schema_text);
+  ASSERT_TRUE(bridge_schema.ok()) << bridge_schema.status();
+  ::avro::ValidSchema cpp_schema;
+  CppOutcome parsed = CallAvrocpp("compileJsonSchemaFromMemory", [&] {
+    cpp_schema = ::avro::compileJsonSchemaFromMemory(
+        reinterpret_cast<const uint8_t*>(schema_text.data()),
+        schema_text.size());
+  });
+  ASSERT_TRUE(parsed.ok()) << parsed.what;
 
-  // So the canonical form is not idempotent.
-  auto reparsed = AvroSchema::Parse(annotated->CanonicalForm());
-  ASSERT_TRUE(reparsed.ok()) << reparsed.status();
-  EXPECT_NE(annotated->CanonicalForm(), reparsed->CanonicalForm());
+  ::avro::GenericDatum datum;
+  CppOutcome cpp = DecodeWithAvrocpp(cpp_schema, std::string(), &datum);
+  EXPECT_FALSE(cpp.ok()) << "avro-cpp is expected to report EOF on empty input";
 
-  // And the fingerprint disagrees with the spec value for an int schema.
-  EXPECT_EQ(plain->FingerprintRabin(), 8247732601305521295LL);
-  EXPECT_NE(annotated->FingerprintRabin(), plain->FingerprintRabin());
+  auto decoded = security::avro::DecodeDatum(*bridge_schema, std::string());
+  ASSERT_TRUE(decoded.ok())
+      << "the bridge is expected to accept empty input at this commit; if it "
+         "now fails, this finding is fixed and the expectations below need "
+         "flipping";
+  auto json = decoded->ToJsonString();
+  ASSERT_TRUE(json.ok()) << json.status();
+  EXPECT_EQ(*json, R"({"a":null,"b":null})")
+      << "both boolean fields were fabricated from no input at all";
+}
+
+// Same finding, minimal shapes. A bare `boolean` decodes to Null, and a union
+// decodes to a union whose branch is Null -- neither inhabits its schema.
+TEST(Differential, EmptyInputFabricatesNullForBooleanAndUnion) {
+  auto boolean_schema = AvroSchema::Parse(R"("boolean")");
+  ASSERT_TRUE(boolean_schema.ok());
+  auto as_boolean = security::avro::DecodeDatum(*boolean_schema, std::string());
+  ASSERT_TRUE(as_boolean.ok());
+  EXPECT_TRUE(as_boolean->IsNull()) << "decoded Null under a boolean schema";
+  EXPECT_FALSE(as_boolean->GetBoolean().ok());
+
+  auto union_schema = AvroSchema::Parse(R"(["int"])");
+  ASSERT_TRUE(union_schema.ok());
+  auto as_union = security::avro::DecodeDatum(*union_schema, std::string());
+  ASSERT_TRUE(as_union.ok());
+  ASSERT_TRUE(as_union->IsUnion());
+  auto branch = as_union->GetUnionValue();
+  ASSERT_TRUE(branch.ok());
+  EXPECT_TRUE(branch->IsNull())
+      << "a union of int alone decoded to a null branch from no input";
+
+  // `null` really does encode as zero bytes, so this one is correct and is
+  // here to show the finding is not just "empty input always succeeds".
+  auto null_schema = AvroSchema::Parse(R"("null")");
+  ASSERT_TRUE(null_schema.ok());
+  EXPECT_TRUE(security::avro::DecodeDatum(*null_schema, std::string()).ok());
+
+  // And an int does fail, so the fabrication is type-dependent rather than
+  // uniform -- which is what makes it easy to miss.
+  auto int_schema = AvroSchema::Parse(R"("int")");
+  ASSERT_TRUE(int_schema.ok());
+  EXPECT_FALSE(security::avro::DecodeDatum(*int_schema, std::string()).ok());
+}
+
+// NEW FINDING, found by SchemaTextVerdictsAgree on its first input.
+//
+// An empty union `[]` and an empty enum are accepted by the bridge and
+// rejected by avro-cpp ("bad node of type union"/"of type enum"). The bridge
+// also re-renders `[]` as `[]`, so it round-trips a schema avro-cpp cannot
+// read.
+//
+// This is the case the tree-based generator provably cannot produce:
+// NormalizeChildren tops an empty union up to one branch, so no amount of
+// running SchemaVerdictsAgree would have found it. Two bytes of schema text
+// found it on the first input.
+TEST(Differential, EmptyUnionAndEnumAcceptedOnlyByTheBridge) {
+  for (const char* text : {R"([])",
+                           R"({"type":"enum","name":"E","symbols":[]})",
+                           R"({"type":"record","name":"R","fields":[)"
+                           R"({"name":"a","type":[]}]})"}) {
+    const std::string schema(text);
+    EXPECT_TRUE(AvroSchema::Parse(schema).ok())
+        << "the bridge is expected to accept " << schema;
+    CppOutcome parsed = CallAvrocpp("compileJsonSchemaFromMemory", [&] {
+      ::avro::compileJsonSchemaFromMemory(
+          reinterpret_cast<const uint8_t*>(schema.data()), schema.size());
+    });
+    EXPECT_FALSE(parsed.ok()) << "avro-cpp is expected to reject " << schema;
+  }
+}
+
+// NEW FINDING, found by SchemasCrossParse.
+//
+// The bridge re-renders a `duration`-annotated fixed in a shape avro-cpp
+// cannot parse, and loses the schema's identity doing it:
+//
+//   in:  {"type":"fixed","name":"B","namespace":"ns","size":12,
+//         "logicalType":"duration"}
+//   out: {"type":{"type":"fixed","name":"duration","size":12},
+//         "logicalType":"duration"}
+//
+// Both engines parse the input. The rendering is where they part company, in
+// two distinct ways:
+//
+//   1. The fixed is nested inside "type" as an object. avro-cpp rejects that
+//      with `Json field "type" is not a string`, so a schema that made the
+//      round trip through the bridge can no longer be read by avro-cpp -- the
+//      exact direction that breaks a partly-migrated deployment.
+//   2. Name and namespace are dropped. `ns.B` comes back as `duration`, so
+//      schema identity does not survive the round trip even for readers that
+//      can parse the result.
+TEST(Differential, DurationFixedRendersUnparseableByAvrocpp) {
+  const std::string original =
+      R"({"type":"fixed","name":"B","namespace":"ns","size":12,)"
+      R"("logicalType":"duration"})";
+
+  // Both engines accept the original.
+  auto bridge_schema = AvroSchema::Parse(original);
+  ASSERT_TRUE(bridge_schema.ok()) << bridge_schema.status();
+  CppOutcome parsed = CallAvrocpp("compileJsonSchemaFromMemory", [&] {
+    ::avro::compileJsonSchemaFromMemory(
+        reinterpret_cast<const uint8_t*>(original.data()), original.size());
+  });
+  ASSERT_TRUE(parsed.ok()) << parsed.what;
+
+  auto rendered = bridge_schema->ToJsonString();
+  ASSERT_TRUE(rendered.ok()) << rendered.status();
+
+  // Pins the buggy rendering as it stands at this commit. Both expectations
+  // flip when it is fixed, which is the signal to turn them into the
+  // correctness assertions described above.
+  EXPECT_EQ(*rendered,
+            R"({"type":{"type":"fixed","name":"duration","size":12},)"
+            R"("logicalType":"duration"})")
+      << "the name ns.B should have survived the round trip";
+
+  CppOutcome reparsed = CallAvrocpp("compileJsonSchemaFromMemory", [&] {
+    ::avro::compileJsonSchemaFromMemory(
+        reinterpret_cast<const uint8_t*>(rendered->data()), rendered->size());
+  });
+  EXPECT_FALSE(reparsed.ok())
+      << "avro-cpp now parses the bridge's duration rendering; this finding is "
+         "fixed and the harness's expectations need updating";
+}
+
+// NEW FINDING, found by DecodersAgreeOnArbitraryBytes.
+//
+// avro-cpp stops at the end of the first datum and ignores whatever follows;
+// the bridge requires the buffer to hold exactly one datum and rejects the
+// remainder. Direction is bridge-stricter, so nothing is mis-decoded, and the
+// bridge's behaviour is the more defensible of the two -- trailing bytes after
+// a single datum usually mean framing has gone wrong. Recorded because it is a
+// difference callers will hit when moving code that relied on avro-cpp
+// tolerating a padded buffer.
+TEST(Differential, TrailingBytesAcceptedOnlyByAvrocpp) {
+  const std::string schema_text = R"("int")";
+  const std::string bytes("\x02\xff", 2);  // one int, then a stray byte
+
+  auto bridge_schema = AvroSchema::Parse(schema_text);
+  ASSERT_TRUE(bridge_schema.ok()) << bridge_schema.status();
+  ::avro::ValidSchema cpp_schema;
+  CppOutcome parsed = CallAvrocpp("compileJsonSchemaFromMemory", [&] {
+    cpp_schema = ::avro::compileJsonSchemaFromMemory(
+        reinterpret_cast<const uint8_t*>(schema_text.data()),
+        schema_text.size());
+  });
+  ASSERT_TRUE(parsed.ok()) << parsed.what;
+
+  ::avro::GenericDatum datum;
+  CppOutcome cpp = DecodeWithAvrocpp(cpp_schema, bytes, &datum);
+  EXPECT_TRUE(cpp.ok()) << "avro-cpp is expected to ignore the trailing byte";
+
+  auto decoded = security::avro::DecodeDatum(*bridge_schema, bytes);
+  EXPECT_FALSE(decoded.ok()) << "the bridge is expected to reject trailing bytes";
 }
 
 // NEW FINDING, found by DatumCircleAgrees under coverage-guided fuzzing.

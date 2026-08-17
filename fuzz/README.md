@@ -1,31 +1,81 @@
 # Differential fuzzing: avro_bridge vs Apache avro-cpp
 
-This tree is pinned at `84ce4af`, deliberately. Two divergences that later
-commits closed are still open bugs here:
+## Glossary
 
-- **D1** — a `string` holding non-UTF-8 bytes. avro-cpp accepts it unvalidated;
+Every short form used here, other than ones assumed universally known (JSON,
+UTF-8, RAM, ID).
+
+| Term | Expansion | What it is here |
+| --- | --- | --- |
+| ANTLR | (a name) | the parser-generator whose C++ runtime FuzzTest pulls in; it appears only as a build dependency. |
+| ASan | AddressSanitizer | clang's memory-error detector, on globally in the fuzzing build. |
+| avro-cpp | Apache Avro C++ | the incumbent implementation, the thing we compare against. |
+| `avro_bridge` | (a name) | the replacement: a Crubit/corrosion binding over the Rust `apache-avro` crate. Called "the bridge" below. |
+| Crubit | (a name) | Google's C++/Rust interop generator, which produces the bridge's C++ API. |
+| corrosion | (a name) | the CMake plugin that drives `cargo` for the Rust half of the build. |
+| D1 | (a name) | divergence register entry 1: a `string` holding non-UTF-8 bytes. Also a suppression ID (`suppress.h`). |
+| D2 | (a name) | divergence register entry 2: duplicate keys in a map. Also a suppression ID. |
+| D3 | (a name) | divergence register entry 3: encoded map byte order is unstable, because Rust `HashMap` iteration order varies per process. Not a suppression ID. |
+| divergence register | (a name) | `doc/AvrocppDivergences.md` on `main`: the hand-maintained list of known, accepted differences between the two implementations. |
+| FuzzTest | (a name) | Google's property-based fuzzing framework, this harness's test driver. |
+| lowering | (a name) | a function turning the generated `Node` tree into one concrete artifact: schema JSON, a bridge `AvroValue`, or an avro-cpp `GenericDatum`. |
+| LSan | LeakSanitizer | clang's memory-leak detector, disabled here via `detect_leaks=0`. |
+| oracle | (a name) | the comparison step deciding whether the two implementations agreed on one generated input. |
+| RE2 | (a name) | Google's regular-expression library, another FuzzTest build dependency. |
+| sancov | SanitizerCoverage | clang's coverage instrumentation, which feeds the mutator. |
+| suppression ID | (a name) | a name that mutes one known divergence for a run, via `suppressions.txt` or `AVRO_FUZZ_SUPPRESS`. |
+| UBSan | UndefinedBehaviorSanitizer | clang's undefined-behaviour detector, enabled per target. |
+
+## Why this baseline
+
+This tree is pinned at `84ce4af`, deliberately. Two divergences the register
+documents are open here in both directions:
+
+- **D1** -- a `string` holding non-UTF-8 bytes. avro-cpp accepts it unvalidated;
   the bridge rejects it on write (`rust/value.rs`, `create_string` calls
   `utf8(v)?`) and on read.
-- **D2** — duplicate keys in a map. avro-cpp keeps both entries; the bridge
+- **D2** -- duplicate keys in a map. avro-cpp keeps both entries; the bridge
   collapses them last-write-wins (`entries.insert` into a `HashMap`).
 
-Both were fixed twelve commits later by `efb7162`. So this baseline has a known
-answer key, and **the harness's acceptance test is that it finds D1 and D2 from
-an empty corpus without being told to look for them.** A differential fuzzer
-that cannot rediscover known bugs is not evidence of anything.
+Both are register entries, written down before this harness existed, so
+**the acceptance test is that the harness finds D1 and D2 starting from an empty
+corpus, with no seed inputs and no test written to target them.** A differential
+fuzzer that cannot rediscover known bugs is not evidence of anything.
 
 `suppressions.txt` is therefore empty of entries. Do not add D1 or D2 to make a
 run green.
 
+### What twelve commits later actually changed
+
+`efb7162` ("Stop losing data on two avrocpp-legal inputs") is often described as
+having closed both. It did not, and the distinction matters when reading the
+findings below, because the sites this harness pins are the ones it left alone:
+
+| | what `efb7162` did | state on `main` |
+| --- | --- | --- |
+| D1, read | non-UTF-8 `string` decodes to `Value::Bytes`; `get_string` accepts it | closed |
+| D1, write | untouched | **still rejects**: `create_string` calls `utf8(v)?`, `rust/value.rs:75` |
+| D2, projected decoder | added `insert_map_entry` in `rust/decode.rs` | **rejects** duplicates. avro-cpp keeps both, so the two still disagree -- the register calls the projected path "stricter than the other two" |
+| D2, apache-avro paths | untouched | still collapses |
+| D2, write | untouched | **still collapses silently**: `map_put` is `HashMap::insert`, `rust/value.rs:560-569` |
+
+So the divergences did not close; D2's decode path swapped silent data loss for
+a loud rejection, which is a better failure mode but still a difference from
+avro-cpp. Both pinning tests in `differential_test.cc` exercise the **write**
+side of their divergence, which means both describe behaviour that is still
+live on `main`.
+
 ## Expect a red ctest here
 
-At this commit the three differential properties **fail on purpose**:
+At this commit all five differential properties **fail on purpose**:
 
-| property | what it finds |
-| --- | --- |
-| `Differential.DatumCircleAgrees` | D1, D2, and `UUID_INVALID_REJECTED` |
-| `Differential.SchemaVerdictsAgree` | avro-cpp accepts the namespace `ns..bad`, which has an empty component; the bridge rejects it |
-| `Differential.SchemasCrossParse` | `CanonicalForm()` is not canonical for a logical-typed primitive |
+| property | input shape | what it finds |
+| --- | --- | --- |
+| `Differential.DatumCircleAgrees` | tree | D1, D2, and `UUID_INVALID_REJECTED` |
+| `Differential.SchemaVerdictsAgree` | tree | avro-cpp accepts the namespace `ns..bad`, which has an empty component; the bridge rejects it |
+| `Differential.SchemasCrossParse` | tree | the bridge re-renders a `duration` fixed as `{"type":{"type":"fixed",...}}`, which avro-cpp cannot parse, and drops its name and namespace |
+| `Differential.SchemaTextVerdictsAgree` | bytes | the bridge accepts the empty union `[]` and the empty enum; avro-cpp rejects both |
+| `Differential.DecodersAgreeOnArbitraryBytes` | bytes | the bridge decodes an *empty* buffer into a record of fabricated nulls, where avro-cpp reports EOF; and `TRAILING_BYTES` |
 
 That is the acceptance criterion, not a broken build. Everything else is green:
 the 54 pre-existing bridge tests, the 12 generator-level properties, and the
@@ -112,18 +162,27 @@ Two binaries exist for a reason. `avro_ir_fuzz_test` and the bridge-only
 targets link **no avro-cpp at all**, so any sanitizer report from them is
 unambiguously about this binding. The differential targets link both.
 
-**If the top non-harness frame is in `avro::`, it is an avro-cpp finding** — to
+**If the top non-harness frame is in `avro::`, it is an avro-cpp finding** -- to
 report upstream, not a bridge regression. We are fuzzing a 2021-era C++ parser
 with clang 21; it will produce its own findings.
 
 Two bridge signals are findings even though they look benign:
 
-- an error string containing `Rust panic caught while processing Avro input:` —
+- an error string containing `Rust panic caught while processing Avro input:` --
   a clean `absl::Status`, but it means apache-avro panicked;
 - a process abort from Crubit's `check_no_mutable_aliasing` guard, or a Rust
   stack overflow, which aborts rather than unwinding.
 
 ## What this harness deliberately does not do
+
+**Check bridge API that avro-cpp has no counterpart to.** avro-cpp is the
+reference wherever it has one. Where the bridge adds surface avro-cpp never had
+-- `CanonicalForm()` and the four fingerprint functions are the whole of it at
+this commit; avro-cpp 1.11.4 has no canonical-form or fingerprint API -- there
+is nothing to compare, so a wrong answer there is a bridge bug rather than a
+divergence and does not belong in this harness. One such bug was found while
+writing it and is written up in `doc/CanonicalFormBug.md`.
+
 
 **Compare encoded bytes across engines.** Two sources of run-to-run variation
 live inside the libraries: object-container sync markers are random, and Rust
@@ -140,7 +199,7 @@ drawn from a tiny alphabet, which `AnyMapKey` generates.
 
 **Instrument the Rust half** (phase 1). Corrosion drives cargo, so the C++
 `-fsanitize=` flags do not reach the Rust staticlib. Roughly none of the decode
-logic is visible to the mutator — the C++ layer is a thin `StatusOr` wrapper
+logic is visible to the mutator -- the C++ layer is a thin `StatusOr` wrapper
 over Crubit thunks. This is survivable only because generation is
 structure-aware: the oracle does the work coverage feedback would otherwise do.
 Rust heap errors are still caught, because Rust uses the system allocator and
@@ -151,12 +210,12 @@ ASan intercepts it. Phase 2 adds sancov via
 
 | file | role |
 | --- | --- |
-| `ir.{h,cc}` | the `Node` tree, `Normalize`, and the mode-resolution scheme |
+| `ir.{h,cc}` | the `Node` tree, `Normalize`, and the mode-resolution scheme. Note `Normalize` legalises the tree, which is why the byte-oriented properties exist: it makes malformed shapes such as `[]` unreachable |
 | `domains.{h,cc}` | FuzzTest domains; depth is a hard structural bound |
-| `lower_schema.{h,cc}` | `Node` → Avro schema JSON, plus name-scope resolution |
+| `lower_schema.{h,cc}` | `Node` -> Avro schema JSON, plus name-scope resolution |
 | `suppress.{h,cc}` | divergence registry and suppression |
 | `ir_test.cc` | generator-level properties; links neither engine |
 
-`lower_schema` depends only on `ir.h` — not on the bridge, not on avro-cpp.
+`lower_schema` depends only on `ir.h` -- not on the bridge, not on avro-cpp.
 Keeping the lowerings on disjoint dependency edges is what makes the two-binary
 triage rule above possible.

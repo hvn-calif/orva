@@ -41,6 +41,18 @@ fuzztest::Domain<std::string> AnyPayload();
 // A whole tree, bounded to `max_depth` layers.
 fuzztest::Domain<Node> AnyTree(int max_depth = kMaxDepth);
 
+// Schema *text*, for the byte-oriented properties.
+//
+// AnyTree can only produce schemas the generator knows how to build, and
+// Normalize legalises them further -- it tops an empty union up to one branch,
+// so `[]` is unreachable by construction however long the tree-based
+// properties run. This domain covers the complement: malformed JSON, truncated
+// input, empty containers, and text no lowering would ever emit. It mixes
+// three sources so the mutator has valid schemas to work from rather than
+// starting from noise, since neither engine's Rust half is instrumented and
+// coverage feedback cannot climb on its own.
+fuzztest::Domain<std::string> AnySchemaText();
+
 // A tree of leaves only. Useful for properties that want to isolate scalar and
 // logical-type behaviour from container framing.
 fuzztest::Domain<Node> AnyLeaf();

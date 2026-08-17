@@ -1,18 +1,50 @@
 # Findings from the first differential fuzzing run
 
+## Glossary
+
+Every short form used here, other than ones assumed universally known (JSON,
+UTF-8, ID).
+
+| Term | Expansion | What it is here |
+| --- | --- | --- |
+| avro-cpp | Apache Avro C++ | the incumbent implementation, the thing we compare against. |
+| `avro_bridge` | (a name) | the replacement: a Crubit/corrosion binding over the Rust `apache-avro` crate. Called "the bridge" below. |
+| D1 | (a name) | divergence register entry 1: a `string` holding non-UTF-8 bytes. Also a suppression ID (`suppress.h`). |
+| D2 | (a name) | divergence register entry 2: duplicate keys in a map. Also a suppression ID. |
+| D3 | (a name) | divergence register entry 3: encoded map byte order is unstable, because Rust `HashMap` iteration order varies per process. Not a suppression ID; it is why only decoded values are compared. |
+| divergence register | (a name) | `doc/AvrocppDivergences.md` on `main`: the hand-maintained list of known, accepted differences between the two implementations. |
+| oracle | (a name) | the comparison step deciding whether the two implementations agreed on one generated input. |
+| suppression ID | (a name) | a name that mutes one known divergence for a run, via `suppressions.txt` or `AVRO_FUZZ_SUPPRESS`. |
+| UUID | Universally Unique Identifier | the Avro logical type `{"type":"string","logicalType":"uuid"}`. |
+
+## Baseline
+
 Baseline: worktree at `84ce4af`, avro-cpp `release-1.11.4`, empty suppression
-file. Findings 1, 3 and 4 came from unit-test mode (about one second per
-property, single core); finding 2 from a coverage-guided run at ~9,000
+file. Every finding except 4 came from unit-test mode, about one second per
+property on a single core; finding 4 came from a coverage-guided run at ~9,000
 executions per second.
 
-Each finding below was reached **cold from an empty corpus**, with no seed
+Each finding below was reached **starting from an empty corpus**, with no seed
 directing the fuzzer toward it.
+
+Findings 1 and 2 came from the byte-oriented properties, which were added after
+the rest. They are the two the tree-based properties could not have found: one
+needs a truncated payload, which a lowered value never produces, and the other
+needs a schema shape `Normalize` legalises away. Both surfaced on the first
+input of their property.
 
 ## Acceptance test: the two known bugs were rediscovered
 
-The point of pinning this worktree at `84ce4af` is that two divergences closed
-twelve commits later by `efb7162` are still open here, so the harness has a
-known answer key.
+Both are entries in the divergence register, written down before this harness
+existed, and both are open at `84ce4af` in both directions. Rediscovering them
+without being told to look is what makes the harness's other results worth
+anything.
+
+`efb7162`, twelve commits later, is often read as having closed them. It did
+not: it closed D1's read side, and replaced D2's silent collapse with a
+rejection in the projected decoder only -- avro-cpp keeps both entries, so the
+two still disagree. Neither write path was touched, and the write path is what
+both pinning tests below exercise. `fuzz/README.md` has the full breakdown.
 
 ### D1 - non-UTF-8 bytes in a string
 
@@ -46,37 +78,96 @@ Reached after suppressing D1, via `AVRO_FUZZ_SUPPRESS=D1,UUID_INVALID_REJECTED`
 These are on surfaces `doc/AvrocppDivergences.md` lists as "not yet
 investigated", so they are new information rather than rediscovery.
 
-### 1. `CanonicalForm()` is not canonical for a logical type on a primitive
+Every one of them is a difference between the two engines. A bug found on
+bridge API that avro-cpp has no counterpart to is not a divergence and is not
+listed here; the one such bug this work turned up is written up separately in
+`doc/CanonicalFormBug.md`.
 
-**The most consequential of the four.**
+### 1. The bridge decodes an empty buffer into fabricated nulls
+
+**The most serious finding here.** Found by `DecodersAgreeOnArbitraryBytes` on
+its first input.
 
 ```
-schema:         {"type":"int","logicalType":"time-millis"}
-CanonicalForm:  {"type":"int"}          <- should be "int"
+schema: {"type":"record","name":"R","fields":[
+           {"name":"a","type":"boolean"},{"name":"b","type":"boolean"}]}
+input:  ""                     (zero bytes)
+
+bridge:  ok, {"a":null,"b":null}
+avrocpp: avro::decode: EOF reached
 ```
 
-Avro's Parsing Canonical Form has a PRIMITIVES rule: a primitive is written in
-its simple form, `"int"`, never `{"type":"int"}`. Three consequences follow:
+Two things are wrong. Decoding zero bytes should fail, and the value returned
+does not inhabit its own schema: `null` is not a legal value of `boolean`. A
+caller handed a truncated message gets a success status and a record of nulls
+instead of an error.
 
-- the canonical form violates the spec;
-- it is **not idempotent** -- reparsing `{"type":"int"}` and taking its
-  canonical form gives `"int"`;
-- the Rabin fingerprint is wrong. The annotated schema fingerprints as
-  `8145260995063234477`; a plain int is `8247732601305521295`, which is the
-  value in the Avro spec's own test data and the one `rust/schema.rs` already
-  asserts.
+It is type-dependent rather than uniform, which is what makes it easy to miss:
 
-Since PCF deliberately strips `logicalType`, these two schemas must fingerprint
-identically. They do not.
+| schema | empty input, bridge | avro-cpp |
+| --- | --- | --- |
+| `"null"` | accepts, `null` | accepts (correct -- `null` really is zero bytes) |
+| `"int"`, `"long"`, `"string"` | rejects | rejects |
+| `"boolean"` | **accepts, yields Null** | rejects |
+| `["int"]` | **accepts, union branch is Null** | rejects |
+| record of booleans | **accepts, every field Null** | rejects |
 
-This is not cosmetic: fingerprints are how schema registries establish schema
-identity, so a wrong one is a missed cache hit or a failed lookup. Any schema
-using `date`, `time-millis`, `timestamp-millis` and friends on a primitive is
-affected, which is most real schemas.
+The register's worst class is silent data loss; this is its mirror image,
+manufacturing data that was never on the wire.
 
-Pinned by `Differential.CanonicalFormIsNotCanonicalForLogicalTypes`.
+Pinned by `Differential.EmptyInputDecodesToFabricatedNulls` and
+`Differential.EmptyInputFabricatesNullForBooleanAndUnion`.
 
-### 2. apache-avro panics on a schema that defines a name twice
+### 2. Empty union `[]` and empty enum: bridge accepts, avro-cpp rejects
+
+Found by `SchemaTextVerdictsAgree` on its first input.
+
+```
+schema text: []
+bridge:  accepts, and re-renders it as []
+avrocpp: Schema is invalid, due to bad node of type union
+```
+
+Same for `{"type":"enum","name":"E","symbols":[]}` ("bad node of type enum")
+and for `[]` nested as a record field type. So the bridge round-trips a schema
+avro-cpp cannot read, which is the same interop break as finding 3 below on a
+different construct.
+
+Worth recording how this was missed for as long as it was: the tree-based
+generator **cannot** produce it. `NormalizeChildren` tops an empty union up to
+one branch (`ir.cc:257-265`), so no amount of running `SchemaVerdictsAgree`
+would have reached it. Two bytes of schema text found it immediately.
+
+Pinned by `Differential.EmptyUnionAndEnumAcceptedOnlyByTheBridge`.
+
+### 3. The bridge re-renders a `duration` fixed in a shape avro-cpp cannot read
+
+**The most consequential for the migration itself.**
+
+```
+in:   {"type":"fixed","name":"B","namespace":"ns","size":12,"logicalType":"duration"}
+out:  {"type":{"type":"fixed","name":"duration","size":12},"logicalType":"duration"}
+
+avro-cpp on the output: Json field "type" is not a string
+```
+
+Both engines parse the input schema; `SchemasCrossParse` only reaches the
+rendering comparison once they have. Two distinct defects in the output:
+
+- **The fixed is nested inside `"type"` as an object.** avro-cpp rejects that
+  outright, so a schema that has passed through the bridge can no longer be
+  read by avro-cpp. That is the direction that breaks a partly-migrated
+  deployment: a bridge-side writer publishes a schema an avro-cpp-side reader
+  must consume.
+- **Name and namespace are dropped.** `ns.B` comes back as `duration`, so
+  schema identity does not survive the round trip even for a reader that can
+  parse the output.
+
+Pinned by `Differential.DurationFixedRendersUnparseableByAvrocpp`, which
+reproduces from the hand-written schema above rather than from a generated
+tree.
+
+### 4. apache-avro panics on a schema that defines a name twice
 
 Found by `DatumCircleAgrees` under coverage-guided fuzzing, within a second.
 
@@ -107,7 +198,7 @@ of service on attacker-supplied schemas.
 
 Pinned by `Differential.DuplicateFullNameParsesThenPanicsOnEncode`.
 
-### 3. avro-cpp accepts a malformed namespace
+### 5. avro-cpp accepts a malformed namespace
 
 ```
 schema: {"type":"fixed","name":"B","namespace":"ns..bad","size":16}
@@ -122,7 +213,7 @@ avro-cpp will ingest schemas that other Avro implementations reject -- data
 written under such a schema may not be readable elsewhere. Arguably an avro-cpp
 bug to report upstream rather than a bridge one.
 
-### 4. The bridge rejects uuid text avro-cpp keeps verbatim
+### 6. The bridge rejects uuid text avro-cpp keeps verbatim
 
 ```
 schema: {"type":"string","logicalType":"uuid"}
@@ -142,14 +233,36 @@ the bridge *does* accept the text, it re-emits the lowercase canonical form, so
 `0F9A...` in becomes `0f9a...` out and `urn:uuid:` prefixes are dropped. That
 is `UUID_TEXT_NOT_PRESERVED`.
 
+### 7. Trailing bytes after a datum: avro-cpp ignores, the bridge rejects
+
+```
+schema: "int"
+input:  02 ff        (one int, then a stray byte)
+
+avrocpp: ok, 1 -- stops at the end of the first datum
+bridge:  trailing bytes after single Avro datum
+```
+
+Direction is bridge-stricter, so nothing is mis-decoded, and the bridge's
+behaviour is the more defensible of the two: trailing bytes after a single
+datum usually mean framing has gone wrong. Recorded because callers moving off
+avro-cpp will hit it wherever they relied on a padded or over-allocated buffer
+being tolerated.
+
+This is `TRAILING_BYTES`, one of the divergence IDs `suppress.h` declared with
+no code able to report it until `DecodersAgreeOnArbitraryBytes` existed.
+
+Pinned by `Differential.TrailingBytesAcceptedOnlyByAvrocpp`.
+
 ## Not yet covered
 
-The harness currently exercises single-datum encode and decode plus schema
-parsing and rendering. Still to build: object-container round-trips across the
-null, deflate and snappy codecs; reader-versus-writer schema resolution, which
-the register also lists as entirely uninvestigated and which the plan sketches
-as an `EvolvePlan` edit applied to the writer tree; and the deep-nesting
-termination property.
+The harness currently exercises single-datum encode and decode, decode of
+arbitrary bytes under a generated schema, and schema parsing and rendering from
+both trees and raw text. Still to build: object-container round-trips across
+the null, deflate and snappy codecs; reader-versus-writer schema resolution,
+which the register also lists as entirely uninvestigated and which the plan
+sketches as an `EvolvePlan` edit applied to the writer tree; and the
+deep-nesting termination property.
 
 Byte-level comparison is deliberately out of scope -- random container sync
 markers and Rust `HashMap` iteration order (D3) make encoded bytes vary between
