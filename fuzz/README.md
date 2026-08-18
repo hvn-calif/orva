@@ -74,7 +74,7 @@ At this commit all five differential properties **fail on purpose**:
 | `Differential.DatumCircleAgrees` | tree | D1, D2, and `UUID_INVALID_REJECTED` |
 | `Differential.SchemaVerdictsAgree` | tree | avro-cpp accepts the namespace `ns..bad`, which has an empty component; the bridge rejects it |
 | `Differential.SchemasCrossParse` | tree | the bridge re-renders a `duration` fixed as `{"type":{"type":"fixed",...}}`, which avro-cpp cannot parse, and drops its name and namespace |
-| `Differential.SchemaTextVerdictsAgree` | bytes | the bridge accepts the empty enum, which avro-cpp rejects. The empty union `[]` alongside it is closed by `apache-avro-0.21-empty-union.patch` |
+| `Differential.SchemaTextVerdictsAgree` | bytes | avro-cpp accepts the namespace `ns..bad`, measured after both of this property's original findings closed |
 | `Differential.DecodersAgreeOnArbitraryBytes` | bytes | `TRAILING_BYTES`. The fabricated-nulls divergence it used to find first is closed by `apache-avro-0.21-strict-eof.patch` |
 
 That is the acceptance criterion, not a broken build. Everything else is green:

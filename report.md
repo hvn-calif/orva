@@ -159,7 +159,7 @@ Now pinned by `Differential.EmptyInputIsRejectedByBothEngines`,
 `Differential.EmptyInputIsRejectedForBooleanAndUnion` and
 `AvroBytes.TruncatedInputIsRejectedByBothEngines`, which assert the agreement.
 
-### 4.2 Empty union `[]` (CLOSED) and empty enum: bridge accepts, avro-cpp rejects
+### 4.2 Empty union `[]` and empty enum: bridge accepted, avro-cpp rejects (CLOSED)
 
 `[]` was accepted by the bridge, re-rendered as `[]`, and rejected by avro-cpp
 with "bad node of type union". Same for `{"type":"enum","name":"E","symbols":[]}`
@@ -171,17 +171,21 @@ produce it. `NormalizeChildren` tops an empty union up to one branch
 (`ir.cc:257-265`), so no amount of running `SchemaVerdictsAgree` would have
 reached it. Two bytes of schema text found it on the first input.
 
-The **union half is CLOSED** by `apache-avro-0.21-empty-union.patch`. No branch
-index is in range for an empty union, so nothing encodes into one and no bytes
-decode under one; `UnionSchema::new` now rejects it where `parse_union` used to
-log an error and carry on. `["int"]` stays legal on both sides, since index 0 is
-in range, and the pinned test asserts that so the fix cannot creep. The empty
-enum is still open.
+**CLOSED**, in two patches, because the two constructs guard differently.
+`apache-avro-0.21-empty-union.patch` rejects an empty member list in
+`UnionSchema::new`, which covers everything the crate can build since that
+type's fields are crate-private. `apache-avro-0.21-empty-enum.patch` rejects an
+empty symbol list in `parse_enum`, which covers the parse path only: `EnumSchema`
+has public fields and a builder, so a Rust caller can still hand-build one.
+Untrusted input arrives by parsing.
 
-Pinned by `Differential.EmptyUnionIsRejectedByBothEngines` and
-`AvroBytes.EmptyUnionIsRejectedByBothEngines` for the closed half, and
-`Differential.EmptyEnumAcceptedOnlyByTheBridge` and
-`AvroBytes.EmptyEnumIsAcceptedByTheBridgeOnly` for the open one.
+`["int"]` and a one-symbol enum stay legal on both sides, since index 0 is in
+range for each, and both pinned tests assert that so neither fix can creep.
+
+Pinned by `Differential.EmptyUnionIsRejectedByBothEngines`,
+`Differential.EmptyEnumIsRejectedByBothEngines`,
+`AvroBytes.EmptyUnionIsRejectedByBothEngines` and
+`AvroBytes.EmptyEnumIsRejectedByBothEngines`.
 
 ### 4.3 The bridge re-renders a `duration` fixed in a shape avro-cpp cannot read
 

@@ -228,7 +228,6 @@ struct KnownDivergence {
 };
 
 constexpr KnownDivergence kKnownDivergences[] = {
-    {"schema-acceptance", "bad node of type enum"},
     {"schema-acceptance", "Invalid namespace"},
     {"trailing-bytes", "trailing bytes"},
     {"alloc-ceiling", "Unable to allocate"},
@@ -748,10 +747,30 @@ TEST(AvroBytes, EmptyUnionIsRejectedByBothEngines) {
   ExpectReencodingAgrees(R"(["int"])", Varint(0) + Varint(42));
 }
 
-// schema-acceptance / "bad node of type enum"
-TEST(AvroBytes, EmptyEnumIsAcceptedByTheBridgeOnly) {
-  ExpectSchemaAcceptance(R"({"type":"enum","name":"E","symbols":[]})", true,
-                         false);
+// CLOSED. Was schema-acceptance / "bad node of type enum", the same defect as
+// the empty union above on a different construct: no symbol index is in range,
+// so it has no valid encoding. The empty-enum patch rejects it in parse_enum.
+//
+// The check is on the parse path only. EnumSchema has public fields and a
+// builder, unlike UnionSchema whose fields are crate-private, so a Rust caller
+// can still hand-build one with no symbols. Untrusted input arrives by parsing,
+// which is what this covers.
+TEST(AvroBytes, EmptyEnumIsRejectedByBothEngines) {
+  for (const char* text : {
+           R"({"type":"enum","name":"E","symbols":[]})",
+           R"({"type":"enum","name":"E","namespace":"ns","symbols":[]})",
+           R"({"type":"record","name":"R","fields":[{"name":"a","type":)"
+           R"({"type":"enum","name":"E","symbols":[]}}]})",
+           R"({"type":"array","items":)"
+           R"({"type":"enum","name":"E","symbols":[]}})",
+       }) {
+    ExpectSchemaAcceptance(text, false, false);
+  }
+
+  // One symbol is enough on both sides: index 0 is in range.
+  const std::string one = R"({"type":"enum","name":"E","symbols":["A"]})";
+  ExpectSchemaAcceptance(one, true, true);
+  ExpectReencodingAgrees(one, Varint(0));
 }
 
 // schema-acceptance / "Invalid namespace"
@@ -1188,7 +1207,7 @@ TEST(AvroBytes, VerticalTabAndFormFeedAreWhitespaceOnlyToAvrocpp) {
 }
 
 TEST(AvroBytes, KnownDivergenceTableSizeIsPinned) {
-  EXPECT_EQ(std::size(kKnownDivergences), 9u)
+  EXPECT_EQ(std::size(kKnownDivergences), 8u)
       << "adding an entry means adding a test named after it above; bump this "
          "count once you have";
 }

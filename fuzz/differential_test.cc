@@ -565,7 +565,8 @@ TEST(Differential, EmptyInputIsRejectedForBooleanAndUnion) {
 // empty union up to one branch, so no amount of running SchemaVerdictsAgree
 // would have found it. Two bytes of schema text found it on the first input.
 //
-// They are split because they close separately. The union half is closed.
+// They are split because they closed separately, one patch each. Both are now
+// closed; the split stays, because each records a distinct construct.
 void ExpectParseVerdicts(absl::string_view schema, bool bridge_accepts,
                          bool avrocpp_accepts) {
   const std::string text(schema);
@@ -592,9 +593,15 @@ TEST(Differential, EmptyUnionIsRejectedByBothEngines) {
   ExpectParseVerdicts(R"(["int"])", true, true);
 }
 
-// STILL OPEN. schema-acceptance / "bad node of type enum".
-TEST(Differential, EmptyEnumAcceptedOnlyByTheBridge) {
-  ExpectParseVerdicts(R"({"type":"enum","name":"E","symbols":[]})", true, false);
+// CLOSED by the empty-enum patch, in parse_enum rather than in a constructor:
+// EnumSchema has public fields and a builder, so the parse path is what can be
+// guarded, and that is the path untrusted input arrives on.
+TEST(Differential, EmptyEnumIsRejectedByBothEngines) {
+  ExpectParseVerdicts(R"({"type":"enum","name":"E","symbols":[]})", false,
+                      false);
+  // One symbol is enough: index 0 is in range.
+  ExpectParseVerdicts(R"({"type":"enum","name":"E","symbols":["A"]})", true,
+                      true);
 }
 
 // NEW FINDING, found by SchemasCrossParse.
