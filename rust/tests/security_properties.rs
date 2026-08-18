@@ -1,6 +1,6 @@
 //! Demonstrations of the three untrusted-input properties surfaced in the
 //! security review of this binding. Two are hardenings this crate enforces
-//! (trailing-byte rejection, panic containment is covered by unit tests);
+//! (panic containment is covered by unit tests);
 //! one is a documented residual limitation (decompression amplification,
 //! unbounded decode recursion). Each test is written to be safe to run in
 //! CI -- it illustrates the issue at a bounded magnitude rather than
@@ -11,26 +11,29 @@ use rust::datum::{decode_datum, encode_datum};
 use rust::schema::AvroSchema;
 use rust::value::AvroValue;
 
-/// Issue 1 (hardened): a single-datum decode rejects trailing bytes.
+/// Issue 1: trailing bytes after a single datum. This binding now follows
+/// avrocpp and ignores them, because code being migrated may hand a padded or
+/// over-allocated buffer to a decode. The rejecting behaviour is still available
+/// through `set_reject_trailing_bytes`, and lives in tests/reject_trailing_bytes.rs
+/// because the setting is a OnceLock and needs its own process.
 ///
-/// avrocpp silently ignores bytes left after a datum. This binding rejects
-/// them, so a framing error cannot be silently swallowed -- e.g. a caller
-/// decoding concatenated datums in a loop would otherwise stop after the
-/// first datum and wrongly report success.
+/// What must not change is that a *truncated* datum is an error. Ignoring bytes
+/// left over after a complete datum and accepting a datum with bytes missing are
+/// different things, and this asserts the second is still refused.
 #[test]
-fn trailing_bytes_after_a_single_datum_are_rejected() {
+fn trailing_bytes_are_ignored_but_a_truncated_datum_is_not() {
     let schema = AvroSchema::parse(b"\"int\"").unwrap();
 
     let mut buf = encode_datum(&schema, &AvroValue::create_int(7)).unwrap().into_vec();
     buf.extend_from_slice(b"\xde\xad\xbe\xef");
+    assert_eq!(decode_datum(&schema, &buf).unwrap().get_int().unwrap(), 7);
 
-    let err = decode_datum(&schema, &buf).unwrap_err();
-    let message = String::from_utf8(err.into_vec()).unwrap();
-    assert!(message.contains("trailing bytes"), "unexpected error: {message}");
-
-    // A correctly framed datum with no trailing bytes still decodes.
     let clean = encode_datum(&schema, &AvroValue::create_int(7)).unwrap();
     assert_eq!(decode_datum(&schema, clean.as_slice()).unwrap().get_int().unwrap(), 7);
+
+    // A length prefix of 2 with one byte behind it.
+    let string_schema = AvroSchema::parse(b"\"string\"").unwrap();
+    assert!(decode_datum(&string_schema, &[0x04, 0x61]).is_err());
 }
 
 /// Issue 2 (documented limitation): compressed container files amplify a

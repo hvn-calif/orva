@@ -33,6 +33,8 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/escaping.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "avro/Compiler.hh"
 #include "avro/Decoder.hh"
 #include "avro/Encoder.hh"
@@ -190,8 +192,7 @@ bool DeclaresLengthBeyondLimit(const std::string& bytes, uint64_t limit) {
 // array, not only a framing one. That is the cost of consolidating: there is
 // nothing in a decoder's error message that separates a bad header from a bad
 // item. It is applied only in place of the generic lenient tags, so
-// alloc-ceiling, trailing-bytes and rust-panic still win under an
-// array.
+// alloc-ceiling and rust-panic still win under an array.
 bool IsArraySchema(const std::string& schema_text) {
   auto parsed = AvroSchema::Parse(schema_text);
   return parsed.ok() && parsed->IsArray();
@@ -229,7 +230,6 @@ struct KnownDivergence {
 
 constexpr KnownDivergence kKnownDivergences[] = {
     {"schema-acceptance", "Invalid namespace"},
-    {"trailing-bytes", "trailing bytes"},
     {"alloc-ceiling", "Unable to allocate"},
     // One root cause, four messages: see IsArraySchema above.
     {"array-block-framing", R"("type":"array")"},
@@ -509,8 +509,6 @@ void DecodersAgreeOnAcceptance(const std::string& schema_text,
       // avro-cpp has no ceiling, so whether it refuses the same input depends
       // on available memory rather than on the input.
       tag = "alloc-ceiling";
-    } else if (bridge_error.find("trailing bytes") != std::string::npos) {
-      tag = "trailing-bytes";
     } else if (bridge_error.find("Rust panic caught") != std::string::npos) {
       tag = "rust-panic";
     }
@@ -820,11 +818,47 @@ TEST(AvroBytes, TruncatedInputIsRejectedByBothEngines) {
   ExpectDecodeAcceptance(R"("string")", std::string(), false, false);
 }
 
-// trailing-bytes / "trailing bytes"
-TEST(AvroBytes, TrailingBytesAreAcceptedByAvrocppOnly) {
+// CLOSED, and the only patch in the series that is bridge-side rather than an
+// apache-avro one: apache-avro's from_avro_datum already stops at the end of the
+// first datum like avrocpp, and the rejection was the bridge's own addition.
+//
+// It is also the only patch that removes a check the bridge shipped with, so the
+// strict behaviour stays reachable through SetRejectTrailingBytes, off by
+// default. avrocpp ignores what follows the first datum, and code being migrated
+// may hand over a padded or over-allocated buffer.
+//
+// The knob is a set-once process global, so this file cannot exercise its `true`
+// value: that lives in rust/tests/reject_trailing_bytes.rs, its own binary.
+TEST(AvroBytes, TrailingBytesAreIgnoredByBothEngines) {
   // One int, then a byte that is not part of it.
-  ExpectDecodeAcceptance(R"("int")", Varint(1) + std::string(1, '\x7f'), false,
-                         true);
+  const std::string trailing = Varint(1) + std::string(1, '\x7f');
+  ExpectDecodeAcceptance(R"("int")", trailing, true, true);
+
+  // Acceptance is not the whole story: both engines must also read the same
+  // value, and stop in the same place.
+  auto schema = AvroSchema::Parse(R"("int")");
+  ASSERT_TRUE(schema.ok()) << schema.status();
+  const auto bridge = security::avro::DecodeDatum(*schema, trailing);
+  ASSERT_TRUE(bridge.ok()) << bridge.status();
+  EXPECT_EQ(bridge->GetInt().value_or(0), 1);
+
+  ::avro::ValidSchema cpp_schema;
+  ASSERT_TRUE(ParseWithAvrocpp(R"("int")", &cpp_schema).ok());
+  ::avro::GenericDatum cpp_value;
+  ASSERT_TRUE(DecodeWithAvrocpp(cpp_schema, trailing, &cpp_value).ok());
+  EXPECT_EQ(cpp_value.value<int32_t>(), 1);
+
+  // Several bytes of padding, and padding that is itself a valid datum, so this
+  // is pinned as "ignore the rest" rather than "tolerate one stray byte".
+  for (const std::string& padding :
+       {std::string(4, '\xff'), Varint(2), std::string(16, '\0')}) {
+    ExpectDecodeAcceptance(R"("int")", Varint(1) + padding, true, true);
+  }
+
+  // What must not change: bytes *missing* from a datum are still an error on
+  // both sides. Ignoring leftovers and accepting a truncated datum are different
+  // things, and conflating them would undo the strict-eof patch.
+  ExpectDecodeAcceptance(R"("string")", Varint(2) + "a", false, false);
 }
 
 // EXPERIMENT. Was avrocpp-lenient / "Invalid utf-8", with the bridge rejecting.
@@ -1190,8 +1224,61 @@ TEST(AvroBytes, VerticalTabAndFormFeedAreWhitespaceOnlyToAvrocpp) {
   }
 }
 
+// NEW FINDING, from the Tier A checkpoint run of Differential.
+// DecodersAgreeOnArbitraryBytes. An avro-cpp bug, and a sub-case of the declared
+// block count reservation (Generic.cc:112) that no entry covered: the one already
+// recorded has the two engines returning **different** array lengths, where this
+// one has them agreeing and the contents differing. That is the more dangerous
+// shape, because a caller checking lengths sees agreement.
+//
+// Six bytes, and the bridge's reading is the strict one: count 1, one item, then
+// a negative count of 1 with a byte size of 2, one more item, then a 0 count
+// ending the array. Every byte is consumed and two items are on the wire.
+// avro-cpp also returns two, but one of them is a null datum it never read --
+// a slot it reserved from the declared count and left default-constructed.
+//
+// Reproduces identically under a `boolean` and a `long` item schema, which is
+// what rules out the strict-eof patch as a cause: that patch touched the
+// Schema::Boolean, Schema::String and Schema::Union decode arms, and the `long`
+// path goes nowhere near them.
+TEST(AvroBytes, AvrocppFabricatesAnArrayItemWithoutChangingTheLength) {
+  // count 1, item false, negative count 1 (byte size 2), item false, end.
+  const std::string bytes = FromHex("020001040000");
+
+  for (const char* schema_text :
+       {R"({"type":"array","items":"boolean"})",
+        R"({"type":"array","items":{"type":"long","logicalType":)"
+        R"("timestamp-micros"}})"}) {
+    const std::string schema(schema_text);
+    auto bridge_schema = AvroSchema::Parse(schema);
+    ASSERT_TRUE(bridge_schema.ok()) << schema;
+    ::avro::ValidSchema cpp_schema;
+    ASSERT_TRUE(ParseWithAvrocpp(schema, &cpp_schema).ok()) << schema;
+
+    const auto bridge = security::avro::DecodeDatum(*bridge_schema, bytes);
+    ASSERT_TRUE(bridge.ok()) << schema << ": " << bridge.status();
+    EXPECT_EQ(bridge->GetArrayLen().value_or(0), 2u) << schema;
+
+    ::avro::GenericDatum datum;
+    ASSERT_TRUE(DecodeWithAvrocpp(cpp_schema, bytes, &datum).ok()) << schema;
+    ASSERT_EQ(datum.type(), ::avro::AVRO_ARRAY) << schema;
+    const auto& items = datum.value<::avro::GenericArray>().value();
+
+    // The lengths agree, which is why this needed its own entry.
+    ASSERT_EQ(items.size(), 2u) << schema;
+
+    size_t fabricated = 0;
+    for (const auto& item : items) {
+      if (item.type() == ::avro::AVRO_NULL) ++fabricated;
+    }
+    EXPECT_EQ(fabricated, 1u)
+        << schema << ": avro-cpp returned " << fabricated
+        << " null datums under an item schema that is not null";
+  }
+}
+
 TEST(AvroBytes, KnownDivergenceTableSizeIsPinned) {
-  EXPECT_EQ(std::size(kKnownDivergences), 7u)
+  EXPECT_EQ(std::size(kKnownDivergences), 6u)
       << "adding an entry means adding a test named after it above; bump this "
          "count once you have";
 }

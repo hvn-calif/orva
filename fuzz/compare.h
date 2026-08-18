@@ -34,11 +34,18 @@ struct CompareOptions {
   bool allow_missing_logical_types = true;
 };
 
-// Walks both values in lockstep, reporting every difference into `log`.
-// Returns true when no unsuppressed difference was found.
+// Walks both values in lockstep, reporting differences into `log`. Returns true
+// when no unsuppressed difference was found.
 //
 // The traversal order is fixed, so which difference is reported first is
 // reproducible -- a requirement for FuzzTest reproducers to mean anything.
+//
+// The walk stops at the first difference that proves the two decoders consumed a
+// different number of input bytes: a collection whose sizes disagree, or a slot
+// avro-cpp reserved and never read. Past that point the two sides are reading
+// different offsets of the same buffer, so a difference is not attributable to
+// either engine. Reporting them anyway buried one suppressed array-of-null length
+// divergence under ten thousand reports about the field that followed it.
 bool CompareValues(const security::avro::AvroValue& bridge,
                    const ::avro::GenericDatum& cpp, FindingLog* log,
                    const CompareOptions& options = {});

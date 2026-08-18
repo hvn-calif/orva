@@ -55,9 +55,10 @@ export ASAN_OPTIONS="detect_leaks=0:allocator_may_return_null=1:max_allocation_s
 # Muting by ID here leaves the committed default alone. Override with
 # AVRO_FUZZ_SUPPRESS= (empty) to see the known findings again.
 : "${AVRO_FUZZ_SUPPRESS=D1,D2,D9,SCHEMA_PARSE_VERDICT,CROSS_PARSE_ROUND_TRIP,\
-TRAILING_BYTES,DECODE_VERDICT_BRIDGE_LENIENT,DECODE_VERDICT_AVROCPP_LENIENT,\
+DECODE_VERDICT_BRIDGE_LENIENT,DECODE_VERDICT_AVROCPP_LENIENT,\
 UUID_INVALID_REJECTED,UUID_TEXT_NOT_PRESERVED,STRING_BYTES_TYPE_MISMATCH,\
-RUST_PANIC_CAUGHT,ARRAY_LEN,SCALAR_VALUE:uuid values differ}"
+RUST_PANIC_CAUGHT,ARRAY_LEN,ARRAY_ITEM_FABRICATED,\
+SCALAR_VALUE:uuid values differ}"
 export AVRO_FUZZ_SUPPRESS
 
 # avro_bytes_fuzz_test.cc predates fuzz/suppress.h and carries its own table and

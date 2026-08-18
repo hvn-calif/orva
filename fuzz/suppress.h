@@ -38,8 +38,6 @@ namespace security::avro_fuzz {
   X(kD9AllocationCeiling, "D9",                                               \
     "the bridge's allocation ceiling fired; avrocpp has none, so the two are " \
     "not comparable on this input")                                           \
-  X(kTrailingBytes, "TRAILING_BYTES",                                         \
-    "bytes after a single datum: avrocpp ignores them, the bridge rejects")   \
   X(kLogicalTypeAbsentIn1114, "LOGICAL_TYPE_ABSENT_IN_1114",                  \
     "timestamp-nanos and the local-timestamp family do not exist in avrocpp " \
     "1.11.4, which falls back to the underlying long")                        \
@@ -64,6 +62,8 @@ namespace security::avro_fuzz {
   X(kRecordFieldNames, "RECORD_FIELD_NAMES", "record field names differ")     \
   X(kRecordArity, "RECORD_ARITY", "record field counts differ")               \
   X(kArrayLen, "ARRAY_LEN", "array lengths differ")                           \
+  X(kArrayItemFabricatedByAvrocpp, "ARRAY_ITEM_FABRICATED",                    \
+    "avrocpp returned a null datum where the item schema is not null")         \
   X(kMapKeySet, "MAP_KEY_SET", "map key sets differ")                         \
   X(kMapArity, "MAP_ARITY", "map entry counts differ")                        \
   X(kUnionBranch, "UNION_BRANCH", "union branch indices differ")              \

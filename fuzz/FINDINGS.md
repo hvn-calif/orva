@@ -267,7 +267,7 @@ the bridge *does* accept the text, it re-emits the lowercase canonical form, so
 `0F9A...` in becomes `0f9a...` out and `urn:uuid:` prefixes are dropped. That
 is `UUID_TEXT_NOT_PRESERVED`.
 
-### 7. Trailing bytes after a datum: avro-cpp ignores, the bridge rejects
+### 7. Trailing bytes after a datum: avro-cpp ignores, the bridge rejected (CLOSED)
 
 ```
 schema: "int"
@@ -283,10 +283,35 @@ datum usually mean framing has gone wrong. Recorded because callers moving off
 avro-cpp will hit it wherever they relied on a padded or over-allocated buffer
 being tolerated.
 
-This is `TRAILING_BYTES`, one of the divergence IDs `suppress.h` declared with
-no code able to report it until `DecodersAgreeOnArbitraryBytes` existed.
+**CLOSED**, and the only one in the series closed bridge-side rather than by an
+apache-avro patch: `from_avro_datum` already stops at the end of the first datum
+like avro-cpp, so the rejection was the bridge's own addition at
+`rust/datum.rs`. It stays reachable through `SetRejectTrailingBytes`, off by
+default.
 
-Pinned by `Differential.TrailingBytesAcceptedOnlyByAvrocpp`.
+It is also the only patch that **removes** a check the bridge shipped with, which
+is why both halves are pinned:
+`Differential.TrailingBytesAreIgnoredByBothEngines` and
+`AvroBytes.TrailingBytesAreIgnoredByBothEngines` assert the engines now agree and
+read the same value, and `rust/tests/reject_trailing_bytes.rs` asserts the knob
+still rejects. That test needs its own binary, because the setting is a
+`OnceLock` no test can reset.
+
+Both pinned tests also assert that a **truncated** datum is still an error.
+Ignoring bytes left over after a complete datum and accepting a datum with bytes
+missing are different things, and conflating them would undo the strict-eof
+patch.
+
+Two things went with it, rather than being left to rot:
+
+- The `TRAILING_BYTES` divergence ID. `suppress.h` had declared it long before
+  anything could report it, and now nothing can again.
+- `TrailingBytesExplainIt` in `fuzz/differential_test.cc`, which classified a
+  bridge rejection as trailing bytes when avro-cpp re-encoded to fewer bytes than
+  it was given. That never looked at *why* the bridge rejected. With the bridge no
+  longer rejecting over leftovers, avro-cpp under-consuming while the bridge
+  rejects means the datum itself failed, so the label would have named the wrong
+  cause.
 
 ## Findings from the one-hour parallel run
 
@@ -425,6 +450,49 @@ text avro-cpp kept, here both succeed and disagree on the value.
 
 Pinned by `Differential.SixteenByteUuidStringIsReadAsBinaryByTheBridge`.
 
+### 13. avro-cpp fabricates an array item without changing the length
+
+Found by the Tier A checkpoint run of `Differential.DecodersAgreeOnArbitraryBytes`
+after 4.15 million runs. An avro-cpp bug, and a sub-case of finding 9's declared
+block count reservation that no entry covered.
+
+```
+schema: {"type":"array","items":"boolean"}
+input:  02 00 01 04 00 00                (six bytes)
+
+bridge:  2 items, both false, every byte consumed
+avrocpp: 2 items, one of them a null datum it never read
+```
+
+The bridge's reading is the strict one: count 1, one item, then a negative count
+of 1 with a byte size of 2, one more item, then a 0 count ending the array.
+
+What makes this worse than finding 11 is that **the two lengths agree**. Finding
+11 has them differ, which a caller comparing sizes would notice; here the sizes
+match and one element is a value avro-cpp never read, so nothing about the shape
+of the result gives the caller a signal. avro-cpp resizes to the declared count
+before reading any item (`Generic.cc:112`), so a slot it never fills comes back
+as a default-constructed `GenericDatum`, which is `AVRO_NULL`.
+
+**Not caused by the strict-eof patch**, which is the first thing to rule out
+since it changed the `Schema::Boolean` decode arm. Measured under a `long` item
+schema as well, where it reproduces identically, and the `long` path goes nowhere
+near any arm that patch touched. The bridge returns the same two items either way
+and avro-cpp is unchanged, so the divergence predates Tier A. What Tier A changed
+is reachability: closing four divergences moved the coverage-guided search onto
+different ground.
+
+It surfaced now rather than in the validated hour-long run because of a harness
+asymmetry, since fixed. `Comparer::CompareArray` reported the array-framing ID
+only when the lengths differed; with them agreeing it fell through to per-element
+comparison and reported `VALUE_TYPE_MISMATCH` and `SCALAR_VALUE`, neither scoped
+to arrays and neither muted. `ARRAY_ITEM_FABRICATED` now names it, keyed on the
+signature that identifies it -- avro-cpp holding `null` where the item schema is
+not `null` -- so a real value divergence inside an array is still reported as one.
+
+Pinned by `AvroBytes.AvrocppFabricatesAnArrayItemWithoutChangingTheLength`, which
+drives both item schemas. It belongs upstream with findings 8, 9 and 11.
+
 ### An unexplained memory growth, not a divergence
 
 `DecodersAgreeOnArbitraryBytes` grows its resident set steadily under load: 112 MB
@@ -442,6 +510,50 @@ Reducing `kMaxDeclaredCount` from a million to 16k cuts the transient allocation
 per input from over 100 MB to a couple. That is what made the property survive a
 full hour. What remains unexplained is why the retained set grew as fast as it
 did at the larger cap, since the corpus is a few thousand small inputs either way.
+
+### A harness bug worth its own entry: cascade reporting
+
+Not a divergence, and it was masking one. Found by the Tier B checkpoint run,
+where `Differential.DecodersAgreeOnArbitraryBytes` reported ten thousand
+`SCALAR_VALUE` differences and one `DECIMAL_VALUE`, each carrying the note
+"(1 further difference(s) suppressed)".
+
+The suppressed sibling was the finding: `ARRAY_LEN` on an `array` of `null`
+(finding 11), muted for the run. Once the two engines read a different number of
+items, they are at different offsets in the same buffer, so **every field after
+the array reads different bytes**. `Comparer` carried on comparing them and
+reported each as an independent difference:
+
+```
+schema: record(f0: union(record(f0: array(null))), f1: int)
+input:  00 02 01 00 02 00 00
+
+reported: SCALAR_VALUE at $.f1, thousands of times
+actual:   ARRAY_LEN at $.f0.f0, suppressed, once
+```
+
+`Comparer` now stops the walk at the first difference that proves the two sides
+consumed a different number of bytes: an array length or map entry count that
+disagrees, or a slot avro-cpp reserved and never read (finding 13). The flag is
+set even when the finding is suppressed, because suppression governs whether it
+counts as a failure, not whether the offsets moved.
+
+The cost, stated because it is real: an independent divergence in a field after a
+size disagreement is not reported for that input. It is not lost -- an input that
+reaches the same field without a preceding size divergence still reports it -- and
+a difference read at a misaligned offset is not evidence about either engine.
+
+This changed `Differential.DecodersAgreeOnArbitraryBytes` in unit-test mode from
+failing every time to failing about half the time, because the array-of-`null`
+cascade it used to trip over on nearly every run is no longer a pile of
+independent findings. Nothing about either engine changed.
+
+The first report of this said it took `ctest` from six non-passes to five. That was
+one lucky run. Measured over 16: **7 passes, 9 failures**, so the `ctest` total is
+176 or 177 of 182 depending on the draw. A `FUZZ_TEST` in unit-test mode is a
+one-second run from a random seed; pinning `FUZZTEST_PRNG_SEED` makes it
+deterministic, 6 of 6 failures. Wiring a fixed seed into the `ctest` registration
+would make the suite a stable regression gate, and is not done.
 
 ### Harness bugs the run also surfaced
 

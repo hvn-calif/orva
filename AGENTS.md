@@ -138,19 +138,60 @@ findings 8 and 9 were attributed to `GenericDatum::init` and
 
 ## Expected state of the test suites
 
-`avro_bytes_fuzz_test`: **20/20 pass** with no environment variables, and also
+`avro_bytes_fuzz_test`: **21/21 pass** with no environment variables, and also
 under `ASAN_OPTIONS=detect_leaks=0` and with `allocator_may_return_null=1`.
 If it fails, the fuzz properties found something new, which is the design.
 
-`ctest` on the whole project: **174/180**, and `ctest -R AvroBytes` is 20/20.
-The six non-passes are the five `Differential.*` properties in `fuzz/`, which
-fail by design at this commit, plus avro-cpp's own
-`AvrogencppTestReservedWords` reporting "Not Run" because that subdirectory is
-`EXCLUDE_FROM_ALL`. Do not silence the five.
+`avro_bridge_test`: **54/54**. The bridge's own Rust suite is **70 tests** across
+five binaries (`cargo test` in `rust/`), one of which,
+`tests/reject_trailing_bytes.rs`, exists only because a `OnceLock` cannot be reset
+in-process.
 
-Both counts moved with the one-hour runs' findings: 169 to 180 tests, and
-`AvroBytes` 13 to 20. `report.md` section 7 says 150/156, measured before
-`avro_bytes_fuzz_test` joined the build; the counts above are current.
+`ctest` on the whole project: **176/182 or 177/182**, and `ctest -R AvroBytes` is
+21/21. The total is not stable, and that is worth understanding before reading any
+change in it as a regression.
+
+Six tests do not pass. Five are by design and one is avro-cpp's own
+`AvrogencppTestReservedWords` reporting "Not Run", because that subdirectory is
+`EXCLUDE_FROM_ALL`. Of the five, four fail every time and one is flaky:
+
+| property | measured over 8 runs each |
+| --- | --- |
+| `Differential.DatumCircleAgrees` | 8 fail |
+| `Differential.SchemaVerdictsAgree` | 8 fail |
+| `Differential.SchemasCrossParse` | 8 fail |
+| `Differential.SchemaTextVerdictsAgree` | 8 fail |
+| `Differential.DecodersAgreeOnArbitraryBytes` | **7 pass, 9 fail across 16 runs** |
+
+Do not silence any of the five. The flaky one is flaky for a plain reason: a
+`FUZZ_TEST` in unit-test mode is a one-second run from a random seed, so whether it
+draws an input that reveals a divergence is chance. Pinning `FUZZTEST_PRNG_SEED`
+makes it deterministic -- measured, 6 of 6 fail with the seed fixed -- so wiring a
+fixed seed into the `ctest` registration would turn the suite back into a stable
+regression gate. That is **not done**, and it is the single change that would most
+improve the "did I break anything" question, which cost two debugging rounds during
+the closure series.
+
+Its failure rate dropped from "always" to "about half" when the cascade fix landed,
+because the array-of-`null` cascade it used to trip over on almost every run is no
+longer reported as a pile of independent findings. The remaining failures are other
+open divergences, and `DECODE_VERDICT_AVROCPP_LENIENT` under `"string"` is the one
+seen most often.
+
+The counts have moved three times, so treat any older number in this repository as
+stale rather than as a regression:
+
+| when | ctest | AvroBytes |
+| --- | --- | --- |
+| before `avro_bytes_fuzz_test` joined the build | 150/156 (`report.md` section 7) | -- |
+| after the one-hour runs' findings | 174/180 | 20/20 |
+| after the divergence-closure series | **176-177/182** | **21/21** |
+
+Two things moved the totals: one differential test split in two when the empty
+union and empty enum closed separately, and one new test pinned finding 13. The
+cascade fix in `Comparer` did not remove a non-pass, as first reported here from a
+single lucky run; it turned one deterministic failure into a flaky one. That is a
+harness change and not a change to either engine.
 
 ## Divergences found
 
@@ -160,8 +201,23 @@ Fifteen. Each has a test in `avro_bytes_fuzz_test.cc` or
 **Closing them is now the work**, per `doc/specs/DivergenceClosure.md`, which
 orders thirteen patches easiest first and records the policy they follow:
 avro-cpp's behaviour is the bridge's default, and every deviation from it is
-reachable through a knob. `kKnownDivergences` is down from 11 entries to 7; the
+reachable through a knob. `kKnownDivergences` is down from 11 entries to 6; the
 pin in `KnownDivergenceTableSizeIsPinned` moves with it.
+
+**Tier B is done too**, and it is the only bridge-side patch in the series:
+`SetRejectTrailingBytes` in `avro_bridge.h`, off by default, because
+apache-avro's `from_avro_datum` already stops at the end of the first datum like
+avro-cpp and the rejection was the bridge's own addition at `rust/datum.rs`. It is
+also the only patch that **removes** a check the bridge shipped with, so the knob's
+`true` value has its own test binary, `rust/tests/reject_trailing_bytes.rs` -- the
+setting is a `OnceLock` and no test can reset it.
+
+Closing it deleted two things rather than leaving them to rot: the
+`TRAILING_BYTES` divergence ID, and `TrailingBytesExplainIt` in
+`fuzz/differential_test.cc`, which labelled a bridge rejection as trailing bytes
+whenever avro-cpp re-encoded shorter than its input. That never looked at why the
+bridge rejected, and with the bridge no longer rejecting over leftovers it would
+have named the wrong cause.
 
 **Tier A is done**: four unconditional apache-avro patches, no knobs, because for
 all four avro-cpp is the stricter engine and apache-avro's behaviour was wrong
@@ -179,11 +235,37 @@ Three of the four are **not additive** for other consumers of the crate, and eac
 had upstream tests asserting the behaviour it changes. That is recorded per patch
 in `patches/README.md`; do not describe this series as purely additive.
 
-Tier A also turned up a defect the fuzzer could not have found, because the
-harness has no object-container coverage: a container file cut inside a
-block-count varint reads as a clean end of iteration, 2 items and no error. It is
-A5 in the spec, with its reproducer, and needs a differential measurement before
-a fix.
+Tier A also turned up two defects that are not bridge divergences:
+
+- **A container file cut inside a block-count varint reads as a clean end of
+  iteration**, 2 items and no error. Found by reading, not by the fuzzer, because
+  the harness has no object-container coverage. A5 in the spec, with its
+  reproducer; it needs a differential measurement before a fix.
+- **avro-cpp fabricates an array item without changing the length.** Finding 13
+  in `fuzz/FINDINGS.md`, from the Tier A checkpoint run. An avro-cpp bug for
+  upstream, and the more dangerous shape of finding 9, since the two lengths
+  agree so the caller gets no signal at all. Six bytes reproduce it.
+
+Both fixed harness bugs on the way out, and the second is the more important:
+
+- `Comparer::CompareArray` attributed an array-framing difference to `ARRAY_LEN`
+  only when the lengths differed, and reported the equal-length case through the
+  unscoped `VALUE_TYPE_MISMATCH` and `SCALAR_VALUE` tags. `ARRAY_ITEM_FABRICATED`
+  now names it, keyed on avro-cpp holding `null` where the item schema is not
+  `null`, so a real value divergence inside an array is still reported as one.
+- **`Comparer` reported cascades as independent findings.** Once the two engines
+  read a different number of array items they are at different offsets in the same
+  buffer, so every later field reads different bytes. The comparer carried on and
+  reported each, so one suppressed `ARRAY_LEN` on an `array` of `null` surfaced as
+  ten thousand `SCALAR_VALUE` reports about the field that followed it. It now
+  stops the walk at the first difference that proves the byte counts diverged, and
+  sets that flag even when the finding is suppressed. This is why
+  `Differential.DecodersAgreeOnArbitraryBytes` now passes in unit-test mode and
+  `ctest` is at 177/182 with **five** non-passes rather than six.
+
+**Expected `ctest` state is now 177/182**, not 174/180. The five non-passes are
+four `Differential.*` properties that still fail by design plus
+`AvrogencppTestReservedWords` reporting "Not Run". Do not silence the four.
 Entries 1 to 10 came from the first runs; 11 to 15 are in the second table below,
 from the parallel hour-long runs.
 
@@ -196,7 +278,7 @@ from the parallel hour-long runs.
 | 5 | namespace `ns..bad` with an empty component | avro-cpp accepts |
 | 6 | non-UTF-8 in a `string` | avro-cpp accepts |
 | 7 | text that is not a well-formed uuid | avro-cpp accepts |
-| 8 | trailing bytes after a single datum | avro-cpp accepts |
+| 8 | trailing bytes after a single datum | **CLOSED**, bridge-side, knob |
 | 9 | truncated array block, avro-cpp returns 29 of 30 declared items | avro-cpp accepts |
 | 10 | oversized `vector::resize`, avro-cpp throws `std::length_error` | **untriaged, not in any table** |
 

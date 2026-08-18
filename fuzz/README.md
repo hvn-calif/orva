@@ -75,7 +75,7 @@ At this commit all five differential properties **fail on purpose**:
 | `Differential.SchemaVerdictsAgree` | tree | avro-cpp accepts the namespace `ns..bad`, which has an empty component; the bridge rejects it |
 | `Differential.SchemasCrossParse` | tree | the bridge re-renders a `duration` fixed as `{"type":{"type":"fixed",...}}`, which avro-cpp cannot parse, and drops its name and namespace |
 | `Differential.SchemaTextVerdictsAgree` | bytes | avro-cpp accepts the namespace `ns..bad`, measured after both of this property's original findings closed |
-| `Differential.DecodersAgreeOnArbitraryBytes` | bytes | `TRAILING_BYTES`. The fabricated-nulls divergence it used to find first is closed by `apache-avro-0.21-strict-eof.patch` |
+| `Differential.DecodersAgreeOnArbitraryBytes` | bytes | avro-cpp fabricating an array item without changing the length (`fuzz/FINDINGS.md` finding 13, an avro-cpp bug). The fabricated-nulls and trailing-bytes divergences it used to find first are both closed |
 
 That is the acceptance criterion, not a broken build. Everything else is green:
 the 54 pre-existing bridge tests, the 12 generator-level properties, and the

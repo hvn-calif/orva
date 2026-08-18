@@ -5,11 +5,47 @@ use crate::schema::AvroSchema;
 use crate::value::AvroValue;
 use crate::vec_u8::{catch_panic, VecU8};
 use apache_avro::Schema;
+use std::sync::OnceLock;
 
 /// Error returned when a single-datum decode leaves bytes unconsumed.
 /// A correctly framed datum buffer is fully consumed; leftover bytes
 /// signal a framing error that would otherwise be silently dropped.
 const TRAILING_BYTES_ERROR: &str = "trailing bytes after single Avro datum";
+
+/// Whether a single-datum decode rejects bytes left over after the datum.
+///
+/// Off by default, which is avrocpp's behaviour: it stops at the end of the
+/// first datum and never looks at what follows. Code being migrated off avrocpp
+/// may hand a padded or over-allocated buffer to a decode, and failing where
+/// avrocpp succeeded would be a behaviour change rather than a fix.
+///
+/// On, the buffer must hold exactly one datum. That is the stricter reading and
+/// the more defensible one -- leftover bytes usually mean framing has gone wrong,
+/// and a caller decoding concatenated datums in a loop would otherwise stop after
+/// the first and report success -- so it stays available to whoever wants it.
+static REJECT_TRAILING_BYTES: OnceLock<bool> = OnceLock::new();
+
+const DEFAULT_REJECT_TRAILING_BYTES: bool = false;
+
+/// Sets whether a single-datum decode rejects trailing bytes. Process-global and
+/// first-call-wins, like [`set_max_allocation_bytes`], and read on the first
+/// decode, so call it before decoding anything. Returns the setting actually in
+/// effect, which differs from the argument if something already set it.
+pub fn set_reject_trailing_bytes(reject: bool) -> bool {
+    *REJECT_TRAILING_BYTES.get_or_init(|| reject)
+}
+
+fn reject_trailing_bytes() -> bool {
+    *REJECT_TRAILING_BYTES.get_or_init(|| DEFAULT_REJECT_TRAILING_BYTES)
+}
+
+/// Errors on unconsumed input, if the caller asked to be stricter than avrocpp.
+fn check_fully_consumed(remaining: &[u8]) -> Result<(), VecU8> {
+    if !remaining.is_empty() && reject_trailing_bytes() {
+        return Err(TRAILING_BYTES_ERROR.into());
+    }
+    Ok(())
+}
 
 /// Encodes a value to Avro binary format using the given schema.
 pub fn encode_datum(schema: &AvroSchema, value: &AvroValue) -> Result<VecU8, VecU8> {
@@ -37,22 +73,20 @@ pub fn encode_datum_schemata(
 }
 
 /// Decodes a single datum from Avro binary format using the schema it was
-/// written with. Errors if the buffer contains trailing bytes after the
-/// datum.
+/// written with. Trailing bytes after the datum are ignored, as avrocpp does,
+/// unless [`set_reject_trailing_bytes`] asked otherwise.
 pub fn decode_datum(writer_schema: &AvroSchema, data: &[u8]) -> Result<AvroValue, VecU8> {
     catch_panic(|| {
         let mut reader = data;
         let value = apache_avro::from_avro_datum(&writer_schema.schema, &mut reader, None)
             .map_err(|err| VecU8::from(err.to_string()))?;
-        if !reader.is_empty() {
-            return Err(TRAILING_BYTES_ERROR.into());
-        }
+        check_fully_consumed(reader)?;
         Ok(AvroValue { value })
     })
 }
 
 /// Decodes a single datum written with `writer_schema`, resolving it to
-/// `reader_schema` (schema evolution). Errors on trailing bytes.
+/// `reader_schema` (schema evolution). Trailing bytes as above.
 pub fn decode_datum_resolved(
     writer_schema: &AvroSchema,
     reader_schema: &AvroSchema,
@@ -66,15 +100,13 @@ pub fn decode_datum_resolved(
             Some(&reader_schema.schema),
         )
         .map_err(|err| VecU8::from(err.to_string()))?;
-        if !reader.is_empty() {
-            return Err(TRAILING_BYTES_ERROR.into());
-        }
+        check_fully_consumed(reader)?;
         Ok(AvroValue { value })
     })
 }
 
 /// Decodes a single datum whose writer schema may reference named types
-/// defined in `writer_schemata`. Errors on trailing bytes.
+/// defined in `writer_schemata`. Trailing bytes as above.
 pub fn decode_datum_schemata(
     writer_schema: &AvroSchema,
     writer_schemata: &[AvroSchema],
@@ -90,9 +122,7 @@ pub fn decode_datum_schemata(
             None,
         )
         .map_err(|err| VecU8::from(err.to_string()))?;
-        if !reader.is_empty() {
-            return Err(TRAILING_BYTES_ERROR.into());
-        }
+        check_fully_consumed(reader)?;
         Ok(AvroValue { value })
     })
 }
@@ -175,16 +205,27 @@ mod tests {
         assert!(decode_datum(&schema, truncated).is_err());
     }
 
+    /// At the default the leftover bytes are ignored and the first datum comes
+    /// back, which is what avrocpp does. The rejecting case cannot be tested
+    /// here, because the setting is a OnceLock no test can reset: it lives in
+    /// tests/reject_trailing_bytes.rs, its own binary.
     #[test]
-    fn decode_rejects_trailing_bytes() {
+    fn decode_ignores_trailing_bytes_by_default() {
         let schema = AvroSchema::parse(b"\"int\"").unwrap();
         let mut encoded = encode_datum(&schema, &AvroValue::create_int(1)).unwrap().into_vec();
-        // A valid single datum followed by stray bytes must be rejected
-        // rather than silently decoding only the first datum.
         encoded.extend_from_slice(&[0xff, 0xfe]);
-        let err = decode_datum(&schema, &encoded).unwrap_err();
-        let message = String::from_utf8(err.into_vec()).unwrap();
-        assert!(message.contains("trailing bytes"), "unexpected error: {message}");
+        let decoded = decode_datum(&schema, &encoded).unwrap();
+        assert_eq!(decoded.get_int().unwrap(), 1);
+    }
+
+    /// A truncated datum is still an error. The setting governs bytes left over
+    /// after a complete datum, not bytes missing from one, and conflating the two
+    /// would undo the strict-eof patch.
+    #[test]
+    fn ignoring_trailing_bytes_does_not_accept_a_truncated_datum() {
+        let schema = AvroSchema::parse(b"\"string\"").unwrap();
+        // Length prefix of 2 with one byte behind it.
+        assert!(decode_datum(&schema, &[0x04, 0x61]).is_err());
     }
 
     #[test]

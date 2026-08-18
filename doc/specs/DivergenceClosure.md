@@ -97,12 +97,29 @@ so.
 4. Each knob gets a test at both of its values. A `OnceLock` cannot be reset
    in-process, so the second value needs its own test binary, as
    `avro/tests/non_utf8_string_as_bytes.rs` does.
-5. `avro_bytes_fuzz_test` stays at 20 of 20 or better in `/opt/dfz-b1`, and
-   `ctest` stays at 174 of 180. The five `Differential.*` failures stay: they
-   fail by design at this commit and this spec does not touch them.
-6. After the last patch of each tier, `fuzz/run_all_parallel.sh 1h` runs with an
-   empty suppression list and all thirteen properties exit 0. A closed
-   divergence that needed muting was not closed.
+5. `avro_bytes_fuzz_test` and `ctest` do not regress. The baselines moved during
+   the series, so the numbers are recorded rather than fixed: 20/20 and 174/180 at
+   the start, **21/21 and 176-177/182** now.
+
+   The `ctest` total is a range because `Differential.DecodersAgreeOnArbitraryBytes`
+   is flaky in unit-test mode: a `FUZZ_TEST` there is a one-second run from a random
+   seed, measured at 7 passes across 16 runs, and deterministic (6 of 6 fail) once
+   `FUZZTEST_PRNG_SEED` is pinned. **Do not read a one-run `ctest` total as
+   evidence** -- that mistake was made once during this series and reported before
+   being caught. The `Differential.*` failures that remain fail by design and this
+   spec does not silence them.
+6. After the last patch of each tier, `fuzz/run_all_parallel.sh` runs all
+   thirteen properties concurrently and every one exits 0. **Not** with an empty
+   suppression list, which an earlier draft of this criterion asked for: that
+   cannot pass while any divergence is still open, and eight of the thirteen
+   would die in their first second. What matters is that no suppression is added
+   for a divergence this series claims to have closed, and that the duration
+   actually run is stated rather than implied.
+
+   The script's `AVRO_FUZZ_SUPPRESS` default is now broader than it needs to be,
+   since some of its IDs only ever fired on divergences Tier A closed. Narrowing
+   it costs one full run per candidate ID, so it is left alone and noted here
+   rather than trimmed on a guess.
 7. Every patch is verified against apache-avro's own suite as well as ours:
    `cargo test -p apache-avro --features derive` in
    `/home/hvn/avro-rs-0.21-d1`, and the count is reported. The two pre-existing
@@ -117,7 +134,7 @@ so.
 | A3 empty-enum | **landed** | `schema-acceptance` / "bad node of type enum" |
 | A4 empty-decimal | **landed** | `reencode-failed` / "decimal sign extension 0" |
 | A5 container block varint | open, needs measurement | no entry yet |
-| B1 trailing bytes after a datum | open | `trailing-bytes` |
+| B1 trailing bytes after a datum | **landed** | `trailing-bytes` |
 | C1 trailing bytes after schema text | open | `schema-trailing-bytes` |
 | C2 vertical tab and form feed | open | `json-whitespace-leniency` |
 | C3 lenient namespace | open, recommended last or not at all | `schema-acceptance` / "Invalid namespace" |
@@ -125,12 +142,26 @@ so.
 | D2 duration render | open | finding 3, no entry |
 | E1/E2 map keys | open, needs its own spec | `avrocpp-lenient` / "Invalid utf-8 string", D2 |
 
-`kKnownDivergences`: 11 entries at the start, 7 now.
+`kKnownDivergences`: 11 entries at the start, 6 now.
+
+The Tier A checkpoint run also surfaced **finding 13**, an avro-cpp bug rather
+than a bridge divergence: it fabricates an array item without changing the array's
+length. See `fuzz/FINDINGS.md`. It is measured as pre-existing, since it
+reproduces identically under a `long` item schema, a path no Tier A patch touched.
+It belongs upstream, alongside findings 8, 9 and 11, and is not a convergence
+target for the same reason the array-framing entry is not.
 
 Tier A is complete. Every one of its four patches is on unconditionally, and
 **three of the four are not additive** for other consumers of apache-avro: each
 changed a behaviour an upstream test asserted. Per-patch detail is in
 `patches/README.md`.
+
+Tier B is complete: one patch, bridge-side, and the first knob. Closing it removed
+the `TRAILING_BYTES` divergence ID and `TrailingBytesExplainIt`, whose
+classification would have misattributed a cause once the bridge stopped rejecting
+over leftovers. It also removed `TRAILING_BYTES` from
+`run_all_parallel.sh`'s suppression default, so anything that used to hide behind
+that label is now reported under its real category.
 
 ## The patch series
 

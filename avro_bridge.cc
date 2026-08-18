@@ -649,6 +649,10 @@ bool SetUuidAsString(bool as_string) {
   return rust::datum::set_uuid_as_string(as_string);
 }
 
+bool SetRejectTrailingBytes(bool reject) {
+  return rust::datum::set_reject_trailing_bytes(reject);
+}
+
 // ---------------------------------------------------------------------------
 // DataFileWriter
 // ---------------------------------------------------------------------------

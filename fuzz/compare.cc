@@ -63,9 +63,39 @@ struct Comparer {
   CompareOptions options;
   bool clean = true;
 
+  // Set when the two engines have provably consumed a different number of input
+  // bytes for the same sub-value: a collection whose sizes disagree, or one
+  // avro-cpp reserved and did not fill. Everything decoded after that point was
+  // read from a different offset in the buffer, so a difference there says
+  // nothing about either engine and reporting it buries the one finding that
+  // does. The array-of-null length divergence is the case that forced this: it
+  // is suppressed as ARRAY_LEN, and its cascade then surfaced as ten thousand
+  // SCALAR_VALUE reports on the field that followed it.
+  //
+  // The cost is real and worth naming: an independent divergence in a later
+  // field is not reported for this input. It is not lost, because the input that
+  // reaches it without a preceding size divergence still reports it, and an
+  // unattributable difference is not evidence of anything.
+  bool offsets_diverged = false;
+
   void Report(DivergenceId id, absl::string_view path, absl::string_view detail,
               absl::string_view evidence = "") {
     if (log->Report(id, path, detail, evidence)) clean = false;
+  }
+
+  // The flag is checked at the top of Compare and again at the top of each
+  // collection loop. The second check is not redundant: those loops have branches
+  // that Report and continue without routing through Compare, so gating only
+  // Compare would leave the reader auditing each branch to know whether it can
+  // fire once the offsets have moved.
+
+  // Reports a difference that also means the two decoders are no longer reading
+  // the same bytes, so the rest of the datum is not comparable.
+  void ReportAndStopComparing(DivergenceId id, absl::string_view path,
+                              absl::string_view detail,
+                              absl::string_view evidence = "") {
+    Report(id, path, detail, evidence);
+    offsets_diverged = true;
   }
 
   // Reads a bridge string-or-bytes payload without caring which tag it carries.
@@ -107,6 +137,7 @@ void Comparer::CompareRecord(const AvroValue& bridge,
     return;
   }
   for (size_t i = 0; i < names->size(); ++i) {
+    if (offsets_diverged) return;
     const std::string& name = (*names)[i];
     const std::string here = absl::StrCat(path, ".", name);
     // Field order is significant on both sides, so compare positionally and
@@ -139,18 +170,37 @@ void Comparer::CompareArray(const AvroValue& bridge,
     return;
   }
   if (*length != items.size()) {
-    Report(DivergenceId::kArrayLen, path,
-           absl::StrCat("length differs: bridge ", *length, ", avro-cpp ",
-                        items.size()));
+    ReportAndStopComparing(
+        DivergenceId::kArrayLen, path,
+        absl::StrCat("length differs: bridge ", *length, ", avro-cpp ",
+                     items.size()));
     return;
   }
   for (size_t i = 0; i < items.size(); ++i) {
+    if (offsets_diverged) return;
     const std::string here = absl::StrCat(path, "[", i, "]");
     auto item = bridge.GetArrayItem(i);
     if (!item.ok()) {
       Report(DivergenceId::kArrayLen, here,
              "the bridge would not read this element");
       continue;
+    }
+    // avro-cpp resizes an array to its declared block count before reading any
+    // item (Generic.cc:112), so a slot it never filled comes back as a
+    // default-constructed GenericDatum, which is AVRO_NULL. That is a fabricated
+    // item, not a value disagreement, and it needs its own ID: it arrives with
+    // the two lengths *agreeing*, so kArrayLen above never sees it, and reporting
+    // it as a type or scalar mismatch would hide those categories behind a known
+    // avro-cpp bug.
+    const bool avrocpp_fabricated_a_null =
+        items[i].type() == ::avro::AVRO_NULL && !item->IsNull();
+    if (avrocpp_fabricated_a_null) {
+      ReportAndStopComparing(
+          DivergenceId::kArrayItemFabricatedByAvrocpp, here,
+          absl::StrCat("avro-cpp holds null where the bridge holds ",
+                       item->TypeName(),
+                       ", which is a slot avro-cpp reserved and never read"));
+      return;
     }
     Compare(*item, items[i], here);
   }
@@ -192,9 +242,10 @@ void Comparer::CompareMap(const AvroValue& bridge,
   // Wire order is never compared: the bridge returns keys sorted, and Rust's
   // HashMap iteration order makes avro-cpp's order vary between runs (D3).
   if (bridge_keys->size() != unique_keys.size()) {
-    Report(DivergenceId::kMapArity, path,
-           absl::StrCat("entry count differs: bridge ", bridge_keys->size(),
-                        ", avro-cpp ", unique_keys.size()));
+    ReportAndStopComparing(
+        DivergenceId::kMapArity, path,
+        absl::StrCat("entry count differs: bridge ", bridge_keys->size(),
+                     ", avro-cpp ", unique_keys.size()));
     return;
   }
   if (*bridge_keys != unique_keys) {
@@ -202,6 +253,7 @@ void Comparer::CompareMap(const AvroValue& bridge,
     return;
   }
   for (const auto& entry : entries) {
+    if (offsets_diverged) return;
     const std::string here =
         absl::StrCat(path, "{\"", absl::BytesToHexString(entry.first), "\"}");
     auto value = bridge.GetMapValue(entry.first);
@@ -216,6 +268,7 @@ void Comparer::CompareMap(const AvroValue& bridge,
 void Comparer::Compare(const AvroValue& bridge_in,
                        const ::avro::GenericDatum& cpp,
                        absl::string_view path) {
+  if (offsets_diverged) return;
   // Unions: avro-cpp's type(), logicalType() and value<T>() are all
   // transparent through a union, forwarding to the selected branch. Only
   // isUnion() and unionBranch() are not. So compare the branch index, then

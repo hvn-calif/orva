@@ -166,22 +166,6 @@ bool HoldsAnOversizedVarint(absl::string_view bytes) {
   return false;
 }
 
-// avro-cpp stops at the end of the first datum and ignores whatever follows;
-// the bridge requires the buffer to be exactly one datum. Re-encoding what
-// avro-cpp decoded gives the length it consumed, so a shorter re-encoding means
-// the input carried trailing bytes.
-//
-// A non-canonical varint in the input would also re-encode shorter, for an
-// unrelated reason. This only chooses which divergence ID to report, never
-// whether to report, so a misclassification costs a wrong label on a finding
-// that is real either way.
-bool TrailingBytesExplainIt(const ::avro::ValidSchema& schema,
-                            const ::avro::GenericDatum& datum,
-                            absl::string_view bytes) {
-  CppEncoded reencoded = EncodeWithAvrocpp(schema, datum);
-  return reencoded.outcome.ok() && reencoded.bytes.size() < bytes.size();
-}
-
 // ---------------------------------------------------------------------------
 
 // The central property. One tree becomes one schema and one value; both engines
@@ -441,18 +425,20 @@ void DecodersAgreeOnArbitraryBytes(const Node& raw, const std::string& bytes) {
     // whether it also refuses depends on the machine's memory rather than on
     // the input, and the two are not comparable.
     //
-    // TRAILING_BYTES: avro-cpp stops at the end of the first datum and ignores
-    // the rest; the bridge requires the buffer to hold exactly one datum.
-    //
     // Anything else is a real decode disagreement.
+    //
+    // TRAILING_BYTES used to be classified here, by checking whether avro-cpp
+    // re-encoded to fewer bytes than it was given. That test never looked at why
+    // the bridge rejected, and the bridge no longer rejects merely because bytes
+    // are left over -- SetRejectTrailingBytes is off by default, matching
+    // avro-cpp. So avro-cpp under-consuming while the bridge rejects now means
+    // the datum itself failed, and calling that "trailing bytes" would name the
+    // wrong cause. The classification is gone rather than left to mislabel.
     DivergenceId id = DivergenceId::kDecodeVerdictAvrocppLenient;
     const char* narrow = "bridge rejected";
     if (LooksLikeAllocationCeiling(bridge_decoded.status())) {
       id = DivergenceId::kD9AllocationCeiling;
       narrow = "allocation ceiling";
-    } else if (TrailingBytesExplainIt(cpp_schema, cpp_datum, bytes)) {
-      id = DivergenceId::kTrailingBytes;
-      narrow = "trailing bytes";
     }
     log.Report(id, "$",
                absl::StrCat("avro-cpp decoded bytes the bridge rejected: ",
@@ -658,16 +644,17 @@ TEST(Differential, DurationFixedRendersUnparseableByAvrocpp) {
          "fixed and the harness's expectations need updating";
 }
 
-// NEW FINDING, found by DecodersAgreeOnArbitraryBytes.
+// CLOSED, bridge-side rather than by an apache-avro patch: from_avro_datum
+// already stops at the end of the first datum like avro-cpp, and the rejection
+// was the bridge's own. It stays available through SetRejectTrailingBytes, off by
+// default, since code being migrated may pass a padded or over-allocated buffer.
 //
-// avro-cpp stops at the end of the first datum and ignores whatever follows;
-// the bridge requires the buffer to hold exactly one datum and rejects the
-// remainder. Direction is bridge-stricter, so nothing is mis-decoded, and the
-// bridge's behaviour is the more defensible of the two -- trailing bytes after
-// a single datum usually mean framing has gone wrong. Recorded because it is a
-// difference callers will hit when moving code that relied on avro-cpp
-// tolerating a padded buffer.
-TEST(Differential, TrailingBytesAcceptedOnlyByAvrocpp) {
+// This is the only patch in the series that removes a check the bridge shipped
+// with, so both halves are pinned: here that the two engines now agree and read
+// the same value, and in rust/tests/reject_trailing_bytes.rs that the knob still
+// rejects. The knob is a set-once process global, so its `true` value cannot be
+// exercised from this binary.
+TEST(Differential, TrailingBytesAreIgnoredByBothEngines) {
   const std::string schema_text = R"("int")";
   const std::string bytes("\x02\xff", 2);  // one int, then a stray byte
 
@@ -683,10 +670,21 @@ TEST(Differential, TrailingBytesAcceptedOnlyByAvrocpp) {
 
   ::avro::GenericDatum datum;
   CppOutcome cpp = DecodeWithAvrocpp(cpp_schema, bytes, &datum);
-  EXPECT_TRUE(cpp.ok()) << "avro-cpp is expected to ignore the trailing byte";
+  ASSERT_TRUE(cpp.ok()) << "avro-cpp is expected to ignore the trailing byte";
+  EXPECT_EQ(datum.value<int32_t>(), 1);
 
   auto decoded = security::avro::DecodeDatum(*bridge_schema, bytes);
-  EXPECT_FALSE(decoded.ok()) << "the bridge is expected to reject trailing bytes";
+  ASSERT_TRUE(decoded.ok())
+      << "the bridge should now ignore the trailing byte: " << decoded.status();
+  EXPECT_EQ(decoded->GetInt().value_or(0), 1);
+
+  // Bytes missing from a datum are still an error. Ignoring leftovers and
+  // accepting a truncated datum are different things.
+  auto string_schema = AvroSchema::Parse(R"("string")");
+  ASSERT_TRUE(string_schema.ok());
+  EXPECT_FALSE(
+      security::avro::DecodeDatum(*string_schema, std::string("\x04\x61", 2))
+          .ok());
 }
 
 // NEW FINDING, found by DatumCircleAgrees under coverage-guided fuzzing.

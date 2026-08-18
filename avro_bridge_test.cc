@@ -487,7 +487,7 @@ TEST(ContainerTest, OcfMagicPresent) {
 // Tests added to close gaps surfaced by the security review: the
 // timestamp/local-timestamp family, map length/key predicates,
 // AvroValue::TypeName, AvroSchema::ToJsonString, non-finite-float JSON
-// error paths, the empty container file, and trailing-byte rejection.
+// error paths, the empty container file, and trailing-byte handling.
 // (SetMaxAllocationBytes-actually-rejects-oversized-input is covered by the
 // Rust integration test tests/max_allocation.rs, which runs in its own
 // process because the limit is a one-shot process global.)
@@ -575,15 +575,27 @@ TEST(ContainerTest, EmptyFileRoundtrips) {
   EXPECT_FALSE(reader->HasNext());
 }
 
-TEST(DatumTest, DecodeRejectsTrailingBytes) {
-  // avrocpp silently ignores trailing bytes after a single datum; this
-  // binding rejects them so a framing error cannot be silently swallowed.
+TEST(DatumTest, DecodeIgnoresTrailingBytesByDefault) {
+  // avrocpp stops at the end of the first datum and ignores what follows, and
+  // this binding now does the same, so code moving off avrocpp that passes a
+  // padded or over-allocated buffer keeps working. SetRejectTrailingBytes
+  // restores the stricter reading; its `true` value is exercised by
+  // rust/tests/reject_trailing_bytes.rs, which needs its own process because the
+  // setting is a one-shot process global.
   auto schema = AvroSchema::Parse("\"int\"");
   ASSERT_TRUE(schema.ok());
   auto encoded = EncodeDatum(*schema, AvroValue::CreateInt(7));
   ASSERT_TRUE(encoded.ok());
   std::string with_trailing = *encoded + std::string("\xde\xad", 2);
-  EXPECT_FALSE(DecodeDatum(*schema, with_trailing).ok());
+  auto decoded = DecodeDatum(*schema, with_trailing);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(decoded->GetInt().value_or(0), 7);
+
+  // Bytes missing from a datum are still an error, which is a different thing
+  // from bytes left over after one.
+  auto string_schema = AvroSchema::Parse("\"string\"");
+  ASSERT_TRUE(string_schema.ok());
+  EXPECT_FALSE(DecodeDatum(*string_schema, std::string("\x04\x61", 2)).ok());
 }
 
 // -- Streaming container files ----------------------------------------------

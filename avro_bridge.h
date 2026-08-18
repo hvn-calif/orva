@@ -312,6 +312,21 @@ bool SetNonUtf8StringAsBytes(bool as_bytes);
 // first-call-wins; call before decoding anything.
 bool SetUuidAsString(bool as_string);
 
+// When on, DecodeDatum and its variants require the buffer to hold exactly one
+// datum. Off by default, which is what avrocpp does: it stops at the end of the
+// first datum and ignores what follows, so a caller migrating off avrocpp that
+// passes a padded or over-allocated buffer keeps working.
+//
+// Turn it on to be stricter than avrocpp. Leftover bytes usually mean framing
+// has gone wrong, and a caller decoding concatenated datums in a loop would
+// otherwise stop after the first and report success.
+//
+// This governs bytes left over after a complete datum, not bytes missing from
+// one: a truncated datum is an error either way. Process-global and
+// first-call-wins like SetMaxAllocationBytes, read on the first decode, so call
+// it before decoding anything. Returns the setting actually in effect.
+bool SetRejectTrailingBytes(bool reject);
+
 // Writes Avro object container files. Replaces avrocpp's
 // DataFileWriter<GenericDatum>. Values are validated and buffered by
 // Append; the encoded file is produced by ToBytes or WriteToPath.

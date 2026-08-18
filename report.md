@@ -261,14 +261,26 @@ covered by D1's fix. A quieter second half: when the bridge *does* accept, it
 re-emits the lowercase canonical form, so `0F9A…` becomes `0f9a…` and
 `urn:uuid:` prefixes are dropped (`UUID_TEXT_NOT_PRESERVED`).
 
-### 4.7 Trailing bytes after a datum: avro-cpp ignores, the bridge rejects
+### 4.7 Trailing bytes after a datum: avro-cpp ignores, the bridge rejected (CLOSED)
 
 Schema `"int"`, input `02 ff`. avro-cpp stops at the end of the first datum and
-returns 1; the bridge rejects the remainder. Direction is bridge-stricter and
-its behaviour is the more defensible of the two, since trailing bytes usually
-mean framing has gone wrong. Recorded because callers who relied on avro-cpp
-tolerating a padded buffer will hit it. Pinned by
-`Differential.TrailingBytesAcceptedOnlyByAvrocpp`.
+returns 1; the bridge rejected the remainder. Direction was bridge-stricter and
+its behaviour was the more defensible of the two, since trailing bytes usually
+mean framing has gone wrong.
+
+**CLOSED**, and the only one closed bridge-side rather than by an apache-avro
+patch: `from_avro_datum` already stops at the end of the first datum, so the
+rejection was the bridge's own addition. Parity wins because callers who relied on
+avro-cpp tolerating a padded buffer would otherwise break on migration, and the
+strict reading stays reachable through `SetRejectTrailingBytes`, off by default.
+
+This is the only patch in the series that removes a check the bridge shipped with,
+so both halves are pinned:
+`Differential.TrailingBytesAreIgnoredByBothEngines` and
+`AvroBytes.TrailingBytesAreIgnoredByBothEngines` for the default,
+`rust/tests/reject_trailing_bytes.rs` for the knob. Both also assert that a
+*truncated* datum is still an error, since ignoring leftovers and accepting a
+datum with bytes missing are different things.
 
 ## 5. Harness design
 
