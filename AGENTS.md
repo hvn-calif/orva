@@ -28,6 +28,7 @@ twelve commits behind `main`. Committed here:
 | `edfd1ce`, `7285ce4` | the original structure-aware harness in `fuzz/` and `report.md` |
 | `dbd2501` | corrections to those claims, the byte-oriented properties in `fuzz/`, `doc/CanonicalFormBug.md` |
 | `4e4122f` | `avro_bytes_fuzz_test.cc`, the self-contained byte-oriented fuzzer |
+| `38fa21c` | the parallel hour-long runs, findings 8 to 12, the harness fixes they needed, and the absl string conversion |
 
 ## Two harnesses, and why
 
