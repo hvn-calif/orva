@@ -159,11 +159,11 @@ Now pinned by `Differential.EmptyInputIsRejectedByBothEngines`,
 `Differential.EmptyInputIsRejectedForBooleanAndUnion` and
 `AvroBytes.TruncatedInputIsRejectedByBothEngines`, which assert the agreement.
 
-### 4.2 Empty union `[]` and empty enum: bridge accepts, avro-cpp rejects
+### 4.2 Empty union `[]` (CLOSED) and empty enum: bridge accepts, avro-cpp rejects
 
-`[]` is accepted by the bridge, re-rendered as `[]`, and rejected by avro-cpp
+`[]` was accepted by the bridge, re-rendered as `[]`, and rejected by avro-cpp
 with "bad node of type union". Same for `{"type":"enum","name":"E","symbols":[]}`
-and for `[]` nested as a record field type. So the bridge round-trips a schema
+and for `[]` nested as a record field type. So the bridge round-tripped a schema
 avro-cpp cannot read.
 
 Worth recording how long this went unseen: the tree-based generator **cannot**
@@ -171,7 +171,17 @@ produce it. `NormalizeChildren` tops an empty union up to one branch
 (`ir.cc:257-265`), so no amount of running `SchemaVerdictsAgree` would have
 reached it. Two bytes of schema text found it on the first input.
 
-Pinned by `Differential.EmptyUnionAndEnumAcceptedOnlyByTheBridge`.
+The **union half is CLOSED** by `apache-avro-0.21-empty-union.patch`. No branch
+index is in range for an empty union, so nothing encodes into one and no bytes
+decode under one; `UnionSchema::new` now rejects it where `parse_union` used to
+log an error and carry on. `["int"]` stays legal on both sides, since index 0 is
+in range, and the pinned test asserts that so the fix cannot creep. The empty
+enum is still open.
+
+Pinned by `Differential.EmptyUnionIsRejectedByBothEngines` and
+`AvroBytes.EmptyUnionIsRejectedByBothEngines` for the closed half, and
+`Differential.EmptyEnumAcceptedOnlyByTheBridge` and
+`AvroBytes.EmptyEnumIsAcceptedByTheBridgeOnly` for the open one.
 
 ### 4.3 The bridge re-renders a `duration` fixed in a shape avro-cpp cannot read
 

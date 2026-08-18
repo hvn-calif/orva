@@ -138,7 +138,7 @@ Now pinned by `Differential.EmptyInputIsRejectedByBothEngines`,
 `Differential.EmptyInputIsRejectedForBooleanAndUnion` and
 `AvroBytes.TruncatedInputIsRejectedByBothEngines`, which assert the agreement.
 
-### 2. Empty union `[]` and empty enum: bridge accepts, avro-cpp rejects
+### 2. Empty union `[]` (CLOSED) and empty enum: bridge accepts, avro-cpp rejects
 
 Found by `SchemaTextVerdictsAgree` on its first input.
 
@@ -158,7 +158,16 @@ generator **cannot** produce it. `NormalizeChildren` tops an empty union up to
 one branch (`ir.cc:257-265`), so no amount of running `SchemaVerdictsAgree`
 would have reached it. Two bytes of schema text found it immediately.
 
-Pinned by `Differential.EmptyUnionAndEnumAcceptedOnlyByTheBridge`.
+The **union half is CLOSED** by `apache-avro-0.21-empty-union.patch`.
+`UnionSchema::new` rejects an empty member list, where `parse_union` used to log
+an error and carry on. `["int"]` stays legal on both sides, since index 0 is in
+range, and the pinned test asserts that too so the fix cannot creep. The empty
+enum is still open.
+
+Pinned by `Differential.EmptyUnionIsRejectedByBothEngines` and
+`AvroBytes.EmptyUnionIsRejectedByBothEngines` for the closed half, and
+`Differential.EmptyEnumAcceptedOnlyByTheBridge` and
+`AvroBytes.EmptyEnumIsAcceptedByTheBridgeOnly` for the open one.
 
 ### 3. The bridge re-renders a `duration` fixed in a shape avro-cpp cannot read
 

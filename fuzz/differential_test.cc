@@ -556,31 +556,45 @@ TEST(Differential, EmptyInputIsRejectedForBooleanAndUnion) {
   EXPECT_TRUE(as_null->IsNull());
 }
 
-// NEW FINDING, found by SchemaTextVerdictsAgree on its first input.
+// Both of these were found by SchemaTextVerdictsAgree on its first input, as one
+// finding: the bridge accepted an empty union `[]` and an empty enum where
+// avro-cpp rejects both ("bad node of type union" / "of type enum"), and
+// re-rendered `[]` as `[]`, so it round-tripped a schema avro-cpp cannot read.
 //
-// An empty union `[]` and an empty enum are accepted by the bridge and
-// rejected by avro-cpp ("bad node of type union"/"of type enum"). The bridge
-// also re-renders `[]` as `[]`, so it round-trips a schema avro-cpp cannot
-// read.
+// Neither is reachable from the tree-based generator: NormalizeChildren tops an
+// empty union up to one branch, so no amount of running SchemaVerdictsAgree
+// would have found it. Two bytes of schema text found it on the first input.
 //
-// This is the case the tree-based generator provably cannot produce:
-// NormalizeChildren tops an empty union up to one branch, so no amount of
-// running SchemaVerdictsAgree would have found it. Two bytes of schema text
-// found it on the first input.
-TEST(Differential, EmptyUnionAndEnumAcceptedOnlyByTheBridge) {
-  for (const char* text : {R"([])",
-                           R"({"type":"enum","name":"E","symbols":[]})",
+// They are split because they close separately. The union half is closed.
+void ExpectParseVerdicts(absl::string_view schema, bool bridge_accepts,
+                         bool avrocpp_accepts) {
+  const std::string text(schema);
+  EXPECT_EQ(AvroSchema::Parse(text).ok(), bridge_accepts)
+      << "the bridge on " << text;
+  CppOutcome parsed = CallAvrocpp("compileJsonSchemaFromMemory", [&] {
+    ::avro::compileJsonSchemaFromMemory(
+        reinterpret_cast<const uint8_t*>(text.data()), text.size());
+  });
+  EXPECT_EQ(parsed.ok(), avrocpp_accepts)
+      << "avro-cpp on " << text << ": " << parsed.what;
+}
+
+// CLOSED by the empty-union patch. No branch index is in range for an empty
+// union, so nothing encodes into one and no bytes decode under one.
+TEST(Differential, EmptyUnionIsRejectedByBothEngines) {
+  for (const char* text : {R"([])", R"([[]])",
                            R"({"type":"record","name":"R","fields":[)"
                            R"({"name":"a","type":[]}]})"}) {
-    const std::string schema(text);
-    EXPECT_TRUE(AvroSchema::Parse(schema).ok())
-        << "the bridge is expected to accept " << schema;
-    CppOutcome parsed = CallAvrocpp("compileJsonSchemaFromMemory", [&] {
-      ::avro::compileJsonSchemaFromMemory(
-          reinterpret_cast<const uint8_t*>(schema.data()), schema.size());
-    });
-    EXPECT_FALSE(parsed.ok()) << "avro-cpp is expected to reject " << schema;
+    ExpectParseVerdicts(text, false, false);
   }
+  // A one-branch union stays legal on both sides, which is what keeps the fix
+  // from over-reaching.
+  ExpectParseVerdicts(R"(["int"])", true, true);
+}
+
+// STILL OPEN. schema-acceptance / "bad node of type enum".
+TEST(Differential, EmptyEnumAcceptedOnlyByTheBridge) {
+  ExpectParseVerdicts(R"({"type":"enum","name":"E","symbols":[]})", true, false);
 }
 
 // NEW FINDING, found by SchemasCrossParse.

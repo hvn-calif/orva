@@ -228,7 +228,6 @@ struct KnownDivergence {
 };
 
 constexpr KnownDivergence kKnownDivergences[] = {
-    {"schema-acceptance", "bad node of type union"},
     {"schema-acceptance", "bad node of type enum"},
     {"schema-acceptance", "Invalid namespace"},
     {"trailing-bytes", "trailing bytes"},
@@ -726,20 +725,27 @@ TEST(AvroBytes, MapsAreExcludedBecauseReencodedEntryOrderIsUnstable) {
       << "the two map schemas are the only ones the round trip skips";
 }
 
-// schema-acceptance / "bad node of type union"
-TEST(AvroBytes, EmptyUnionIsAcceptedByTheBridgeOnly) {
-  ExpectSchemaAcceptance(R"([])", true, false);
-  ExpectSchemaAcceptance(
-      R"({"type":"record","name":"R","fields":[{"name":"a","type":[]}]})", true,
-      false);
+// CLOSED. Was schema-acceptance / "bad node of type union". The empty-union
+// patch rejects it at parse, in UnionSchema::new, where the crate used to log an
+// error and carry on. No branch index is in range for an empty union, so nothing
+// encodes into one and no bytes decode under one; the bridge used to accept such
+// a schema and render it straight back, so it round-tripped something avro-cpp
+// cannot read.
+TEST(AvroBytes, EmptyUnionIsRejectedByBothEngines) {
+  for (const char* text : {
+           R"([])",
+           R"([[]])",
+           R"({"type":"record","name":"R","fields":[{"name":"a","type":[]}]})",
+           R"({"type":"array","items":[]})",
+           R"({"type":"map","values":[]})",
+       }) {
+    ExpectSchemaAcceptance(text, false, false);
+  }
 
-  // And the bridge renders it straight back, so it round-trips a schema
-  // avro-cpp cannot read.
-  auto parsed = AvroSchema::Parse(R"([])");
-  ASSERT_TRUE(parsed.ok());
-  auto rendered = parsed->ToJsonString();
-  ASSERT_TRUE(rendered.ok());
-  EXPECT_EQ(*rendered, R"([])");
+  // A one-branch union stays legal on both sides: index 0 is in range, so it
+  // has a valid encoding. This is what keeps the fix from over-reaching.
+  ExpectSchemaAcceptance(R"(["int"])", true, true);
+  ExpectReencodingAgrees(R"(["int"])", Varint(0) + Varint(42));
 }
 
 // schema-acceptance / "bad node of type enum"
@@ -1182,7 +1188,7 @@ TEST(AvroBytes, VerticalTabAndFormFeedAreWhitespaceOnlyToAvrocpp) {
 }
 
 TEST(AvroBytes, KnownDivergenceTableSizeIsPinned) {
-  EXPECT_EQ(std::size(kKnownDivergences), 10u)
+  EXPECT_EQ(std::size(kKnownDivergences), 9u)
       << "adding an entry means adding a test named after it above; bump this "
          "count once you have";
 }
