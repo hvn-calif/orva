@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "absl/strings/string_view.h"
+
 // The divergence registry and the suppression mechanism.
 //
 // Every difference the harness can report has a stable ID declared here, so a
@@ -106,7 +108,7 @@ const char* DivergenceDoc(DivergenceId id);
 
 // Parses a wire name. Returns kNone when the name is not registered, which
 // callers treat as a fatal configuration error rather than a no-op.
-DivergenceId LookupDivergence(const std::string& wire_name);
+DivergenceId LookupDivergence(absl::string_view wire_name);
 
 // A set of muted divergences.
 //
@@ -119,7 +121,7 @@ class SuppressionSet {
  public:
   // `evidence` narrows a coarse ID to one substring of the detail text. An
   // entry with no evidence strings suppresses its ID unconditionally.
-  bool Contains(DivergenceId id, const std::string& evidence = "") const;
+  bool Contains(DivergenceId id, absl::string_view evidence = "") const;
 
   bool empty() const { return entries_.empty(); }
 
@@ -128,7 +130,7 @@ class SuppressionSet {
   // another.
   std::string Render() const;
 
-  void Add(DivergenceId id, const std::string& evidence = "");
+  void Add(DivergenceId id, absl::string_view evidence = "");
 
  private:
   std::map<DivergenceId, std::vector<std::string>> entries_;
@@ -145,7 +147,7 @@ const SuppressionSet& Suppressions();
 
 // Parses one suppression file body. Exposed for testing. Returns false and
 // fills `error` when a line names an unregistered ID.
-bool ParseSuppressions(const std::string& text, SuppressionSet* out,
+bool ParseSuppressions(absl::string_view text, SuppressionSet* out,
                        std::string* error);
 
 // One reported difference.
@@ -175,8 +177,8 @@ class FindingLog {
 
   // Records a finding, or counts it as suppressed. Returns true when it was
   // recorded, i.e. when the caller should treat it as a real difference.
-  bool Report(DivergenceId id, const std::string& path,
-              const std::string& detail, const std::string& evidence = "");
+  bool Report(DivergenceId id, absl::string_view path, absl::string_view detail,
+              absl::string_view evidence = "");
 
   bool empty() const { return findings_.empty(); }
   size_t suppressed_count() const { return suppressed_count_; }

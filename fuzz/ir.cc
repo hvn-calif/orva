@@ -1,11 +1,13 @@
 #include "fuzz/ir.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/string_view.h"
 #include "fuzz/suppress.h"
 
 namespace security::avro_fuzz {
@@ -63,7 +65,7 @@ const KindInfo& Info(Kind kind) {
 //
 // Used only when D1 is suppressed, and applied before either lowering, so the
 // bridge and avrocpp provably receive the same bytes.
-std::string SanitizeUtf8(const std::string& input) {
+std::string SanitizeUtf8(absl::string_view input) {
   std::string out;
   out.reserve(input.size());
   size_t i = 0;
@@ -105,10 +107,10 @@ std::string SanitizeUtf8(const std::string& input) {
     }
 
     if (valid) {
-      out.append(input, i, length);
+      absl::StrAppend(&out, input.substr(i, length));
       i += length;
     } else {
-      out += "\xef\xbf\xbd";  // U+FFFD
+      absl::StrAppend(&out, "\xef\xbf\xbd");  // U+FFFD
       i += 1;
     }
   }
@@ -126,29 +128,25 @@ std::string BranchTypeKey(const Node& node) {
   // here but would in fact get distinct names -- which is the safe direction:
   // it drops a branch that would have been legal rather than emitting a schema
   // both engines reject.
-  return std::string(info.name) + ":" +
-         std::to_string(static_cast<int>(node.naming.strategy)) + ":" +
-         std::to_string(node.naming.name_id) + ":" +
-         std::to_string(node.naming.namespace_id);
+  return absl::StrCat(info.name, ":", static_cast<int>(node.naming.strategy),
+                      ":", node.naming.name_id, ":", node.naming.namespace_id);
 }
 
-std::string Escape(const std::string& raw) {
+std::string Escape(absl::string_view raw) {
   std::string out;
   out.reserve(raw.size() + 2);
   for (unsigned char c : raw) {
     switch (c) {
-      case '"': out += "\\\""; break;
-      case '\\': out += "\\\\"; break;
-      case '\n': out += "\\n"; break;
-      case '\t': out += "\\t"; break;
-      case '\r': out += "\\r"; break;
+      case '"': absl::StrAppend(&out, "\\\""); break;
+      case '\\': absl::StrAppend(&out, "\\\\"); break;
+      case '\n': absl::StrAppend(&out, "\\n"); break;
+      case '\t': absl::StrAppend(&out, "\\t"); break;
+      case '\r': absl::StrAppend(&out, "\\r"); break;
       default:
         if (c < 0x20 || c >= 0x7F) {
-          char buf[8];
-          std::snprintf(buf, sizeof(buf), "\\x%02X", c);
-          out += buf;
+          absl::StrAppendFormat(&out, "\\x%02X", c);
         } else {
-          out += static_cast<char>(c);
+          out.push_back(static_cast<char>(c));
         }
     }
   }
@@ -177,12 +175,12 @@ const int kNamespacePoolSize = 8;
 
 std::string LabelAt(const Node& node, size_t i) {
   if (i < node.labels.size() && !node.labels[i].empty()) return node.labels[i];
-  return "f" + std::to_string(i);
+  return absl::StrCat("f", i);
 }
 
 std::string KeyAt(const Node& node, size_t i) {
   if (i < node.keys.size()) return node.keys[i];
-  return "k" + std::to_string(i);
+  return absl::StrCat("k", i);
 }
 
 uint32_t ResolveIndex(const Selectors& selectors, size_t size) {
@@ -278,18 +276,16 @@ Node NormalizeNode(const Node& raw, NormalizeState& state, int depth) {
   const bool out_of_budget = depth >= state.options->max_depth ||
                              state.nodes_used > state.options->max_nodes;
 
-  // Past the depth or node budget, collapse to a leaf. Doing this by rewriting
-  // the Kind rather than by refusing to recurse keeps the result a valid tree
-  // for every input.
-  if (out_of_budget && IsComplex(out.kind)) {
-    out.kind = Kind::kNull;
-    return out;
-  }
-
   if (static_cast<size_t>(out.kind) >= static_cast<size_t>(Kind::kMaxKind)) {
     out.kind = Kind::kNull;
   }
 
+  // The clamps below run before the out-of-budget collapse rather than after.
+  // A collapsed node returns immediately, so clamping later left an unclamped
+  // precision and scale behind on it. No lowering reads those fields once the
+  // node is a null, but the well-formedness invariant applies to every node
+  // regardless of kind, and a one-hour fuzz run aborts on it: found at
+  // precision 40, scale -116.
   if (value_bearing) {
     // An in-range index everywhere; out-of-range indices are the exclusive
     // business of the property that tests for them.
@@ -324,6 +320,14 @@ Node NormalizeNode(const Node& raw, NormalizeState& state, int depth) {
     }
   }
 
+  // Past the depth or node budget, collapse to a leaf. Doing this by rewriting
+  // the Kind rather than by refusing to recurse keeps the result a valid tree
+  // for every input.
+  if (out_of_budget && IsComplex(out.kind)) {
+    out.kind = Kind::kNull;
+    return out;
+  }
+
   switch (out.kind) {
     case Kind::kRecord: {
       NormalizeChildren(raw, out, state, depth, /*min_children=*/0);
@@ -334,7 +338,7 @@ Node NormalizeNode(const Node& raw, NormalizeState& state, int depth) {
         std::string label = LabelAt(raw, i);
         if (value_bearing) {
           while (label.empty() || used.count(label) != 0) {
-            label += "_" + std::to_string(state.serial++);
+            absl::StrAppend(&label, "_", state.serial++);
           }
           used.insert(label);
         }
@@ -351,13 +355,15 @@ Node NormalizeNode(const Node& raw, NormalizeState& state, int depth) {
         std::string symbol = raw.labels[i];
         if (value_bearing) {
           while (symbol.empty() || used.count(symbol) != 0) {
-            symbol += "_" + std::to_string(state.serial++);
+            absl::StrAppend(&symbol, "_", state.serial++);
           }
           used.insert(symbol);
         }
         out.labels.push_back(symbol);
       }
-      if (out.labels.empty()) out.labels.push_back("S" + std::to_string(state.serial++));
+      if (out.labels.empty()) {
+        out.labels.push_back(absl::StrCat("S", state.serial++));
+      }
       break;
     }
 
@@ -451,25 +457,29 @@ std::string ToDebugString(const Node& node) {
     case Kind::kUnion:
     case Kind::kArray:
     case Kind::kMap: {
-      out += "(";
+      absl::StrAppend(&out, "(");
       for (size_t i = 0; i < node.children.size(); ++i) {
-        if (i != 0) out += ", ";
-        if (node.kind == Kind::kRecord) out += LabelAt(node, i) + ": ";
-        if (node.kind == Kind::kMap) out += "\"" + Escape(KeyAt(node, i)) + "\": ";
-        out += ToDebugString(node.children[i]);
+        if (i != 0) absl::StrAppend(&out, ", ");
+        if (node.kind == Kind::kRecord) {
+          absl::StrAppend(&out, LabelAt(node, i), ": ");
+        }
+        if (node.kind == Kind::kMap) {
+          absl::StrAppend(&out, "\"", Escape(KeyAt(node, i)), "\": ");
+        }
+        absl::StrAppend(&out, ToDebugString(node.children[i]));
       }
-      out += ")";
+      absl::StrAppend(&out, ")");
       break;
     }
     case Kind::kEnum:
-      out += "[" + std::to_string(node.labels.size()) + " symbols @" +
-             std::to_string(ResolveIndex(node.selectors, node.labels.size())) + "]";
+      absl::StrAppend(&out, "[", node.labels.size(), " symbols @",
+                      ResolveIndex(node.selectors, node.labels.size()), "]");
       break;
     case Kind::kString:
     case Kind::kBytes:
     case Kind::kFixed:
     case Kind::kUuid:
-      out += "(\"" + Escape(node.scalars.blob) + "\")";
+      absl::StrAppend(&out, "(\"", Escape(node.scalars.blob), "\")");
       break;
     default:
       break;
@@ -478,26 +488,23 @@ std::string ToDebugString(const Node& node) {
 }
 
 std::string ToCppLiteral(const Node& node) {
-  std::string out = "MakeNode(Kind::k";
-  const char* name = KindName(node.kind);
-  out += name;
-  out += ")";
+  std::string out = absl::StrCat("MakeNode(Kind::k", KindName(node.kind), ")");
   // A full aggregate dump is unreadable; the fields that matter for a
   // reproducer are the kind, the blob and the children.
   if (!node.scalars.blob.empty()) {
-    out += ".WithBlob(\"" + Escape(node.scalars.blob) + "\")";
+    absl::StrAppend(&out, ".WithBlob(\"", Escape(node.scalars.blob), "\")");
   }
   if (node.scalars.integer != 0) {
-    out += ".WithInteger(" + std::to_string(node.scalars.integer) + "LL)";
+    absl::StrAppend(&out, ".WithInteger(", node.scalars.integer, "LL)");
   }
   for (size_t i = 0; i < node.children.size(); ++i) {
-    out += "\n  .WithChild(";
+    absl::StrAppend(&out, "\n  .WithChild(");
     if (node.kind == Kind::kRecord) {
-      out += "\"" + Escape(LabelAt(node, i)) + "\", ";
+      absl::StrAppend(&out, "\"", Escape(LabelAt(node, i)), "\", ");
     } else if (node.kind == Kind::kMap) {
-      out += "\"" + Escape(KeyAt(node, i)) + "\", ";
+      absl::StrAppend(&out, "\"", Escape(KeyAt(node, i)), "\", ");
     }
-    out += ToCppLiteral(node.children[i]) + ")";
+    absl::StrAppend(&out, ToCppLiteral(node.children[i]), ")");
   }
   return out;
 }

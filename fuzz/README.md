@@ -134,6 +134,25 @@ suppressions file.
 `llvm-symbolizer` is **required** for readable reports and is not installed by
 default here: `sudo dnf install llvm` (the packaged 21.1.8 matches clang).
 
+### Running every property at once
+
+`run_all_parallel.sh <duration> <output-dir> [rss_limit_mb]` starts every
+`FUZZ_TEST` in the project concurrently, reads the property list from the
+binaries, and writes per-property logs, `status.tsv` of exit codes, and memory
+traces.
+
+```sh
+./fuzz/run_all_parallel.sh 1h ./fuzzrun/hour 800
+```
+
+It sets the environment above plus three ASan options that are not in it:
+`quarantine_size_mb=32:malloc_context_size=10:max_redzone=16`. Thirteen jobs at
+ASan's defaults peak at 703 MB each and drive the machine into swap; with these
+they peak at 146 MB, and throughput is unchanged. It also sets
+`AVRO_FUZZ_SUPPRESS` to the already-triaged divergences, because a property that
+reports a finding aborts through a gtest assertion in the first second or two and
+would never reach an hour. `AGENTS.md` has the numbers and the reasoning.
+
 ## Suppressing a divergence
 
 Every reportable difference has a stable ID in `suppress.h`. Add one per line

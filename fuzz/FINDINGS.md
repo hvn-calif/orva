@@ -254,6 +254,171 @@ no code able to report it until `DecodersAgreeOnArbitraryBytes` existed.
 
 Pinned by `Differential.TrailingBytesAcceptedOnlyByAvrocpp`.
 
+## Findings from the one-hour parallel run
+
+Every property running at once for an hour, with the findings above muted so the
+fuzzer reaches new ground. Setup, per-property throughput and the memory trace
+are in `fuzz/run_all_parallel.sh` and its output directory.
+
+The first three are avro-cpp bugs rather than bridge regressions: avro-cpp is the
+reference wherever it has a counterpart, and in each of these the top non-harness
+frame is in `avro::`. They belong upstream.
+
+### 8. `GenericDatum` construction recurses until the stack is gone
+
+Found by `DatumCircleAgrees` after 4.7 seconds. `avro::GenericDatum(NodePtr)`
+builds a datum for every record field eagerly and guards neither depth nor
+cycles, so a record that reaches itself through records alone recurses forever:
+247 frames of `GenericRecord` / `GenericDatum::init` at about 1 KiB each, then
+SIGSEGV.
+
+```
+{"type":"record","name":"R","fields":[{"name":"a","type":"R"}]}          CRASH
+A holding B holding A                                                   CRASH
+{"type":"record","name":"A","namespace":"ns","fields":[
+   {"name":"f","type":{"type":"record","name":"A","fields":[]}}]}        CRASH
+same, with an array, map or union anywhere in the cycle                  ok
+```
+
+The third shape is the one a caller cannot see coming: the text never names a
+type twice, but Avro resolves the inner `A` against the enclosing namespace, so
+both definitions land on `ns.A` and avro-cpp turns the second into a symbolic
+reference. A container in the cycle saves it, because an array or map builds
+empty and a union builds one branch.
+
+The generator was producing that third shape itself: `ResolveName` computed full
+names without namespace inheritance, so its "two definitions may not share a full
+name" uniquifier compared names the parsers never see. Fixed in
+`fuzz/lower_schema.cc`. `ToAvrocppDatum` now also refuses a schema that reaches a
+name reference *before* constructing the datum, since construction is what
+crashes and the existing check in `Fill` never got to run.
+
+Pinned by `Differential.RecursiveRecordSchemaCrashesAvrocppDatum` and
+`Differential.RecursionUnderAContainerIsSafeInAvrocpp`.
+
+### 9. avro-cpp reserves a declared block count before reading any item
+
+`avro::GenericReader::read` (`Generic.cc:112`) resizes an array or map to its
+declared count with no check against how much input is left, and avro-cpp has no
+allocation ceiling of its own. Two measured cases: 1.6 GB reserved from five
+bytes of payload, and a 837 GB request from 27 bytes, which ASan turned into an
+abort. Five bytes of varint can declare more items than any machine can hold.
+
+This is the `vector::resize` finding `AGENTS.md` recorded as untriaged. It is now
+symbolized, and it applies to maps as well as arrays -- the 837 GB case was
+`vector<pair<string, GenericDatum>>::resize`.
+
+`DecodersAgreeOnArbitraryBytes` drops inputs holding an oversized varint so the
+class does not end every run; `avro_bytes_fuzz_test.cc` already guards it with
+`kMaxDeclaredLengthBytes` and pins the ceiling arithmetic in
+`AllocationCeilingChecksCountAgainstAByteLimit`.
+
+### 10. Vertical tab and form feed are whitespace only to avro-cpp
+
+Found by `ParsersAgreeOnSchemaAcceptance` after 23 seconds. avro-cpp skips
+whitespace with `isspace()` (`JsonIO.cc:42`), which accepts vertical tab (0x0B)
+and form feed (0x0C). RFC 8259 permits exactly four bytes there -- tab, newline,
+carriage return, space -- and serde_json, under the bridge, enforces that.
+
+```
+0x0B "int"      avrocpp accepts   bridge rejects
+"int" 0x0B      avrocpp accepts   bridge rejects
+{"type": 0x0B "int"}   avrocpp accepts   bridge rejects
+0x09 / 0x0A / 0x0D / 0x20   both accept
+every other byte 0x00 to 0x20   both agree
+```
+
+Direction is avro-cpp-lenient, so nothing is mis-decoded. It matters the other
+way round: a pipeline that fed avro-cpp a pretty-printed schema containing a form
+feed starts failing to parse after moving to the bridge.
+
+Pinned by `AvroBytes.VerticalTabAndFormFeedAreWhitespaceOnlyToAvrocpp`, with its
+own `json-whitespace-leniency` tag so the `kKnownDivergences` entry that mutes it
+cannot also mute an unrelated parser disagreement.
+
+### 11. Two decoders, one input, different array lengths
+
+Found by `DecodersAgreeOnArbitraryBytes` after 68 seconds and 430,000 runs. Four
+bytes under `{"type":"array","items":"null"}` and both engines accept, both
+return an array, and the lengths differ. Nothing errors, so neither caller has
+any signal that the other side read different data.
+
+```
+schema: {"type":"array","items":"null"}
+input:  02 01 00 00
+
+strict reading:      2 items (one item, then a one-item sized block, then a
+                     zero count ending the array)
+ASan fuzzing build:  bridge 32, avro-cpp 26
+plain build:         bridge 2,  avro-cpp 0
+```
+
+A `null` item occupies zero bytes, so a declared count needs no payload behind it
+and neither decoder runs out of input to notice the framing is wrong. Both
+fabricate, by different amounts.
+
+The counts move with the build, which means at least one side's length does not
+come from the input alone -- a pointer past the end of the buffer is the obvious
+suspect and this has not been chased down. Neither pair of numbers is explained.
+
+Pinned by `Differential.ArrayOfNullLengthsDisagree`, which asserts the
+disagreement rather than the counts, since a pinned regression must not depend on
+the build. This is `ARRAY_LEN`, another ID that had a reporting site but had never
+fired.
+
+### 12. A 16-byte uuid string is read as a binary uuid by the bridge
+
+Found by `DecodersAgreeOnArbitraryBytes` after 293,811 runs. Both engines accept
+and neither errors, so the caller has no signal that the value changed meaning.
+
+```
+schema: {"type":"string","logicalType":"uuid"}
+input:  20 00*12 62 6f 6c 73     (length 16, twelve NULs, then "bols")
+
+avrocpp: the sixteen bytes verbatim
+bridge:  "00000000-0000-0000-0000-0000626f6c73"
+```
+
+The tail of the bridge's rendering, `626f6c73`, is "bols" read as hex: the bytes
+were reinterpreted, not reformatted. The specification puts `uuid` on `string`
+and defines its encoding as the 36-character text form, so avro-cpp is reading
+what the spec says is there; apache-avro additionally accepts a 16-byte payload
+as a binary uuid, which is what a uuid-on-`fixed(16)` field carries in Avro 1.12.
+
+Reachable only at length exactly 16, which is why five figures of runs were
+needed. This is a different failure from finding 6: there the bridge rejected
+text avro-cpp kept, here both succeed and disagree on the value.
+
+Pinned by `Differential.SixteenByteUuidStringIsReadAsBinaryByTheBridge`.
+
+### An unexplained memory growth, not a divergence
+
+`DecodersAgreeOnArbitraryBytes` grows its resident set steadily under load: 112 MB
+after a minute, 237 MB at five, 412 MB at fifteen, and 847 MB at eighteen, where
+it hit its RSS limit and ended the run. Growth is monotonic rather than spiky, so
+a corpus of 1,789 small inputs does not explain it.
+
+It is **not** a leak in the malloc sense. A five-minute run with
+`detect_leaks=1`, 1.27 million executions, exits clean with nothing from
+LeakSanitizer. So the memory is retained and still reachable -- FuzzTest's corpus
+and coverage state, or allocator fragmentation under inputs that reserve a
+hundred megabytes and drop it again -- rather than lost.
+
+Reducing `kMaxDeclaredCount` from a million to 16k cuts the transient allocation
+per input from over 100 MB to a couple. That is what made the property survive a
+full hour. What remains unexplained is why the retained set grew as fast as it
+did at the larger cap, since the corpus is a few thousand small inputs either way.
+
+### Harness bugs the run also surfaced
+
+Neither is a divergence; both were breaking the run rather than the product.
+
+- `Normalize` applied its value-bearing scalar clamps *after* the out-of-budget
+  early return, so a collapsed node kept `precision 40, scale -116` and violated
+  the well-formedness invariant that applies to every node. Found by
+  `ValueBearingTreesAreWellFormed`. Fixed by clamping before the collapse.
+- `ResolveName` ignored namespace inheritance, described under finding 8.
+
 ## Not yet covered
 
 The harness currently exercises single-datum encode and decode, decode of

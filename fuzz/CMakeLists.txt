@@ -17,6 +17,7 @@ add_library(avro_fuzz_ir
   lower_schema.cc lower_schema.h
 )
 target_include_directories(avro_fuzz_ir PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(avro_fuzz_ir PUBLIC absl::strings absl::str_format)
 if (AVRO_FUZZ_COVERAGE_FLAGS)
   target_compile_options(avro_fuzz_ir PRIVATE ${AVRO_FUZZ_COVERAGE_FLAGS})
 endif()

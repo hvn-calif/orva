@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "absl/strings/string_view.h"
 #include "avro/GenericDatum.hh"
 #include "avro/Node.hh"
 #include "avro/Types.hh"
@@ -14,12 +15,37 @@
 namespace security::avro_fuzz {
 namespace {
 
-std::vector<uint8_t> ToBytes(const std::string& raw) {
+std::vector<uint8_t> ToBytes(absl::string_view raw) {
   return std::vector<uint8_t>(raw.begin(), raw.end());
 }
 
-CppOutcome Failure(const std::string& what) {
-  return {CppVerdict::kOtherStdException, what};
+CppOutcome Failure(absl::string_view what) {
+  return {CppVerdict::kOtherStdException, std::string(what)};
+}
+
+// Comfortably above NormalizeOptions::max_depth, so a tree the generator can
+// produce is never mistaken for a cycle.
+constexpr int kMaxSchemaWalkDepth = 32;
+
+// True when the schema graph reaches a name reference, or is deeper than the
+// generator can produce.
+//
+// avro::GenericDatum(NodePtr) builds a datum for every record field eagerly and
+// has no cycle or depth guard, so a record that reaches itself through records
+// alone recurses until the stack is gone. An array, map or union in the cycle
+// saves it, since those build empty or single-branch. avro-cpp resolves a
+// *duplicate* definition to a symbolic reference too, so this is reachable
+// without the schema text ever naming a type twice.
+//
+// Pinned by Differential.RecursiveRecordSchemaCrashesAvrocppDatum.
+bool ReachesNameReference(const ::avro::NodePtr& schema, int depth) {
+  if (schema == nullptr) return false;
+  if (depth > kMaxSchemaWalkDepth) return true;
+  if (schema->type() == ::avro::AVRO_SYMBOLIC) return true;
+  for (size_t i = 0; i < schema->leaves(); ++i) {
+    if (ReachesNameReference(schema->leafAt(i), depth + 1)) return true;
+  }
+  return false;
 }
 
 CppOutcome Fill(const Node& node, const ::avro::NodePtr& schema,
@@ -187,6 +213,12 @@ CppOutcome Fill(const Node& node, const ::avro::NodePtr& schema,
 CppOutcome ToAvrocppDatum(const Node& node, const ::avro::NodePtr& schema,
                           ::avro::GenericDatum* out) {
   if (out == nullptr) return Failure("null output datum");
+
+  // Checked before construction, not after: constructing the datum is itself
+  // what crashes, so Fill's own symbolic-node check never gets to run.
+  if (ReachesNameReference(schema, 0)) {
+    return Failure("schema reaches a name reference; GenericDatum would recurse");
+  }
 
   CppOutcome constructed = CallAvrocpp("GenericDatum(NodePtr)", [&] {
     *out = ::avro::GenericDatum(schema);

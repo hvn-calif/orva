@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "absl/strings/string_view.h"
 #include "fuzz/ir.h"
 
 // Renders an IR tree as Avro schema JSON.
@@ -40,7 +41,7 @@ std::string ToSchemaJson(const Node& node, SchemaNames* names);
 
 // Escapes `raw` as a JSON string literal, including the surrounding quotes.
 // Exposed because the value lowerings need the same escaping for map keys.
-std::string JsonQuote(const std::string& raw);
+std::string JsonQuote(absl::string_view raw);
 
 }  // namespace security::avro_fuzz
 

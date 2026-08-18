@@ -7,6 +7,8 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/escaping.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "avro_bridge.h"
 #include "fuzz/ir.h"
 #include "fuzz/suppress.h"
@@ -16,19 +18,16 @@ namespace {
 
 using ::security::avro::AvroValue;
 
-std::string Extend(const std::string& path, const std::string& step) {
-  return path + step;
-}
-
-absl::StatusOr<AvroValue> Lower(const Node& node, const std::string& path,
+absl::StatusOr<AvroValue> Lower(const Node& node, absl::string_view path,
                                 FindingLog* log);
 
-absl::StatusOr<AvroValue> LowerRecord(const Node& node, const std::string& path,
+absl::StatusOr<AvroValue> LowerRecord(const Node& node, absl::string_view path,
                                       FindingLog* log) {
   AvroValue record = AvroValue::CreateRecord();
   for (size_t i = 0; i < node.children.size(); ++i) {
     const std::string name = LabelAt(node, i);
-    auto field = Lower(node.children[i], Extend(path, "." + name), log);
+    auto field =
+        Lower(node.children[i], absl::StrCat(path, ".", name), log);
     if (!field.ok()) return field.status();
     if (absl::Status status = record.RecordPut(name, *field); !status.ok()) {
       return status;
@@ -37,7 +36,7 @@ absl::StatusOr<AvroValue> LowerRecord(const Node& node, const std::string& path,
   return record;
 }
 
-absl::StatusOr<AvroValue> LowerArray(const Node& node, const std::string& path,
+absl::StatusOr<AvroValue> LowerArray(const Node& node, absl::string_view path,
                                      FindingLog* log) {
   AvroValue array = AvroValue::CreateArray();
   // The schema takes its item type from children[0]; every element must
@@ -45,7 +44,7 @@ absl::StatusOr<AvroValue> LowerArray(const Node& node, const std::string& path,
   if (node.children.empty()) return array;
   for (size_t i = 0; i < node.children.size(); ++i) {
     auto item =
-        Lower(node.children[0], Extend(path, "[" + std::to_string(i) + "]"), log);
+        Lower(node.children[0], absl::StrCat(path, "[", i, "]"), log);
     if (!item.ok()) return item.status();
     if (absl::Status status = array.ArrayPush(*item); !status.ok()) {
       return status;
@@ -54,7 +53,7 @@ absl::StatusOr<AvroValue> LowerArray(const Node& node, const std::string& path,
   return array;
 }
 
-absl::StatusOr<AvroValue> LowerMap(const Node& node, const std::string& path,
+absl::StatusOr<AvroValue> LowerMap(const Node& node, absl::string_view path,
                                    FindingLog* log) {
   AvroValue map = AvroValue::CreateMap();
   if (node.children.empty()) return map;
@@ -63,15 +62,16 @@ absl::StatusOr<AvroValue> LowerMap(const Node& node, const std::string& path,
   for (size_t i = 0; i < node.children.size(); ++i) {
     const std::string key = KeyAt(node, i);
     const std::string here =
-        Extend(path, "{\"" + absl::BytesToHexString(key) + "\"}");
+        absl::StrCat(path, "{\"", absl::BytesToHexString(key), "\"}");
 
     if (!seen.insert(key).second) {
       // D2. avro-cpp's GenericMap is a vector of pairs and keeps both entries;
       // the bridge's HashMap collapses them and silently loses one.
       log->Report(DivergenceId::kD2DuplicateMapKey, here,
-                  "duplicate map key " + absl::BytesToHexString(key) +
-                      ": the bridge collapses it (last write wins), avro-cpp "
-                      "keeps both entries",
+                  absl::StrCat("duplicate map key ",
+                               absl::BytesToHexString(key),
+                               ": the bridge collapses it (last write wins), "
+                               "avro-cpp keeps both entries"),
                   "duplicate map key");
       return absl::FailedPreconditionError("D2");
     }
@@ -84,7 +84,7 @@ absl::StatusOr<AvroValue> LowerMap(const Node& node, const std::string& path,
   return map;
 }
 
-absl::StatusOr<AvroValue> LowerUnion(const Node& node, const std::string& path,
+absl::StatusOr<AvroValue> LowerUnion(const Node& node, absl::string_view path,
                                      FindingLog* log) {
   if (node.children.empty()) {
     return absl::FailedPreconditionError("union with no branches");
@@ -94,12 +94,12 @@ absl::StatusOr<AvroValue> LowerUnion(const Node& node, const std::string& path,
     return absl::OutOfRangeError("union branch out of range");
   }
   auto value = Lower(node.children[branch],
-                     Extend(path, "<branch " + std::to_string(branch) + ">"), log);
+                     absl::StrCat(path, "<branch ", branch, ">"), log);
   if (!value.ok()) return value.status();
   return AvroValue::CreateUnion(branch, *value);
 }
 
-absl::StatusOr<AvroValue> Lower(const Node& node, const std::string& path,
+absl::StatusOr<AvroValue> Lower(const Node& node, absl::string_view path,
                                 FindingLog* log) {
   const int64_t integer = node.scalars.integer;
   const auto narrow = [integer] { return static_cast<int32_t>(integer); };
@@ -121,10 +121,10 @@ absl::StatusOr<AvroValue> Lower(const Node& node, const std::string& path,
       // divergence -- the read side surfaces when avro-cpp encodes such a
       // string and the bridge decodes it.
       log->Report(DivergenceId::kD1StringNotUtf8, path,
-                  "the bridge rejected string bytes " +
-                      absl::BytesToHexString(node.scalars.blob) + " (" +
-                      std::string(value.status().message()) +
-                      "); avro-cpp stores them verbatim",
+                  absl::StrCat("the bridge rejected string bytes ",
+                               absl::BytesToHexString(node.scalars.blob), " (",
+                               value.status().message(),
+                               "); avro-cpp stores them verbatim"),
                   "non-utf8 string");
       return value.status();
     }
@@ -133,9 +133,9 @@ absl::StatusOr<AvroValue> Lower(const Node& node, const std::string& path,
       auto value = AvroValue::CreateUuid(node.scalars.blob);
       if (value.ok()) return value;
       log->Report(DivergenceId::kUuidInvalidRejected, path,
-                  "the bridge rejected uuid text " +
-                      absl::BytesToHexString(node.scalars.blob) +
-                      "; avro-cpp keeps the string as written",
+                  absl::StrCat("the bridge rejected uuid text ",
+                               absl::BytesToHexString(node.scalars.blob),
+                               "; avro-cpp keeps the string as written"),
                   "invalid uuid");
       return value.status();
     }

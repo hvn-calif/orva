@@ -72,28 +72,91 @@ cmake --build build-fuzz --target avro_bytes_fuzz_test --parallel 2
 Keep `--parallel` at 2 for the fuzzing build. The machine has 7 GB of RAM and
 that build compiles abseil, RE2, ANTLR, FuzzTest and avro-cpp with ASan.
 
-`llvm-symbolizer` is still not installed, so ASan reports are bare hex
-addresses until `sudo dnf install llvm`.
+## Running every property at once
+
+`fuzz/run_all_parallel.sh <duration> <output-dir> [rss_limit_mb]` runs all
+thirteen properties concurrently, reading the list from the binaries rather than
+hardcoding it. It writes per-property logs, a corpus database, `status.tsv` with
+each exit code, and `memory.tsv` / `memory_by_job.tsv` traces.
+
+```sh
+./fuzz/run_all_parallel.sh 1h ./fuzzrun/hour 1200
+```
+
+`fuzzrun/` is gitignored, so the logs, corpora and traces from a run stay out of
+the history. Three hour-long runs from this session are there under `hour`,
+`hour2` and `hour3`; `hour3` is the validated one.
+
+**Validated: thirteen of thirteen exit 0 after a full hour**, peaking at 2.1 GB
+resident with 2.5 GB still available. Two earlier attempts got twelve of
+thirteen; the notes below are what the difference cost.
+
+Five things had to be true before thirteen properties could survive an hour
+together, and each cost a debugging session:
+
+- **`--continue_after_crash=true` does not do what its name suggests here.**
+  These properties fail through a gtest assertion, which aborts the process in
+  the FuzzTest engine's in-process mode, before FuzzTest's crash handling sees
+  it. The flag is set anyway, and is not what keeps a run alive.
+- **Known divergences have to be muted or five properties die in their first
+  second.** Two separate mechanisms: `AVRO_FUZZ_SUPPRESS` for `fuzz/`, and
+  `AVRO_BYTES_FUZZ_SKIP` for `avro_bytes_fuzz_test.cc`, which predates
+  `fuzz/suppress.h` and carries its own table. The script sets the first and
+  leaves the second empty. `fuzz/suppressions.txt` stays committed empty, so an
+  ordinary run still rediscovers D1 and D2 unaided.
+- **ASan's defaults do not fit thirteen jobs in 7.5 GB.** Peak RSS per job is
+  703 MB with defaults against 146 MB with
+  `quarantine_size_mb=32:malloc_context_size=10:max_redzone=16`, and throughput
+  is the same either way (680k against 677k runs in 60s on
+  `ValueBearingTreesAreWellFormed`). Thirteen jobs then sit at about 1.8 GB
+  total. The cost is a shorter use-after-free window and thinner allocation
+  stacks, which matters little while `llvm-symbolizer` is missing.
+- **One input can ask for more memory than the machine has**, so
+  `--rss_limit_mb` is not optional. 1200 MB per job against a 150 to 250 MB
+  steady state.
+- **`DecodersAgreeOnArbitraryBytes` needed its declared-count cap lowered.** At a
+  cap of a million elements, avro-cpp allocates a `GenericDatum` per declared
+  element, and the property's resident set climbed 112 MB to 847 MB over eighteen
+  minutes and died on its RSS limit -- twice, in two consecutive hour attempts. At
+  16k it ends the hour at 256 MB. Not a leak: five minutes with `detect_leaks=1`
+  and 1.27 million executions exits clean.
+
+Measured throughput over the validated hour, thirteen jobs at once: 17 to 32
+million runs each for the three byte-oriented properties, 3.7 to 12 million for
+the five `AvroIr` invariants, 6.1 to 12 million for the five `Differential`
+properties. The slowest is `DeepChainsRenderWithoutOverflow` at about 1,100 runs a
+second, the fastest `ReencodingAgreesWhenBothDecode` at about 12,000. No new
+findings surfaced in that hour, which is what a clean run looks like once the
+known ones are muted.
+
+`llvm-symbolizer` is still not installed, so ASan reports are bare hex addresses
+until `sudo dnf install llvm`. In the meantime `addr2line -e <binary> -f -C
+<addresses>` resolves them, including the frames inside avro-cpp: that is how
+findings 8 and 9 were attributed to `GenericDatum::init` and
+`GenericReader::read` rather than guessed at.
 
 ## Expected state of the test suites
 
-`avro_bytes_fuzz_test`: **13/13 pass** with no environment variables, and also
+`avro_bytes_fuzz_test`: **20/20 pass** with no environment variables, and also
 under `ASAN_OPTIONS=detect_leaks=0` and with `allocator_may_return_null=1`.
 If it fails, the fuzz properties found something new, which is the design.
 
-`ctest` on the whole project: **163/169**, and `ctest -R AvroBytes` is 13/13.
+`ctest` on the whole project: **174/180**, and `ctest -R AvroBytes` is 20/20.
 The six non-passes are the five `Differential.*` properties in `fuzz/`, which
 fail by design at this commit, plus avro-cpp's own
 `AvrogencppTestReservedWords` reporting "Not Run" because that subdirectory is
 `EXCLUDE_FROM_ALL`. Do not silence the five.
 
-`report.md` section 7 says 150/156. That was measured before
-`avro_bytes_fuzz_test` was added to the build; the count above is current.
+Both counts moved with the one-hour runs' findings: 169 to 180 tests, and
+`AvroBytes` 13 to 20. `report.md` section 7 says 150/156, measured before
+`avro_bytes_fuzz_test` joined the build; the counts above are current.
 
 ## Divergences found
 
-Ten. Each has a test in `avro_bytes_fuzz_test.cc` or `fuzz/differential_test.cc`
-named after it. Full detail in `fuzz/FINDINGS.md`.
+Fifteen. Each has a test in `avro_bytes_fuzz_test.cc` or
+`fuzz/differential_test.cc` named after it. Full detail in `fuzz/FINDINGS.md`.
+Entries 1 to 10 came from the first runs; 11 to 15 are in the second table below,
+from the parallel hour-long runs.
 
 | # | divergence | direction |
 | --- | --- | --- |
@@ -108,10 +171,35 @@ named after it. Full detail in `fuzz/FINDINGS.md`.
 | 9 | truncated array block, avro-cpp returns 29 of 30 declared items | avro-cpp accepts |
 | 10 | oversized `vector::resize`, avro-cpp throws `std::length_error` | **untriaged, not in any table** |
 
-Finding 10 surfaced in a long run as `vector::_M_default_append` with schema
-`{"type":"array","items":"int"}` and 10 to 14 bytes of payload. It needs the
-same treatment as the others: triage, an entry in `kKnownDivergences`, a test,
-and a bump of the count in `KnownDivergenceTableSizeIsPinned`.
+Finding 10 is **triaged**: it is `avro::GenericReader::read` (`Generic.cc:112`)
+resizing an array or map to its declared block count before reading any item,
+with no check against remaining input and no allocation ceiling on the avro-cpp
+side. Symbolized during the one-hour run, where it also appeared as a map:
+`vector<pair<string, GenericDatum>>::resize` requesting 837 GB from 27 bytes, and
+1.6 GB from five bytes in another case. `fuzz/FINDINGS.md` finding 9 has the
+detail. It is an avro-cpp bug for upstream, guarded in the harness rather than
+suppressed.
+
+Five more divergences came out of the parallel hour-long runs, all written up in
+`fuzz/FINDINGS.md` as findings 8 to 12:
+
+| # | divergence | direction |
+| --- | --- | --- |
+| 11 | `GenericDatum(NodePtr)` recurses to SIGSEGV on a record-only name cycle | avro-cpp crashes |
+| 12 | declared block count reserved before reading items | avro-cpp allocates unboundedly |
+| 13 | vertical tab and form feed accepted as JSON whitespace | avro-cpp accepts |
+| 14 | array of `null`: both accept, lengths differ, and differ by build | **value divergence** |
+| 15 | a 16-byte string under `uuid` is read as a binary uuid | **value divergence** |
+
+Numbers 14 and 15 are the ones to look at next: both are value divergences where
+neither engine errors, so a caller gets no signal at all. For 14 the counts also
+move between the ASan and plain builds, which means at least one side's length
+does not come from the input alone.
+
+`DecodersAgreeOnArbitraryBytes` also grows its resident set monotonically under
+load, 112 MB to 847 MB over eighteen minutes, which a corpus of 1,789 small inputs
+does not explain. `detect_leaks=0` is in force everywhere, so LSan is not
+watching. See the end of `fuzz/FINDINGS.md`; it is unexplained.
 
 Separately, `doc/CanonicalFormBug.md` records a spec-conformance bug in
 `CanonicalForm()` and the Rabin fingerprint. It is **not** a divergence, because
@@ -147,6 +235,18 @@ is a plain bridge bug and belongs in its own document.
    `~/safe-bindings` is Bazel-based. It does not change the conclusion that this
    repo stays on CMake, since avro-cpp has no Bazel build.
 
+5. **"The array-of-`null` lengths are 32 and 26."** Those are the ASan fuzzing
+   build's numbers. The plain build gives 2 and 0 for the input the fuzzer
+   printed. Since the counts move with the build, at least one engine's length
+   does not come from the input alone, and the pinned test asserts the
+   disagreement rather than either pair. Finding 15's write-up says so.
+6. **"The death test's child dies by SIGSEGV, or SIGABRT under ASan."** Neither,
+   in the fuzzing build: it links absl's failure signal handler, which prints a
+   trace and exits with a *code*, so a `WIFSIGNALED` predicate fails there while
+   passing in the plain build. `DiedRatherThanReturned` now accepts any death.
+   Caught only because the test was run in both trees; a death test that passes
+   where you developed it can still fail under the sanitizer.
+
 ## Traps
 
 - **`options.suppressions` is never set by any `fuzz/` property.**
@@ -162,6 +262,27 @@ is a plain bridge bug and belongs in its own document.
   D5 to D9. The table is a vocabulary of difference categories, not a list of
   discovered bugs, and its header comment calling the non-`D` entries "findings"
   invites exactly that misreading. **Unfixed.**
+- **`allocator_may_return_null=1` does not cover every oversized allocation.**
+  It handles a request above `max_allocation_size_mb`, which returns null and
+  becomes a `std::bad_alloc` the harness can report as a verdict. A request too
+  large to map at all takes ASan's out-of-memory path instead, which aborts
+  regardless of the flag: an 837 GB `vector::resize` ended a run that way. Set
+  `max_allocation_size_mb` as `fuzz/README.md` prescribes, and note the asymmetry
+  -- the bridge's half cannot lean on it, because Rust aborts on a failed
+  allocation instead of throwing.
+- **`AVRO_FUZZ_SUPPRESS` does not reach `avro_bytes_fuzz_test.cc`.** That file
+  predates `fuzz/suppress.h` and has its own table plus its own variable,
+  `AVRO_BYTES_FUZZ_SKIP`, with `TAG[:substring]` entries. Muting a divergence in
+  one harness leaves the other reporting it.
+- **`--continue_after_crash=true` does not keep a property alive.** The FuzzTest
+  engine runs these in-process, so a gtest assertion aborts before its crash
+  handling applies. Suppression is the only way past a known finding.
+- **The value-bearing well-formedness invariant applies to every node, whatever
+  its kind.** `ValueBearingTreesAreWellFormed` checks `precision`, scale and
+  `fixed_size` on all of them, including nodes `Normalize` has collapsed to
+  `kNull`, where those fields no longer mean anything. Anything added to
+  `Normalize` that returns early has to normalise the scalars first; that
+  ordering bug survived until an hour-long run hit it.
 - **Coverage flags are easy to forget.** A target without
   `${AVRO_FUZZ_COVERAGE_FLAGS}` gets almost no feedback. Adding it to
   `avro_bytes_fuzz_test` took a 90-second run from 9 edges and a corpus of 20
@@ -182,24 +303,66 @@ is a plain bridge bug and belongs in its own document.
 
 ## Next steps, in the order I would take them
 
-1. **Triage finding 10** and add it to the table with a test.
-2. **Wire `options.suppressions`** at the three `fuzz/` call sites, add a
+1. **Chase finding 14, the array-of-`null` length disagreement.** Both engines
+   accept, neither errors, and the counts differ *and* move between the ASan and
+   plain builds, so at least one length does not come from the input alone. Read
+   past the end of the buffer is the obvious suspect. This is the only value
+   divergence found so far where the caller gets no signal whatsoever.
+2. **Fuzz the depth axis.** Nothing generates nesting past 6: `kMaxDepth` is 5,
+   `NormalizeOptions::max_depth` is 6, the schema-text seeds reach 2 or 3, and
+   the free-form string domains cap at 64 and 96 bytes. `AnyDeepChain(24)` exists
+   but only `AvroIr.DeepChainsRenderWithoutOverflow` uses it, and 24 is below the
+   first threshold that matters. Measured by hand: the bridge rejects from 128
+   nesting levels, which is serde_json's default recursion limit, while avro-cpp
+   accepts and only segfaults at about 11,600 nested arrays, 4,900 nested records
+   or 35,000 unbalanced `[`. So there is an acceptance divergence across the whole
+   band from 43 or 128 up to roughly 11,600, and an unbounded recursion in
+   avro-cpp's `readEntity` (`JsonDom.cc:46`) above it, and no property covers
+   either. A depth parameter on the schema-text domain covers the first cheaply;
+   the second needs a fork-per-case pinning test, since the crash kills the
+   process without unwinding. Note that FuzzTest's `--stack_limit_kb` defaults to
+   128, so a depth property hits that soft limit long before the real stack.
+3. **Wire `options.suppressions`** at the three `fuzz/` call sites, add a
    property asserting that a suppressed-D1 normalize yields a tree
    `ToBridgeValue` accepts, and correct the two documents.
-3. **Make `min_children` mode-dependent** in `fuzz/ir.cc` so `kSchemaOnly` can
+4. **Make `min_children` mode-dependent** in `fuzz/ir.cc` so `kSchemaOnly` can
    emit empty unions and enums. Today `Normalize` legalises them away and the
    invariant tests assert that as intended behaviour, which locks the gap in
    place. The byte harness covers this from the other side, so this is about
    the tree harness's honesty rather than new findings.
-4. **Reader-versus-writer schema resolution.** The register lists it as entirely
+5. **Reader-versus-writer schema resolution.** The register lists it as entirely
    uninvestigated, and findings 3 and 4 both land on schema handling. Sketched
    in the plan as an `EvolvePlan` edit applied to the writer tree.
-5. **Object container round-trips** across the null, deflate and snappy codecs.
-6. **Register entries.** The new divergences need `D13`+ entries in
+6. **Object container round-trips** across the null, deflate and snappy codecs.
+7. **Register entries.** The new divergences need `D13`+ entries in
    `doc/AvrocppDivergences.md` on `main`. That file does not exist on this
    branch, so nothing was added to it.
 
 ## Conventions worth keeping
+
+- **absl for strings, not the standard library's spelling of it.**
+  `absl::StrCat` and `absl::StrAppend` to build, `absl::StrFormat` /
+  `absl::PrintF` / `absl::StrAppendFormat` to format, `absl::StrJoin`,
+  `absl::StrSplit`, `absl::StripAsciiWhitespace`, `absl::StrContains`,
+  `absl::AsciiStrToLower`, `absl::ConsumePrefix` for the rest. Not
+  `std::to_string`, not `operator+` chains, not `snprintf` into a buffer, not
+  `std::ostringstream`, not `.find(...) != npos`. `StrAppend` formats integers
+  itself, which is what removes most `std::to_string` calls. absl has **no**
+  string-repeat helper: `std::string(count, char)` for one character, a loop over
+  `StrAppend` for anything longer. `avro_fuzz_ir` links `absl::strings` and
+  `absl::str_format` for this.
+- **Read-only string parameters are `absl::string_view`.** Not
+  `const std::string&`, which forces an allocation at any call site holding a
+  literal or a view. Construct a `std::string` at the point of storage instead.
+  Two exceptions, both real: a `FUZZ_TEST` property function's signature has to
+  match its domain, so `SchemaTextVerdictsAgree(const std::string&)` and
+  `DecodersAgreeOnArbitraryBytes(const Node&, const std::string&)` cannot take
+  views and will not compile if you change them; and watch the lifetime when a
+  view is passed across a `fork()`, as `run_all_parallel.sh`'s probes do.
+- **Comments earn their place or go.** Only *why*, or something without which the
+  code cannot be followed. No restating what the line does, and no bird's-eye
+  narration either. Prefer making the comment unnecessary: an `enum class` with
+  named values beats a `// 0 = accepted, 1 = rejected` legend.
 
 - Assert what was measured, including numbers that are not yet explained, and
   say in a comment that they are unexplained. `TruncatedArrayBlockIs...` asserts

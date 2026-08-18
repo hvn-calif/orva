@@ -7,7 +7,12 @@
 #include <string>
 #include <vector>
 
+#include "absl/strings/ascii.h"
 #include "absl/strings/escaping.h"
+#include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
+#include "absl/strings/strip.h"
 #include "avro/GenericDatum.hh"
 #include "avro/LogicalType.hh"
 #include "avro/Types.hh"
@@ -21,7 +26,7 @@ using ::security::avro::AvroValue;
 // Drops redundant sign bytes from a two's-complement big-endian integer, so two
 // encodings of the same number compare equal on value even when their lengths
 // differ.
-std::string MinimalTwosComplement(const std::string& raw) {
+std::string MinimalTwosComplement(absl::string_view raw) {
   size_t start = 0;
   while (start + 1 < raw.size()) {
     const unsigned char lead = static_cast<unsigned char>(raw[start]);
@@ -31,20 +36,17 @@ std::string MinimalTwosComplement(const std::string& raw) {
     if (!redundant_zero && !redundant_ones) break;
     ++start;
   }
-  return raw.substr(start);
+  return std::string(raw.substr(start));
 }
 
 // Lowercases and strips the decorations avro-cpp preserves verbatim but the
 // bridge normalises away.
-std::string CanonicalUuid(const std::string& raw) {
-  std::string text = raw;
-  if (text.rfind("urn:uuid:", 0) == 0) text = text.substr(9);
-  if (text.size() >= 2 && text.front() == '{' && text.back() == '}') {
-    text = text.substr(1, text.size() - 2);
+std::string CanonicalUuid(absl::string_view raw) {
+  absl::ConsumePrefix(&raw, "urn:uuid:");
+  if (raw.size() >= 2 && absl::StartsWith(raw, "{") && absl::EndsWith(raw, "}")) {
+    raw = raw.substr(1, raw.size() - 2);
   }
-  std::transform(text.begin(), text.end(), text.begin(),
-                 [](unsigned char c) { return std::tolower(c); });
-  return text;
+  return absl::AsciiStrToLower(raw);
 }
 
 template <typename T, typename Bits>
@@ -61,13 +63,9 @@ struct Comparer {
   CompareOptions options;
   bool clean = true;
 
-  void Report(DivergenceId id, const std::string& path,
-              const std::string& detail, const std::string& evidence = "") {
+  void Report(DivergenceId id, absl::string_view path, absl::string_view detail,
+              absl::string_view evidence = "") {
     if (log->Report(id, path, detail, evidence)) clean = false;
-  }
-
-  std::string Step(const std::string& path, const std::string& step) {
-    return path + step;
   }
 
   // Reads a bridge string-or-bytes payload without caring which tag it carries.
@@ -82,19 +80,19 @@ struct Comparer {
   }
 
   void Compare(const AvroValue& bridge, const ::avro::GenericDatum& cpp,
-               const std::string& path);
+               absl::string_view path);
 
   void CompareRecord(const AvroValue& bridge, const ::avro::GenericDatum& cpp,
-                     const std::string& path);
+                     absl::string_view path);
   void CompareArray(const AvroValue& bridge, const ::avro::GenericDatum& cpp,
-                    const std::string& path);
+                    absl::string_view path);
   void CompareMap(const AvroValue& bridge, const ::avro::GenericDatum& cpp,
-                  const std::string& path);
+                  absl::string_view path);
 };
 
 void Comparer::CompareRecord(const AvroValue& bridge,
                              const ::avro::GenericDatum& cpp,
-                             const std::string& path) {
+                             absl::string_view path) {
   const auto& record = cpp.value<::avro::GenericRecord>();
   auto names = bridge.GetRecordFieldNames();
   if (!names.ok()) {
@@ -104,34 +102,35 @@ void Comparer::CompareRecord(const AvroValue& bridge,
   }
   if (names->size() != record.fieldCount()) {
     Report(DivergenceId::kRecordArity, path,
-           "field count differs: bridge " + std::to_string(names->size()) +
-               ", avro-cpp " + std::to_string(record.fieldCount()));
+           absl::StrCat("field count differs: bridge ", names->size(),
+                        ", avro-cpp ", record.fieldCount()));
     return;
   }
   for (size_t i = 0; i < names->size(); ++i) {
     const std::string& name = (*names)[i];
+    const std::string here = absl::StrCat(path, ".", name);
     // Field order is significant on both sides, so compare positionally and
     // check the names agree at each position.
     if (record.schema()->nameAt(i) != name) {
-      Report(DivergenceId::kRecordFieldNames, Step(path, "." + name),
-             "field " + std::to_string(i) + " is named '" + name +
-                 "' in the bridge and '" + record.schema()->nameAt(i) +
-                 "' in avro-cpp");
+      Report(DivergenceId::kRecordFieldNames, here,
+             absl::StrCat("field ", i, " is named '", name,
+                          "' in the bridge and '", record.schema()->nameAt(i),
+                          "' in avro-cpp"));
       continue;
     }
     auto field = bridge.GetRecordField(name);
     if (!field.ok()) {
-      Report(DivergenceId::kRecordFieldNames, Step(path, "." + name),
-             "the bridge has no field '" + name + "'");
+      Report(DivergenceId::kRecordFieldNames, here,
+             absl::StrCat("the bridge has no field '", name, "'"));
       continue;
     }
-    Compare(*field, record.fieldAt(i), Step(path, "." + name));
+    Compare(*field, record.fieldAt(i), here);
   }
 }
 
 void Comparer::CompareArray(const AvroValue& bridge,
                             const ::avro::GenericDatum& cpp,
-                            const std::string& path) {
+                            absl::string_view path) {
   const auto& items = cpp.value<::avro::GenericArray>().value();
   auto length = bridge.GetArrayLen();
   if (!length.ok()) {
@@ -141,24 +140,25 @@ void Comparer::CompareArray(const AvroValue& bridge,
   }
   if (*length != items.size()) {
     Report(DivergenceId::kArrayLen, path,
-           "length differs: bridge " + std::to_string(*length) +
-               ", avro-cpp " + std::to_string(items.size()));
+           absl::StrCat("length differs: bridge ", *length, ", avro-cpp ",
+                        items.size()));
     return;
   }
   for (size_t i = 0; i < items.size(); ++i) {
+    const std::string here = absl::StrCat(path, "[", i, "]");
     auto item = bridge.GetArrayItem(i);
     if (!item.ok()) {
-      Report(DivergenceId::kArrayLen, Step(path, "[" + std::to_string(i) + "]"),
+      Report(DivergenceId::kArrayLen, here,
              "the bridge would not read this element");
       continue;
     }
-    Compare(*item, items[i], Step(path, "[" + std::to_string(i) + "]"));
+    Compare(*item, items[i], here);
   }
 }
 
 void Comparer::CompareMap(const AvroValue& bridge,
                           const ::avro::GenericDatum& cpp,
-                          const std::string& path) {
+                          absl::string_view path) {
   const auto& entries = cpp.value<::avro::GenericMap>().value();
 
   // avro-cpp keeps duplicate keys; the bridge's HashMap collapses them. Detect
@@ -181,11 +181,10 @@ void Comparer::CompareMap(const AvroValue& bridge,
 
   if (distinct != cpp_keys.size()) {
     Report(DivergenceId::kD2DuplicateMapKey, path,
-           "avro-cpp holds " + std::to_string(cpp_keys.size()) +
-               " entries with only " + std::to_string(distinct) +
-               " distinct keys; the bridge holds " +
-               std::to_string(bridge_keys->size()) +
-               ", so a duplicate key lost data",
+           absl::StrCat("avro-cpp holds ", cpp_keys.size(),
+                        " entries with only ", distinct,
+                        " distinct keys; the bridge holds ",
+                        bridge_keys->size(), ", so a duplicate key lost data"),
            "duplicate map key");
     return;
   }
@@ -194,8 +193,8 @@ void Comparer::CompareMap(const AvroValue& bridge,
   // HashMap iteration order makes avro-cpp's order vary between runs (D3).
   if (bridge_keys->size() != unique_keys.size()) {
     Report(DivergenceId::kMapArity, path,
-           "entry count differs: bridge " + std::to_string(bridge_keys->size()) +
-               ", avro-cpp " + std::to_string(unique_keys.size()));
+           absl::StrCat("entry count differs: bridge ", bridge_keys->size(),
+                        ", avro-cpp ", unique_keys.size()));
     return;
   }
   if (*bridge_keys != unique_keys) {
@@ -203,21 +202,20 @@ void Comparer::CompareMap(const AvroValue& bridge,
     return;
   }
   for (const auto& entry : entries) {
+    const std::string here =
+        absl::StrCat(path, "{\"", absl::BytesToHexString(entry.first), "\"}");
     auto value = bridge.GetMapValue(entry.first);
     if (!value.ok()) {
-      Report(DivergenceId::kMapKeySet,
-             Step(path, "{\"" + absl::BytesToHexString(entry.first) + "\"}"),
-             "the bridge has no such key");
+      Report(DivergenceId::kMapKeySet, here, "the bridge has no such key");
       continue;
     }
-    Compare(*value, entry.second,
-            Step(path, "{\"" + absl::BytesToHexString(entry.first) + "\"}"));
+    Compare(*value, entry.second, here);
   }
 }
 
 void Comparer::Compare(const AvroValue& bridge_in,
                        const ::avro::GenericDatum& cpp,
-                       const std::string& path) {
+                       absl::string_view path) {
   // Unions: avro-cpp's type(), logicalType() and value<T>() are all
   // transparent through a union, forwarding to the selected branch. Only
   // isUnion() and unionBranch() are not. So compare the branch index, then
@@ -226,7 +224,7 @@ void Comparer::Compare(const AvroValue& bridge_in,
   // a loop, not recursion.
   const AvroValue* bridge = &bridge_in;
   AvroValue branch_storage = bridge_in;
-  std::string here = path;
+  std::string here(path);
 
   if (bridge->IsUnion()) {
     if (!cpp.isUnion()) {
@@ -242,8 +240,8 @@ void Comparer::Compare(const AvroValue& bridge_in,
     }
     if (*bridge_branch != cpp.unionBranch()) {
       Report(DivergenceId::kUnionBranch, here,
-             "branch differs: bridge " + std::to_string(*bridge_branch) +
-                 ", avro-cpp " + std::to_string(cpp.unionBranch()));
+             absl::StrCat("branch differs: bridge ", *bridge_branch,
+                          ", avro-cpp ", cpp.unionBranch()));
       return;
     }
     auto inner = bridge->GetUnionValue();
@@ -254,7 +252,7 @@ void Comparer::Compare(const AvroValue& bridge_in,
     }
     branch_storage = *inner;
     bridge = &branch_storage;
-    here = Step(here, "<branch " + std::to_string(*bridge_branch) + ">");
+    absl::StrAppend(&here, "<branch ", *bridge_branch, ">");
   } else if (cpp.isUnion()) {
     Report(DivergenceId::kValueTypeMismatch, here,
            "avro-cpp holds a union, the bridge does not");
@@ -268,7 +266,8 @@ void Comparer::Compare(const AvroValue& bridge_in,
     case ::avro::AVRO_NULL:
       if (!bridge->IsNull()) {
         Report(DivergenceId::kValueTypeMismatch, here,
-               "avro-cpp holds null, the bridge holds " + bridge->TypeName());
+               absl::StrCat("avro-cpp holds null, the bridge holds ",
+                            bridge->TypeName()));
       }
       return;
 
@@ -276,7 +275,8 @@ void Comparer::Compare(const AvroValue& bridge_in,
       auto value = bridge->GetBoolean();
       if (!value.ok()) {
         Report(DivergenceId::kValueTypeMismatch, here,
-               "avro-cpp holds boolean, the bridge holds " + bridge->TypeName());
+               absl::StrCat("avro-cpp holds boolean, the bridge holds ",
+                            bridge->TypeName()));
       } else if (*value != cpp.value<bool>()) {
         Report(DivergenceId::kScalarValue, here, "boolean values differ");
       }
@@ -292,11 +292,12 @@ void Comparer::Compare(const AvroValue& bridge_in,
                                            : bridge->GetInt();
       if (!ours.ok()) {
         Report(DivergenceId::kValueTypeMismatch, here,
-               "avro-cpp holds int, the bridge holds " + bridge->TypeName());
+               absl::StrCat("avro-cpp holds int, the bridge holds ",
+                            bridge->TypeName()));
       } else if (*ours != theirs) {
         Report(DivergenceId::kScalarValue, here,
-               "int values differ: bridge " + std::to_string(*ours) +
-                   ", avro-cpp " + std::to_string(theirs));
+               absl::StrCat("int values differ: bridge ", *ours, ", avro-cpp ",
+                            theirs));
       }
       return;
     }
@@ -321,18 +322,20 @@ void Comparer::Compare(const AvroValue& bridge_in,
            bridge->IsLocalTimestampMicros() || bridge->IsLocalTimestampNanos());
       if (cpp_dropped_annotation && !options.allow_missing_logical_types) {
         Report(DivergenceId::kLogicalTypeAbsentIn1114, here,
-               "the bridge kept the logical type " + bridge->TypeName() +
-                   " but avro-cpp 1.11.4 has no such LogicalType and fell back "
-                   "to a plain long",
+               absl::StrCat("the bridge kept the logical type ",
+                            bridge->TypeName(),
+                            " but avro-cpp 1.11.4 has no such LogicalType and "
+                            "fell back to a plain long"),
                "logical type absent");
       }
       if (!ours.ok()) {
         Report(DivergenceId::kValueTypeMismatch, here,
-               "avro-cpp holds long, the bridge holds " + bridge->TypeName());
+               absl::StrCat("avro-cpp holds long, the bridge holds ",
+                            bridge->TypeName()));
       } else if (*ours != theirs) {
         Report(DivergenceId::kScalarValue, here,
-               "long values differ: bridge " + std::to_string(*ours) +
-                   ", avro-cpp " + std::to_string(theirs));
+               absl::StrCat("long values differ: bridge ", *ours, ", avro-cpp ",
+                            theirs));
       }
       return;
     }
@@ -342,7 +345,8 @@ void Comparer::Compare(const AvroValue& bridge_in,
       const float theirs = cpp.value<float>();
       if (!ours.ok()) {
         Report(DivergenceId::kValueTypeMismatch, here,
-               "avro-cpp holds float, the bridge holds " + bridge->TypeName());
+               absl::StrCat("avro-cpp holds float, the bridge holds ",
+                            bridge->TypeName()));
         return;
       }
       if (options.strict_float_bits) {
@@ -364,7 +368,8 @@ void Comparer::Compare(const AvroValue& bridge_in,
       const double theirs = cpp.value<double>();
       if (!ours.ok()) {
         Report(DivergenceId::kValueTypeMismatch, here,
-               "avro-cpp holds double, the bridge holds " + bridge->TypeName());
+               absl::StrCat("avro-cpp holds double, the bridge holds ",
+                            bridge->TypeName()));
         return;
       }
       if (options.strict_float_bits) {
@@ -387,14 +392,15 @@ void Comparer::Compare(const AvroValue& bridge_in,
         const std::string ours = TextOf(*bridge);
         if (CanonicalUuid(ours) != CanonicalUuid(theirs)) {
           Report(DivergenceId::kScalarValue, here,
-                 "uuid values differ: bridge '" + ours + "', avro-cpp '" +
-                     theirs + "'");
+                 absl::StrCat("uuid values differ: bridge '", ours,
+                              "', avro-cpp '", theirs, "'"));
         } else if (ours != theirs) {
           // avro-cpp preserves the text as written; the bridge re-emits the
           // lowercase canonical form.
           Report(DivergenceId::kUuidTextNotPreserved, here,
-                 "uuid canonicalises the same but the text differs: bridge '" +
-                     ours + "', avro-cpp '" + theirs + "'",
+                 absl::StrCat("uuid canonicalises the same but the text "
+                              "differs: bridge '",
+                              ours, "', avro-cpp '", theirs, "'"),
                  "uuid text");
         }
         return;
@@ -403,18 +409,18 @@ void Comparer::Compare(const AvroValue& bridge_in,
         // Strict on purpose. Treating String and Bytes as interchangeable is
         // exactly how D1 would be hidden.
         Report(DivergenceId::kStringBytesTypeMismatch, here,
-               "avro-cpp holds a string of " + std::to_string(theirs.size()) +
-                   " bytes (" + absl::BytesToHexString(theirs) +
-                   ") but the bridge holds " + bridge->TypeName(),
+               absl::StrCat("avro-cpp holds a string of ", theirs.size(),
+                            " bytes (", absl::BytesToHexString(theirs),
+                            ") but the bridge holds ", bridge->TypeName()),
                "string vs bytes");
         return;
       }
       const std::string ours = TextOf(*bridge);
       if (ours != theirs) {
         Report(DivergenceId::kScalarValue, here,
-               "string payloads differ: bridge " +
-                   absl::BytesToHexString(ours) + ", avro-cpp " +
-                   absl::BytesToHexString(theirs));
+               absl::StrCat("string payloads differ: bridge ",
+                            absl::BytesToHexString(ours), ", avro-cpp ",
+                            absl::BytesToHexString(theirs)));
       }
       return;
     }
@@ -426,30 +432,32 @@ void Comparer::Compare(const AvroValue& bridge_in,
         const std::string ours = TextOf(*bridge);
         if (MinimalTwosComplement(ours) != MinimalTwosComplement(theirs_text)) {
           Report(DivergenceId::kDecimalValue, here,
-                 "decimal values differ: bridge " +
-                     absl::BytesToHexString(ours) + ", avro-cpp " +
-                     absl::BytesToHexString(theirs_text));
+                 absl::StrCat("decimal values differ: bridge ",
+                              absl::BytesToHexString(ours), ", avro-cpp ",
+                              absl::BytesToHexString(theirs_text)));
         } else if (ours != theirs_text) {
           Report(DivergenceId::kDecimalSignPadding, here,
-                 "decimals are numerically equal but padded differently: "
-                 "bridge " +
-                     absl::BytesToHexString(ours) + ", avro-cpp " +
-                     absl::BytesToHexString(theirs_text),
+                 absl::StrCat("decimals are numerically equal but padded "
+                              "differently: bridge ",
+                              absl::BytesToHexString(ours), ", avro-cpp ",
+                              absl::BytesToHexString(theirs_text)),
                  "decimal padding");
         }
         return;
       }
       if (!bridge->IsBytes()) {
         Report(DivergenceId::kStringBytesTypeMismatch, here,
-               "avro-cpp holds bytes but the bridge holds " + bridge->TypeName(),
+               absl::StrCat("avro-cpp holds bytes but the bridge holds ",
+                            bridge->TypeName()),
                "string vs bytes");
         return;
       }
       const std::string ours = TextOf(*bridge);
       if (ours != theirs_text) {
         Report(DivergenceId::kScalarValue, here,
-               "bytes differ: bridge " + absl::BytesToHexString(ours) +
-                   ", avro-cpp " + absl::BytesToHexString(theirs_text));
+               absl::StrCat("bytes differ: bridge ",
+                            absl::BytesToHexString(ours), ", avro-cpp ",
+                            absl::BytesToHexString(theirs_text)));
       }
       return;
     }
@@ -476,17 +484,15 @@ void Comparer::Compare(const AvroValue& bridge_in,
         auto millis = bridge->GetDurationMillis();
         if (!months.ok() || !days.ok() || !millis.ok()) {
           Report(DivergenceId::kValueTypeMismatch, here,
-                 "avro-cpp holds a duration, the bridge holds " +
-                     bridge->TypeName());
+                 absl::StrCat("avro-cpp holds a duration, the bridge holds ",
+                              bridge->TypeName()));
           return;
         }
         if (*months != le32(0) || *days != le32(1) || *millis != le32(2)) {
           Report(DivergenceId::kDurationFields, here,
-                 "duration fields differ: bridge (" + std::to_string(*months) +
-                     "," + std::to_string(*days) + "," +
-                     std::to_string(*millis) + "), avro-cpp (" +
-                     std::to_string(le32(0)) + "," + std::to_string(le32(1)) +
-                     "," + std::to_string(le32(2)) + ")");
+                 absl::StrCat("duration fields differ: bridge (", *months, ",",
+                              *days, ",", *millis, "), avro-cpp (", le32(0),
+                              ",", le32(1), ",", le32(2), ")"));
         }
         return;
       }
@@ -494,14 +500,13 @@ void Comparer::Compare(const AvroValue& bridge_in,
       if (cpp_logical == ::avro::LogicalType::DECIMAL || bridge->IsDecimal()) {
         if (MinimalTwosComplement(ours) != MinimalTwosComplement(theirs_text)) {
           Report(DivergenceId::kDecimalValue, here,
-                 "fixed-backed decimal values differ: bridge " +
-                     absl::BytesToHexString(ours) + ", avro-cpp " +
-                     absl::BytesToHexString(theirs_text));
+                 absl::StrCat("fixed-backed decimal values differ: bridge ",
+                              absl::BytesToHexString(ours), ", avro-cpp ",
+                              absl::BytesToHexString(theirs_text)));
         } else if (ours.size() != theirs_text.size()) {
           Report(DivergenceId::kDecimalSignPadding, here,
-                 "fixed-backed decimal lengths differ: bridge " +
-                     std::to_string(ours.size()) + ", avro-cpp " +
-                     std::to_string(theirs_text.size()),
+                 absl::StrCat("fixed-backed decimal lengths differ: bridge ",
+                              ours.size(), ", avro-cpp ", theirs_text.size()),
                  "decimal padding");
         }
         return;
@@ -509,13 +514,15 @@ void Comparer::Compare(const AvroValue& bridge_in,
 
       if (!bridge->IsFixed()) {
         Report(DivergenceId::kValueTypeMismatch, here,
-               "avro-cpp holds fixed, the bridge holds " + bridge->TypeName());
+               absl::StrCat("avro-cpp holds fixed, the bridge holds ",
+                            bridge->TypeName()));
         return;
       }
       if (ours != theirs_text) {
         Report(DivergenceId::kScalarValue, here,
-               "fixed payloads differ: bridge " + absl::BytesToHexString(ours) +
-                   ", avro-cpp " + absl::BytesToHexString(theirs_text));
+               absl::StrCat("fixed payloads differ: bridge ",
+                            absl::BytesToHexString(ours), ", avro-cpp ",
+                            absl::BytesToHexString(theirs_text)));
       }
       return;
     }
@@ -526,21 +533,22 @@ void Comparer::Compare(const AvroValue& bridge_in,
       auto symbol = bridge->GetEnumSymbol();
       if (!position.ok() || !symbol.ok()) {
         Report(DivergenceId::kValueTypeMismatch, here,
-               "avro-cpp holds an enum, the bridge holds " + bridge->TypeName());
+               absl::StrCat("avro-cpp holds an enum, the bridge holds ",
+                            bridge->TypeName()));
         return;
       }
       // Compare both: a position/symbol disagreement is precisely the D6 shape.
       if (*position != theirs.value()) {
         Report(DivergenceId::kEnumPosition, here,
-               "enum positions differ: bridge " + std::to_string(*position) +
-                   ", avro-cpp " + std::to_string(theirs.value()));
+               absl::StrCat("enum positions differ: bridge ", *position,
+                            ", avro-cpp ", theirs.value()));
         return;
       }
       if (*symbol != theirs.symbol()) {
         Report(DivergenceId::kEnumSymbol, here,
-               "enum symbols differ at position " + std::to_string(*position) +
-                   ": bridge '" + *symbol + "', avro-cpp '" + theirs.symbol() +
-                   "'");
+               absl::StrCat("enum symbols differ at position ", *position,
+                            ": bridge '", *symbol, "', avro-cpp '",
+                            theirs.symbol(), "'"));
       }
       return;
     }
@@ -548,7 +556,8 @@ void Comparer::Compare(const AvroValue& bridge_in,
     case ::avro::AVRO_RECORD:
       if (!bridge->IsRecord()) {
         Report(DivergenceId::kValueTypeMismatch, here,
-               "avro-cpp holds a record, the bridge holds " + bridge->TypeName());
+               absl::StrCat("avro-cpp holds a record, the bridge holds ",
+                            bridge->TypeName()));
         return;
       }
       CompareRecord(*bridge, cpp, here);
@@ -557,7 +566,8 @@ void Comparer::Compare(const AvroValue& bridge_in,
     case ::avro::AVRO_ARRAY:
       if (!bridge->IsArray()) {
         Report(DivergenceId::kValueTypeMismatch, here,
-               "avro-cpp holds an array, the bridge holds " + bridge->TypeName());
+               absl::StrCat("avro-cpp holds an array, the bridge holds ",
+                            bridge->TypeName()));
         return;
       }
       CompareArray(*bridge, cpp, here);
@@ -566,7 +576,8 @@ void Comparer::Compare(const AvroValue& bridge_in,
     case ::avro::AVRO_MAP:
       if (!bridge->IsMap()) {
         Report(DivergenceId::kValueTypeMismatch, here,
-               "avro-cpp holds a map, the bridge holds " + bridge->TypeName());
+               absl::StrCat("avro-cpp holds a map, the bridge holds ",
+                            bridge->TypeName()));
         return;
       }
       CompareMap(*bridge, cpp, here);
@@ -574,7 +585,8 @@ void Comparer::Compare(const AvroValue& bridge_in,
 
     default:
       Report(DivergenceId::kValueTypeMismatch, here,
-             "unhandled avro-cpp type " + std::to_string(cpp_type));
+             absl::StrCat("unhandled avro-cpp type ",
+                          static_cast<int>(cpp_type)));
       return;
   }
 }

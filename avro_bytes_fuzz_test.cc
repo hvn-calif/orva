@@ -240,6 +240,7 @@ constexpr KnownDivergence kKnownDivergences[] = {
     {"schema-trailing-bytes", "disagree on whether this schema is legal"},
     {"avrocpp-lenient", "Invalid utf-8 string"},
     {"reencode-failed", "decimal sign extension 0"},
+    {"json-whitespace-leniency", "disagree on whether this schema is legal"},
 };
 
 bool IsKnown(const std::string& tag, const std::string& detail) {
@@ -450,6 +451,19 @@ fuzztest::Domain<std::string> AnySchemaText() {
                          fuzztest::Arbitrary<std::string>().WithMaxSize(96));
 }
 
+// avro-cpp decides whitespace with isspace() (JsonIO.cc:42), which accepts
+// vertical tab and form feed. JSON allows only tab, newline, carriage return
+// and space, so those two bytes are avro-cpp's alone: it accepts them before,
+// after and inside a schema, and the bridge rejects all three positions. Given
+// its own tag so the table entry that mutes it cannot also mute an unrelated
+// parser disagreement.
+bool HoldsNonJsonWhitespace(absl::string_view text) {
+  for (const char c : text) {
+    if (c == '\v' || c == '\f') return true;
+  }
+  return false;
+}
+
 void ParsersAgreeOnSchemaAcceptance(const std::string& text) {
   const auto bridge = AvroSchema::Parse(text);
   const absl::Status cpp = ParseWithAvrocpp(text, nullptr);
@@ -461,10 +475,14 @@ void ParsersAgreeOnSchemaAcceptance(const std::string& text) {
   const std::string cpp_verdict =
       cpp.ok() ? std::string("accepted")
                : "rejected: " + std::string(cpp.message());
-  const bool trailing_bytes =
-      !bridge.ok() && cpp.ok() && ParsesAsSchemaPrefix(text);
-  ReportDivergence(
-      trailing_bytes ? "schema-trailing-bytes" : "schema-acceptance",
+
+  absl::string_view tag = "schema-acceptance";
+  if (!bridge.ok() && cpp.ok() && HoldsNonJsonWhitespace(text)) {
+    tag = "json-whitespace-leniency";
+  } else if (!bridge.ok() && cpp.ok() && ParsesAsSchemaPrefix(text)) {
+    tag = "schema-trailing-bytes";
+  }
+  ReportDivergence(std::string(tag),
                    "the two parsers disagree on whether this schema is legal"
                    "\n  text:    " +
                        text + "\n  bridge:  " + bridge_verdict +
@@ -1114,8 +1132,45 @@ TEST(AvroBytes, ArrayBlockHeaderRecoveryDiverges) {
   EXPECT_EQ(cpp_zeros, 9u) << "avro-cpp invented nine items";
 }
 
+// NEW FINDING, found by ParsersAgreeOnSchemaAcceptance in 23 seconds.
+//
+// avro-cpp calls isspace() to skip whitespace (JsonIO.cc:42), so it accepts
+// vertical tab (0x0B) and form feed (0x0C) wherever JSON permits whitespace.
+// RFC 8259 permits exactly four bytes there -- tab, newline, carriage return,
+// space -- and serde_json, under the bridge, enforces that. Every other byte
+// from 0x00 to 0x20 gets the same verdict from both.
+//
+// Direction is avro-cpp-lenient, so nothing is mis-decoded: a schema the bridge
+// accepts, avro-cpp also accepts. It matters the other way round, when a
+// pipeline that fed avro-cpp a pretty-printed schema containing a form feed
+// starts failing to parse after moving to the bridge.
+TEST(AvroBytes, VerticalTabAndFormFeedAreWhitespaceOnlyToAvrocpp) {
+  for (const char byte : {'\v', '\f'}) {
+    const std::string before = std::string(1, byte) + R"("int")";
+    const std::string after = R"("int")" + std::string(1, byte);
+    const std::string inside =
+        R"({"type":)" + std::string(1, byte) + R"("int"})";
+    for (const std::string& text : {before, after, inside}) {
+      EXPECT_TRUE(ParseWithAvrocpp(text, nullptr).ok())
+          << "avro-cpp is expected to treat 0x" << std::hex
+          << static_cast<int>(byte) << " as whitespace: " << text;
+      EXPECT_FALSE(AvroSchema::Parse(text).ok())
+          << "the bridge is expected to reject it; if it now accepts, "
+             "serde_json widened its whitespace set and this finding is closed";
+    }
+  }
+
+  // The four JSON whitespace bytes agree, which is what makes the two above a
+  // finding rather than a general disagreement about leading bytes.
+  for (const char byte : {'\t', '\n', '\r', ' '}) {
+    const std::string text = std::string(1, byte) + R"("int")";
+    EXPECT_TRUE(ParseWithAvrocpp(text, nullptr).ok()) << text;
+    EXPECT_TRUE(AvroSchema::Parse(text).ok()) << text;
+  }
+}
+
 TEST(AvroBytes, KnownDivergenceTableSizeIsPinned) {
-  EXPECT_EQ(std::size(kKnownDivergences), 10u)
+  EXPECT_EQ(std::size(kKnownDivergences), 11u)
       << "adding an entry means adding a test named after it above; bump this "
          "count once you have";
 }

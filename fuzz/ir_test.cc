@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "absl/strings/string_view.h"
 #include "fuzz/domains.h"
 #include "fuzz/ir.h"
 #include "fuzz/lower_schema.h"
@@ -55,7 +56,7 @@ bool SameTree(const Node& a, const Node& b) {
 // Balanced-delimiter and quote check. Not a JSON parser -- the real check is
 // that both engines parse it, which lives in the differential targets -- but
 // it catches the structural mistakes a hand-rolled emitter makes.
-bool DelimitersBalance(const std::string& json, std::string* why) {
+bool DelimitersBalance(absl::string_view json, std::string* why) {
   std::vector<char> stack;
   bool in_string = false;
   bool escaped = false;
@@ -200,9 +201,14 @@ void SchemaJsonIsStructurallySound(const Node& raw) {
 }
 FUZZ_TEST(AvroIr, SchemaJsonIsStructurallySound).WithDomains(AnyTree());
 
-// Deep nesting must not blow the stack in the generator or the emitter. Both
-// engines are separately checked for this in the differential targets; here the
-// claim is only that the harness survives.
+// Deep nesting must not blow the stack in the generator or the emitter. The
+// claim is only that the harness survives: no differential property feeds either
+// engine a deep schema, so depth is an unfuzzed axis rather than a covered one.
+// Measured separately, avro-cpp's JSON reader recurses per nesting level with no
+// depth counter (readEntity, JsonDom.cc:46) and segfaults at about 11,600 nested
+// arrays or 35,000 unbalanced brackets on an 8 MiB stack, while apache-avro stops
+// at serde_json's 128-level limit -- so the two disagree from depth 128 up, and
+// nothing here or in the differential targets would find that.
 void DeepChainsRenderWithoutOverflow(const Node& raw) {
   NormalizeOptions options = ValueBearing();
   options.max_depth = 24;

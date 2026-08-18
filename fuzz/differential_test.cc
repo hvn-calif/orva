@@ -5,12 +5,17 @@
 // markers, and Rust HashMap iteration order making encoded map bytes differ
 // (D3) -- so a byte-level assertion would be flaky rather than informative.
 
+#include <csignal>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "absl/status/statusor.h"
 #include "absl/strings/escaping.h"
+#include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "avro/Compiler.hh"
 #include "avro/Decoder.hh"
 #include "avro/Encoder.hh"
@@ -52,9 +57,8 @@ const bool kAllocationCeilingSet = [] {
 // A clean absl::Status whose text says apache-avro panicked is still a
 // finding: the panic was contained at the FFI boundary, but it happened.
 bool LooksLikeRustPanic(const absl::Status& status) {
-  return std::string(status.message())
-             .find("Rust panic caught while processing Avro input") !=
-         std::string::npos;
+  return absl::StrContains(status.message(),
+                           "Rust panic caught while processing Avro input");
 }
 
 // The bridge refuses an allocation past its ceiling, by policy and
@@ -63,8 +67,24 @@ bool LooksLikeRustPanic(const absl::Status& status) {
 // how much memory the machine has. So a verdict comparison on such an input is
 // not meaningful in either direction, which is what D9 records.
 bool LooksLikeAllocationCeiling(const absl::Status& status) {
-  return std::string(status.message()).find("Unable to allocate") !=
-         std::string::npos;
+  return absl::StrContains(status.message(), "Unable to allocate");
+}
+
+// Avro encodes lengths, block counts and union branches as zigzag varints, so a
+// test can spell out what its bytes mean instead of embedding a blob. The same
+// helper exists in avro_bytes_fuzz_test.cc, which shares no code with this file
+// on purpose.
+std::string Varint(int64_t value) {
+  uint64_t n = (static_cast<uint64_t>(value) << 1) ^
+               static_cast<uint64_t>(value >> 63);
+  std::string out;
+  do {
+    uint8_t byte = n & 0x7f;
+    n >>= 7;
+    if (n != 0) byte |= 0x80;
+    out.push_back(static_cast<char>(byte));
+  } while (n != 0);
+  return out;
 }
 
 struct CppEncoded {
@@ -92,7 +112,7 @@ CppEncoded EncodeWithAvrocpp(const ::avro::ValidSchema& schema,
 }
 
 CppOutcome DecodeWithAvrocpp(const ::avro::ValidSchema& schema,
-                             const std::string& bytes,
+                             absl::string_view bytes,
                              ::avro::GenericDatum* out) {
   return CallAvrocpp("avro::decode", [&] {
     std::unique_ptr<::avro::InputStream> in = ::avro::memoryInputStream(
@@ -102,6 +122,48 @@ CppOutcome DecodeWithAvrocpp(const ::avro::ValidSchema& schema,
     *out = ::avro::GenericDatum(schema);
     ::avro::decode(*decoder, *out);
   });
+}
+
+// avro-cpp resizes an array or map to its declared block count before reading a
+// single item (Generic.cc:112), with no check against how much input is left and
+// no allocation ceiling of its own. Two measured cases: 1.6 GB reserved from
+// five bytes, and a 837 GB request from 27 bytes that ASan turned into an abort.
+// Either ends a fuzzing run without teaching anything the pinned tests do not
+// already record -- avro_bytes_fuzz_test.cc guards the same class with
+// kMaxDeclaredLengthBytes, and this is the untriaged vector::resize finding in
+// AGENTS.md, now also confirmed for maps.
+//
+// The guard is deliberately blunt: a varint anywhere in the buffer, at any
+// offset, decoding beyond the cap drops the input. It does not try to work out
+// which varints the decoder will actually read as counts, because that means
+// reimplementing both decoders. The cost is that a large scalar long is also
+// dropped here; DatumCircleAgrees carries the int64 boundary values, so that
+// coverage is not lost, only moved.
+//
+// The cap is 16k rather than a million because avro-cpp allocates a GenericDatum
+// per declared element up front: a million of them is over 100 MB of transient
+// allocation per input, and at that cap this property climbed from 112 MB to
+// 847 MB of resident memory and died on its RSS limit eighteen minutes into an
+// hour. Framing and truncation are covered just as well by a count in the
+// thousands.
+constexpr int64_t kMaxDeclaredCount = 1 << 14;
+
+bool HoldsAnOversizedVarint(absl::string_view bytes) {
+  for (size_t start = 0; start < bytes.size(); ++start) {
+    uint64_t raw = 0;
+    int shift = 0;
+    for (size_t i = start; i < bytes.size(); ++i) {
+      raw |= static_cast<uint64_t>(bytes[i] & 0x7f) << shift;
+      if ((bytes[i] & 0x80) == 0) break;
+      shift += 7;
+      if (shift > 63) return true;
+    }
+    // Zigzag. A negative count is avro-cpp's block-with-byte-size form, whose
+    // magnitude is what gets reserved either way, so compare on magnitude.
+    const int64_t value = static_cast<int64_t>(raw >> 1) ^ -(raw & 1);
+    if (value > kMaxDeclaredCount || value < -kMaxDeclaredCount) return true;
+  }
+  return false;
 }
 
 // avro-cpp stops at the end of the first datum and ignores whatever follows;
@@ -115,7 +177,7 @@ CppOutcome DecodeWithAvrocpp(const ::avro::ValidSchema& schema,
 // that is real either way.
 bool TrailingBytesExplainIt(const ::avro::ValidSchema& schema,
                             const ::avro::GenericDatum& datum,
-                            const std::string& bytes) {
+                            absl::string_view bytes) {
   CppEncoded reencoded = EncodeWithAvrocpp(schema, datum);
   return reencoded.outcome.ok() && reencoded.bytes.size() < bytes.size();
 }
@@ -160,17 +222,19 @@ void DatumCircleAgrees(const Node& raw) {
     ::avro::GenericDatum round_tripped;
     CppOutcome read = DecodeWithAvrocpp(cpp_schema, *bridge_bytes, &round_tripped);
     if (!read.ok()) {
-      log.Report(
-          DivergenceId::kBridgeCannotRepresent, "$",
-          "avro-cpp could not decode bytes the bridge encoded: " + read.what +
-              " [" + absl::BytesToHexString(*bridge_bytes) + "]",
-          "avrocpp rejected bridge output");
+      log.Report(DivergenceId::kBridgeCannotRepresent, "$",
+                 absl::StrCat("avro-cpp could not decode bytes the bridge "
+                              "encoded: ",
+                              read.what, " [",
+                              absl::BytesToHexString(*bridge_bytes), "]"),
+                 "avrocpp rejected bridge output");
     } else {
       CompareValues(*bridge_value, round_tripped, &log);
     }
   } else if (LooksLikeRustPanic(bridge_bytes.status())) {
     log.Report(DivergenceId::kRustPanicCaught, "$",
-               "encoding panicked: " + std::string(bridge_bytes.status().message()),
+               absl::StrCat("encoding panicked: ",
+                            bridge_bytes.status().message()),
                "rust panic");
   }
 
@@ -182,9 +246,9 @@ void DatumCircleAgrees(const Node& raw) {
     auto decoded = security::avro::DecodeDatum(*bridge_schema, cpp_bytes.bytes);
     if (!decoded.ok()) {
       log.Report(DivergenceId::kDecodeVerdictAvrocppLenient, "$",
-                 "the bridge rejected bytes avro-cpp encoded: " +
-                     std::string(decoded.status().message()) + " [" +
-                     absl::BytesToHexString(cpp_bytes.bytes) + "]",
+                 absl::StrCat("the bridge rejected bytes avro-cpp encoded: ",
+                              decoded.status().message(), " [",
+                              absl::BytesToHexString(cpp_bytes.bytes), "]"),
                  LooksLikeRustPanic(decoded.status()) ? "rust panic"
                                                       : "bridge rejected");
     } else {
@@ -223,9 +287,12 @@ void SchemaVerdictsAgree(const Node& raw) {
   FindingLog log(&Suppressions());
   if (bridge_ok != parsed.ok()) {
     log.Report(DivergenceId::kSchemaParseVerdict, "$",
-               std::string("the bridge ") + (bridge_ok ? "accepted" : "rejected") +
-                   " a schema avro-cpp " + (parsed.ok() ? "accepted" : "rejected") +
-                   (parsed.ok() ? "" : " (" + parsed.what + ")"),
+               absl::StrCat("the bridge ",
+                            bridge_ok ? "accepted" : "rejected",
+                            " a schema avro-cpp ",
+                            parsed.ok() ? "accepted" : "rejected",
+                            parsed.ok() ? "" : absl::StrCat(" (", parsed.what,
+                                                            ")")),
                parsed.ok() ? "bridge rejected" : "avrocpp rejected");
   }
   ASSERT_TRUE(log.empty()) << log.Render() << "schema: " << schema_json;
@@ -260,8 +327,9 @@ void SchemasCrossParse(const Node& raw) {
   });
   if (rendered.ok() && !AvroSchema::Parse(cpp_rendered).ok()) {
     log.Report(DivergenceId::kCrossParseRoundTrip, "$",
-               "the bridge cannot parse the schema avro-cpp rendered: " +
-                   cpp_rendered,
+               absl::StrCat("the bridge cannot parse the schema avro-cpp "
+                            "rendered: ",
+                            cpp_rendered),
                "bridge cannot parse avrocpp rendering");
   }
 
@@ -275,8 +343,9 @@ void SchemasCrossParse(const Node& raw) {
     });
     if (!reparsed.ok()) {
       log.Report(DivergenceId::kCrossParseRoundTrip, "$",
-                 "avro-cpp cannot parse the schema the bridge rendered: " +
-                     *bridge_rendered + " (" + reparsed.what + ")",
+                 absl::StrCat("avro-cpp cannot parse the schema the bridge "
+                              "rendered: ",
+                              *bridge_rendered, " (", reparsed.what, ")"),
                  "avrocpp cannot parse bridge rendering");
     }
   }
@@ -309,10 +378,12 @@ void SchemaTextVerdictsAgree(const std::string& text) {
   FindingLog log(&Suppressions());
   if (bridge_ok != parsed.ok()) {
     log.Report(DivergenceId::kSchemaParseVerdict, "$",
-               std::string("the bridge ") + (bridge_ok ? "accepted" : "rejected") +
-                   " schema text avro-cpp " +
-                   (parsed.ok() ? "accepted" : "rejected") +
-                   (parsed.ok() ? "" : " (" + parsed.what + ")"),
+               absl::StrCat("the bridge ",
+                            bridge_ok ? "accepted" : "rejected",
+                            " schema text avro-cpp ",
+                            parsed.ok() ? "accepted" : "rejected",
+                            parsed.ok() ? "" : absl::StrCat(" (", parsed.what,
+                                                            ")")),
                parsed.ok() ? "bridge rejected" : "avrocpp rejected");
   }
   ASSERT_TRUE(log.empty()) << log.Render() << "text: " << text;
@@ -338,6 +409,7 @@ void DecodersAgreeOnArbitraryBytes(const Node& raw, const std::string& bytes) {
         schema_json.size());
   });
   if (!bridge_schema.ok() || !parsed.ok()) return;
+  if (HoldsAnOversizedVarint(bytes)) return;
 
   FindingLog log(&Suppressions());
 
@@ -348,19 +420,19 @@ void DecodersAgreeOnArbitraryBytes(const Node& raw, const std::string& bytes) {
   const bool bridge_panicked =
       !bridge_decoded.ok() && LooksLikeRustPanic(bridge_decoded.status());
   if (bridge_panicked) {
-    log.Report(
-        DivergenceId::kRustPanicCaught, "$",
-        "decoding panicked: " + std::string(bridge_decoded.status().message()) +
-            " [" + absl::BytesToHexString(bytes) + "]",
-        "rust panic");
+    log.Report(DivergenceId::kRustPanicCaught, "$",
+               absl::StrCat("decoding panicked: ",
+                            bridge_decoded.status().message(), " [",
+                            absl::BytesToHexString(bytes), "]"),
+               "rust panic");
   }
 
   if (bridge_decoded.ok() && !cpp_decoded.ok()) {
-    log.Report(
-        DivergenceId::kDecodeVerdictBridgeLenient, "$",
-        "the bridge decoded bytes avro-cpp rejected: " + cpp_decoded.what +
-            " [" + absl::BytesToHexString(bytes) + "]",
-        "avrocpp rejected");
+    log.Report(DivergenceId::kDecodeVerdictBridgeLenient, "$",
+               absl::StrCat("the bridge decoded bytes avro-cpp rejected: ",
+                            cpp_decoded.what, " [",
+                            absl::BytesToHexString(bytes), "]"),
+               "avrocpp rejected");
   } else if (!bridge_decoded.ok() && cpp_decoded.ok() && !bridge_panicked) {
     // Three different things can put us here, and reporting them all as one
     // divergence would mislabel two of them.
@@ -383,9 +455,9 @@ void DecodersAgreeOnArbitraryBytes(const Node& raw, const std::string& bytes) {
       narrow = "trailing bytes";
     }
     log.Report(id, "$",
-               "avro-cpp decoded bytes the bridge rejected: " +
-                   std::string(bridge_decoded.status().message()) + " [" +
-                   absl::BytesToHexString(bytes) + "]",
+               absl::StrCat("avro-cpp decoded bytes the bridge rejected: ",
+                            bridge_decoded.status().message(), " [",
+                            absl::BytesToHexString(bytes), "]"),
                narrow);
   } else if (bridge_decoded.ok() && cpp_decoded.ok()) {
     CompareValues(*bridge_decoded, cpp_datum, &log);
@@ -653,9 +725,8 @@ TEST(Differential, DuplicateFullNameParsesThenPanicsOnEncode) {
 
   auto encoded = security::avro::EncodeDatum(*bridge_schema, outer);
   ASSERT_FALSE(encoded.ok()) << "encoding an illegal schema should not succeed";
-  EXPECT_NE(std::string(encoded.status().message())
-                .find("Rust panic caught while processing Avro input"),
-            std::string::npos)
+  EXPECT_TRUE(absl::StrContains(encoded.status().message(),
+                                "Rust panic caught while processing Avro input"))
       << "expected a contained panic, got: " << encoded.status().message();
 
   // avro-cpp accepts it too, so neither engine enforces the uniqueness rule at
@@ -669,6 +740,219 @@ TEST(Differential, DuplicateFullNameParsesThenPanicsOnEncode) {
       << "if avro-cpp now rejects duplicate full names, the two engines have "
          "stopped agreeing at parse time and this finding needs revisiting: "
       << parsed.what;
+}
+
+// NEW FINDING, found by DatumCircleAgrees in 4.7 seconds of parallel fuzzing.
+//
+// avro::GenericDatum(NodePtr) builds a datum for every record field eagerly and
+// guards neither depth nor cycles, so a record that reaches itself through
+// records alone recurses until the stack is gone. Measured: 247 frames of
+// GenericRecord/GenericDatum::init at about 1 KiB each, then SIGSEGV.
+//
+// Three schema shapes reach it, and the third is why this is not just "do not
+// write recursive schemas":
+//
+//   1. a record referring to itself by name,
+//   2. mutual reference, A holding B holding A,
+//   3. two definitions of one full name, which avro-cpp resolves by turning the
+//      second into a symbolic reference. The text never names a type twice, so
+//      a caller cannot see this coming by reading its own schema.
+//
+// An array, map or union anywhere in the cycle saves it: those build empty or
+// single-branch, so the recursion terminates. That is what made this survive
+// months of the harness generating recursive named types -- the generator only
+// emits a reference where a container can terminate it.
+//
+// avro-cpp is the reference implementation here, so by the scope rule this is an
+// avro-cpp bug to report upstream rather than a bridge regression. The bridge
+// parses all three shapes and builds no datum eagerly, so it does not crash.
+// ToAvrocppDatum refuses these schemas before construction, which is what lets
+// the differential properties run for an hour rather than dying on the first
+// one.
+// How the child dies depends on the build, so the predicate accepts any death.
+// A plain build takes SIGSEGV on the guard page. Under ASan the fault is
+// intercepted and turned into an abort, and the fuzzing build additionally
+// installs absl's failure signal handler, which prints a trace and exits with a
+// code rather than letting a signal terminate the process. Only the *manner* of
+// death varies; a death test only consults this predicate when the statement
+// failed to return, so accepting a non-zero exit still asserts the crash.
+class DiedRatherThanReturned {
+ public:
+  bool operator()(int exit_status) const {
+    if (WIFSIGNALED(exit_status)) {
+      const int signal = WTERMSIG(exit_status);
+      return signal == SIGSEGV || signal == SIGABRT;
+    }
+    return WIFEXITED(exit_status) && WEXITSTATUS(exit_status) != 0;
+  }
+};
+
+TEST(Differential, RecursiveRecordSchemaCrashesAvrocppDatum) {
+  const std::vector<std::string> crashing = {
+      R"({"type":"record","name":"R","fields":[{"name":"a","type":"R"}]})",
+      R"({"type":"record","name":"A","fields":[{"name":"b","type":)"
+      R"({"type":"record","name":"B","fields":[{"name":"a","type":"A"}]}}]})",
+      R"({"type":"record","name":"A","namespace":"ns","fields":[)"
+      R"({"name":"f","type":{"type":"record","name":"A","fields":[]}}]})",
+  };
+  for (const std::string& text : crashing) {
+    ::avro::ValidSchema schema;
+    CppOutcome parsed = CallAvrocpp("compileJsonSchemaFromMemory", [&] {
+      schema = ::avro::compileJsonSchemaFromMemory(
+          reinterpret_cast<const uint8_t*>(text.data()), text.size());
+    });
+    ASSERT_TRUE(parsed.ok()) << "avro-cpp should still parse this: " << text;
+    EXPECT_TRUE(AvroSchema::Parse(text).ok())
+        << "the bridge should still parse this: " << text;
+
+    EXPECT_EXIT(
+        { ::avro::GenericDatum datum(schema); }, DiedRatherThanReturned(), "")
+        << "avro-cpp no longer crashes building a datum for " << text
+        << "; the upstream fix has landed and ToAvrocppDatum's guard can go";
+
+    // A container in the cycle terminates the recursion, so the guard must not
+    // be read as "recursive schemas crash".
+    ::avro::GenericDatum survives;
+    CppOutcome guarded = ToAvrocppDatum(Node{}, schema, &survives);
+    EXPECT_FALSE(guarded.ok())
+        << "the harness must refuse this schema before constructing a datum";
+  }
+}
+
+TEST(Differential, RecursionUnderAContainerIsSafeInAvrocpp) {
+  const std::vector<std::string> safe = {
+      R"({"type":"record","name":"R","fields":[{"name":"a","type":)"
+      R"({"type":"array","items":"R"}}]})",
+      R"({"type":"record","name":"R","fields":[{"name":"a","type":)"
+      R"({"type":"map","values":"R"}}]})",
+      R"({"type":"record","name":"R","fields":[{"name":"a","type":)"
+      R"(["null","R"]}]})",
+  };
+  for (const std::string& text : safe) {
+    ::avro::ValidSchema schema;
+    CppOutcome parsed = CallAvrocpp("compileJsonSchemaFromMemory", [&] {
+      schema = ::avro::compileJsonSchemaFromMemory(
+          reinterpret_cast<const uint8_t*>(text.data()), text.size());
+    });
+    ASSERT_TRUE(parsed.ok()) << parsed.what << " for " << text;
+    CppOutcome built = CallAvrocpp("GenericDatum(NodePtr)", [&] {
+      ::avro::GenericDatum datum(schema);
+    });
+    EXPECT_TRUE(built.ok())
+        << "an array, map or union in the cycle should terminate it: " << text;
+  }
+}
+
+// NEW FINDING, found by DecodersAgreeOnArbitraryBytes after 68 seconds and
+// 430,000 runs of the one-hour parallel run.
+//
+// Four bytes under {"type":"array","items":"null"} and both engines accept, both
+// return an array, and they disagree on how long it is. This is worse than the
+// verdict splits in the table above: nothing errors, so neither caller has any
+// signal that the other side read different data.
+//
+// An items type of null is what makes it reachable. A null item occupies zero
+// bytes, so a declared block count needs no payload to back it and the decoders
+// never run out of input to notice the framing is wrong. Read strictly, the
+// input declares one item, then a negative-count block of one item with a byte
+// size of zero, then a zero count to end the array: two items. Both engines
+// return far more than that, by different amounts, so both are fabricating.
+//
+// The byte harness records this root cause as `array-block-framing`; what is new
+// here is that it also produces a *value* difference rather than only a verdict
+// difference, which is why ARRAY_LEN had never fired before.
+//
+// The exact counts are build-dependent, so only the disagreement is asserted.
+// The one-hour ASan fuzzing build reported bridge 32 against avro-cpp 26; this
+// build, without a sanitizer, gives bridge 2 against avro-cpp 0 for the input
+// the fuzzer printed. Neither pair is explained. A length that moves with the
+// build is a length that does not come from the input alone, which points at
+// memory past the end of the buffer being read on at least one side -- worth
+// investigating on its own, and the reason this test pins the relation rather
+// than the numbers.
+TEST(Differential, ArrayOfNullLengthsDisagree) {
+  const std::string schema_text = R"({"type":"array","items":"null"})";
+  const std::string bytes("\x02\x01\x00\x00", 4);
+
+  auto bridge_schema = AvroSchema::Parse(schema_text);
+  ASSERT_TRUE(bridge_schema.ok()) << bridge_schema.status();
+  ::avro::ValidSchema cpp_schema;
+  CppOutcome parsed = CallAvrocpp("compileJsonSchemaFromMemory", [&] {
+    cpp_schema = ::avro::compileJsonSchemaFromMemory(
+        reinterpret_cast<const uint8_t*>(schema_text.data()),
+        schema_text.size());
+  });
+  ASSERT_TRUE(parsed.ok()) << parsed.what;
+
+  auto decoded = security::avro::DecodeDatum(*bridge_schema, bytes);
+  ASSERT_TRUE(decoded.ok()) << "the bridge is expected to accept these bytes: "
+                            << decoded.status();
+  auto bridge_len = decoded->GetArrayLen();
+  ASSERT_TRUE(bridge_len.ok());
+
+  ::avro::GenericDatum cpp_datum;
+  CppOutcome cpp = DecodeWithAvrocpp(cpp_schema, bytes, &cpp_datum);
+  ASSERT_TRUE(cpp.ok()) << "avro-cpp is expected to accept them too: "
+                        << cpp.what;
+  const size_t cpp_len = cpp_datum.value<::avro::GenericArray>().value().size();
+
+  EXPECT_NE(*bridge_len, cpp_len)
+      << "the two engines now agree at " << *bridge_len
+      << " items; this finding is closed and ARRAY_LEN can come out of the run "
+         "script's suppression list";
+}
+
+// NEW FINDING, found by DecodersAgreeOnArbitraryBytes after 293,811 runs.
+//
+// A string of exactly 16 bytes under a `uuid` logical type is read as a binary
+// UUID by the bridge and as the text it is by avro-cpp. Both succeed, so the
+// caller gets no signal that the value changed meaning.
+//
+//   schema: {"type":"string","logicalType":"uuid"}
+//   input:  20 00*12 62 6f 6c 73        (length 16, then twelve NULs, "bols")
+//
+//   avrocpp: the 16 bytes verbatim
+//   bridge:  "00000000-0000-0000-0000-0000626f6c73"
+//
+// The tail of the bridge's rendering, 626f6c73, is "bols" read as hex: the bytes
+// were reinterpreted, not reformatted. The Avro specification puts `uuid` on
+// `string` and defines its encoding as the 36-character text form, so avro-cpp is
+// reading what the spec says is there. apache-avro additionally accepts a
+// 16-byte payload as a binary UUID, which is what a uuid-on-fixed(16) field
+// carries in Avro 1.12.
+//
+// Length 16 exactly is what makes it reachable, and why it took five figures of
+// runs to find: any other length and both engines agree.
+TEST(Differential, SixteenByteUuidStringIsReadAsBinaryByTheBridge) {
+  const std::string schema_text = R"({"type":"string","logicalType":"uuid"})";
+  const std::string payload = std::string(12, '\0') + "bols";
+  ASSERT_EQ(payload.size(), 16u);
+  const std::string bytes = Varint(static_cast<int64_t>(payload.size())) + payload;
+
+  auto bridge_schema = AvroSchema::Parse(schema_text);
+  ASSERT_TRUE(bridge_schema.ok()) << bridge_schema.status();
+  ::avro::ValidSchema cpp_schema;
+  CppOutcome parsed = CallAvrocpp("compileJsonSchemaFromMemory", [&] {
+    cpp_schema = ::avro::compileJsonSchemaFromMemory(
+        reinterpret_cast<const uint8_t*>(schema_text.data()),
+        schema_text.size());
+  });
+  ASSERT_TRUE(parsed.ok()) << parsed.what;
+
+  ::avro::GenericDatum cpp_datum;
+  CppOutcome cpp = DecodeWithAvrocpp(cpp_schema, bytes, &cpp_datum);
+  ASSERT_TRUE(cpp.ok()) << cpp.what;
+  EXPECT_EQ(cpp_datum.value<std::string>(), payload)
+      << "avro-cpp is expected to hand back the bytes as written";
+
+  auto decoded = security::avro::DecodeDatum(*bridge_schema, bytes);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  auto text = decoded->GetUuid();
+  ASSERT_TRUE(text.ok()) << text.status();
+  EXPECT_EQ(*text, "00000000-0000-0000-0000-0000626f6c73")
+      << "the bridge is expected to read the 16 bytes as a binary uuid; if it "
+         "now returns them verbatim, this finding is fixed";
+  EXPECT_NE(*text, payload) << "the two engines now agree";
 }
 
 // The harness's own sanity check: a plain record must survive the full circle.

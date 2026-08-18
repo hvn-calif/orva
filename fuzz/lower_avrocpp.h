@@ -3,6 +3,7 @@
 
 #include <string>
 
+#include "absl/strings/str_cat.h"
 #include "avro/GenericDatum.hh"
 #include "avro/Node.hh"
 #include "avro/ValidSchema.hh"
@@ -66,11 +67,11 @@ CppOutcome CallAvrocpp(const char* site, F&& body) {
     body();
     return {};
   } catch (const ::avro::Exception& e) {
-    return {CppVerdict::kAvroException, std::string(site) + ": " + e.what()};
+    return {CppVerdict::kAvroException, absl::StrCat(site, ": ", e.what())};
   } catch (const std::out_of_range& e) {
-    return {CppVerdict::kOutOfRange, std::string(site) + ": " + e.what()};
+    return {CppVerdict::kOutOfRange, absl::StrCat(site, ": ", e.what())};
   } catch (const std::exception& e) {
-    return {CppVerdict::kOtherStdException, std::string(site) + ": " + e.what()};
+    return {CppVerdict::kOtherStdException, absl::StrCat(site, ": ", e.what())};
   }
 }
 

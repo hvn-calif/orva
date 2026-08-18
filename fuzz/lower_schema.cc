@@ -1,10 +1,13 @@
 #include "fuzz/lower_schema.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <set>
 #include <string>
 #include <vector>
+
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/string_view.h"
 
 namespace security::avro_fuzz {
 namespace {
@@ -38,6 +41,17 @@ std::string ResolveNamespace(const Naming& naming) {
   return kNamespacePool[naming.namespace_id % kNamespacePoolSize];
 }
 
+absl::string_view SimplePartOf(absl::string_view full) {
+  const size_t dot = full.rfind('.');
+  return dot == absl::string_view::npos ? full : full.substr(dot + 1);
+}
+
+absl::string_view NamespacePartOf(absl::string_view full) {
+  const size_t dot = full.rfind('.');
+  return dot == absl::string_view::npos ? absl::string_view()
+                                        : full.substr(0, dot);
+}
+
 std::string ResolveSimpleName(const Naming& naming, ScopeState& state) {
   switch (naming.strategy) {
     case NameStrategy::kPool:
@@ -45,30 +59,27 @@ std::string ResolveSimpleName(const Naming& naming, ScopeState& state) {
     case NameStrategy::kReserved:
       return kReservedWords[naming.name_id % kReservedWordsSize];
     case NameStrategy::kReuseAncestor:
+      // The enclosing entry is a full name; shadowing reuses the simple part.
       if (!state.enclosing.empty()) {
-        // The enclosing entry is a full name; shadowing reuses the simple part.
-        const std::string& full = state.enclosing.back();
-        size_t dot = full.rfind('.');
-        return dot == std::string::npos ? full : full.substr(dot + 1);
+        return std::string(SimplePartOf(state.enclosing.back()));
       }
       break;
     case NameStrategy::kReuseAnyInScope:
       if (!state.defined.empty()) {
-        const std::string& full =
-            state.defined[naming.name_id % state.defined.size()];
-        size_t dot = full.rfind('.');
-        return dot == std::string::npos ? full : full.substr(dot + 1);
+        return std::string(SimplePartOf(
+            state.defined[naming.name_id % state.defined.size()]));
       }
       break;
     case NameStrategy::kFresh:
     default:
       break;
   }
-  return "N" + std::to_string(state.serial++);
+  return absl::StrCat("N", state.serial++);
 }
 
-std::string JoinName(const std::string& name_space, const std::string& simple) {
-  return name_space.empty() ? simple : name_space + "." + simple;
+std::string JoinName(absl::string_view name_space, absl::string_view simple) {
+  return name_space.empty() ? std::string(simple)
+                            : absl::StrCat(name_space, ".", simple);
 }
 
 struct ResolvedName {
@@ -78,16 +89,15 @@ struct ResolvedName {
   bool is_reference = false;
 };
 
-// Splits a full name into namespace and simple parts.
-void SplitName(const std::string& full, std::string* name_space,
+void SplitName(absl::string_view full, std::string* name_space,
                std::string* simple) {
-  size_t dot = full.rfind('.');
-  if (dot == std::string::npos) {
+  const size_t dot = full.rfind('.');
+  if (dot == absl::string_view::npos) {
     name_space->clear();
-    *simple = full;
+    simple->assign(full);
   } else {
-    *name_space = full.substr(0, dot);
-    *simple = full.substr(dot + 1);
+    name_space->assign(full.substr(0, dot));
+    simple->assign(full.substr(dot + 1));
   }
 }
 
@@ -119,6 +129,16 @@ ResolvedName ResolveName(const Naming& naming, ScopeState& state) {
   if (out.full.empty()) {
     out.simple = ResolveSimpleName(naming, state);
     out.name_space = ResolveNamespace(naming);
+    // Avro resolves a name carrying no namespace against the enclosing
+    // definition's namespace, so the uniquifier below has to compare the names
+    // the *parsers* will see rather than the ones the pool handed out. Without
+    // this, an inner record named A under an outer ns.A was emitted as a second
+    // definition, both engines resolved it to ns.A, and avro-cpp turned the
+    // duplicate into a symbolic reference -- a record cycle whose GenericDatum
+    // construction recurses until the stack is gone.
+    if (out.name_space.empty() && !state.enclosing.empty()) {
+      out.name_space = std::string(NamespacePartOf(state.enclosing.back()));
+    }
     out.full = JoinName(out.name_space, out.simple);
   }
 
@@ -142,7 +162,7 @@ ResolvedName ResolveName(const Naming& naming, ScopeState& state) {
   // property its input.
   while (std::find(state.defined.begin(), state.defined.end(), out.full) !=
          state.defined.end()) {
-    out.simple += "_" + std::to_string(state.serial++);
+    absl::StrAppend(&out.simple, "_", state.serial++);
     out.full = JoinName(out.name_space, out.simple);
   }
   return out;
@@ -196,21 +216,19 @@ int ReserveSlot(ScopeState& state) {
   return index;
 }
 
-void RecordName(ScopeState& state, int index, const std::string& full,
+void RecordName(ScopeState& state, int index, absl::string_view full,
                 bool is_reference) {
   if (state.names == nullptr) return;
-  state.names->full_name_by_preorder_index[index] = full;
+  state.names->full_name_by_preorder_index[index].assign(full);
   state.names->is_reference_by_preorder_index[index] = is_reference;
 }
 
-void EmitNamedHeader(const ResolvedName& name, const char* type,
+void EmitNamedHeader(const ResolvedName& name, absl::string_view type,
                      std::string* out) {
-  *out += "{\"type\":\"";
-  *out += type;
-  *out += "\",\"name\":";
-  *out += JsonQuote(name.simple);
+  absl::StrAppend(out, "{\"type\":\"", type, "\",\"name\":",
+                  JsonQuote(name.simple));
   if (!name.name_space.empty()) {
-    *out += ",\"namespace\":" + JsonQuote(name.name_space);
+    absl::StrAppend(out, ",\"namespace\":", JsonQuote(name.name_space));
   }
 }
 
@@ -219,22 +237,23 @@ void EmitRecord(const Node& node, ScopeState& state, int index,
   ResolvedName name = ResolveName(node.naming, state);
   RecordName(state, index, name.full, name.is_reference);
   if (name.is_reference) {
-    *out += JsonQuote(name.full);
+    absl::StrAppend(out, JsonQuote(name.full));
     return;
   }
   state.defined.push_back(name.full);
   EmitNamedHeader(name, "record", out);
-  if (node.naming.emit_doc) *out += ",\"doc\":\"generated\"";
+  if (node.naming.emit_doc) absl::StrAppend(out, ",\"doc\":\"generated\"");
 
   state.enclosing.push_back(name.full);
-  *out += ",\"fields\":[";
+  absl::StrAppend(out, ",\"fields\":[");
   for (size_t i = 0; i < node.children.size(); ++i) {
-    if (i != 0) *out += ",";
-    *out += "{\"name\":" + JsonQuote(LabelAt(node, i)) + ",\"type\":";
+    if (i != 0) absl::StrAppend(out, ",");
+    absl::StrAppend(out, "{\"name\":", JsonQuote(LabelAt(node, i)),
+                    ",\"type\":");
     Emit(node.children[i], state, out);
-    *out += "}";
+    absl::StrAppend(out, "}");
   }
-  *out += "]}";
+  absl::StrAppend(out, "]}");
   state.enclosing.pop_back();
 }
 
@@ -243,17 +262,17 @@ void EmitEnum(const Node& node, ScopeState& state, int index,
   ResolvedName name = ResolveName(node.naming, state);
   RecordName(state, index, name.full, name.is_reference);
   if (name.is_reference) {
-    *out += JsonQuote(name.full);
+    absl::StrAppend(out, JsonQuote(name.full));
     return;
   }
   state.defined.push_back(name.full);
   EmitNamedHeader(name, "enum", out);
-  *out += ",\"symbols\":[";
+  absl::StrAppend(out, ",\"symbols\":[");
   for (size_t i = 0; i < node.labels.size(); ++i) {
-    if (i != 0) *out += ",";
-    *out += JsonQuote(node.labels[i]);
+    if (i != 0) absl::StrAppend(out, ",");
+    absl::StrAppend(out, JsonQuote(node.labels[i]));
   }
-  *out += "]}";
+  absl::StrAppend(out, "]}");
 }
 
 void EmitFixedLike(const Node& node, ScopeState& state, int index,
@@ -261,21 +280,21 @@ void EmitFixedLike(const Node& node, ScopeState& state, int index,
   ResolvedName name = ResolveName(node.naming, state);
   RecordName(state, index, name.full, name.is_reference);
   if (name.is_reference) {
-    *out += JsonQuote(name.full);
+    absl::StrAppend(out, JsonQuote(name.full));
     return;
   }
   state.defined.push_back(name.full);
   EmitNamedHeader(name, "fixed", out);
   const int size = node.kind == Kind::kDuration ? 12 : node.selectors.fixed_size;
-  *out += ",\"size\":" + std::to_string(size);
+  absl::StrAppend(out, ",\"size\":", size);
   if (decimal) {
-    *out += ",\"logicalType\":\"decimal\",\"precision\":" +
-            std::to_string(node.selectors.precision) +
-            ",\"scale\":" + std::to_string(ResolveScale(node.selectors));
+    absl::StrAppend(out, ",\"logicalType\":\"decimal\",\"precision\":",
+                    node.selectors.precision,
+                    ",\"scale\":", ResolveScale(node.selectors));
   } else if (node.kind == Kind::kDuration) {
-    *out += ",\"logicalType\":\"duration\"";
+    absl::StrAppend(out, ",\"logicalType\":\"duration\"");
   }
-  *out += "}";
+  absl::StrAppend(out, "}");
 }
 
 void Emit(const Node& node, ScopeState& state, std::string* out) {
@@ -301,17 +320,17 @@ void Emit(const Node& node, ScopeState& state, std::string* out) {
     case Kind::kArray:
       // An array may be empty, so anything below it can terminate.
       ++state.termination_guards;
-      *out += "{\"type\":\"array\",\"items\":";
+      absl::StrAppend(out, "{\"type\":\"array\",\"items\":");
       Emit(node.children.empty() ? Node{} : node.children[0], state, out);
-      *out += "}";
+      absl::StrAppend(out, "}");
       --state.termination_guards;
       return;
 
     case Kind::kMap:
       ++state.termination_guards;
-      *out += "{\"type\":\"map\",\"values\":";
+      absl::StrAppend(out, "{\"type\":\"map\",\"values\":");
       Emit(node.children.empty() ? Node{} : node.children[0], state, out);
-      *out += "}";
+      absl::StrAppend(out, "}");
       --state.termination_guards;
       return;
 
@@ -320,20 +339,22 @@ void Emit(const Node& node, ScopeState& state, std::string* out) {
       // so its subtrees can terminate.
       const bool has_alternative = node.children.size() > 1;
       if (has_alternative) ++state.termination_guards;
-      *out += "[";
+      absl::StrAppend(out, "[");
       for (size_t i = 0; i < node.children.size(); ++i) {
-        if (i != 0) *out += ",";
+        if (i != 0) absl::StrAppend(out, ",");
         Emit(node.children[i], state, out);
       }
-      *out += "]";
+      absl::StrAppend(out, "]");
       if (has_alternative) --state.termination_guards;
       return;
     }
 
     case Kind::kDecimalBytes:
-      *out += "{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":" +
-              std::to_string(node.selectors.precision) +
-              ",\"scale\":" + std::to_string(ResolveScale(node.selectors)) + "}";
+      absl::StrAppend(out,
+                      "{\"type\":\"bytes\",\"logicalType\":\"decimal\","
+                      "\"precision\":",
+                      node.selectors.precision,
+                      ",\"scale\":", ResolveScale(node.selectors), "}");
       return;
 
     default:
@@ -341,48 +362,40 @@ void Emit(const Node& node, ScopeState& state, std::string* out) {
   }
 
   if (const char* annotation = LogicalAnnotation(node.kind)) {
-    *out += "{\"type\":\"";
-    *out += LogicalBase(node.kind);
-    *out += "\",\"logicalType\":\"";
-    *out += annotation;
-    *out += "\"}";
+    absl::StrAppend(out, "{\"type\":\"", LogicalBase(node.kind),
+                    "\",\"logicalType\":\"", annotation, "\"}");
     return;
   }
 
-  // Plain primitive.
-  *out += "\"";
-  *out += KindName(node.kind);
-  *out += "\"";
+  absl::StrAppend(out, "\"", KindName(node.kind), "\"");
 }
 
 }  // namespace
 
-std::string JsonQuote(const std::string& raw) {
+std::string JsonQuote(absl::string_view raw) {
   std::string out = "\"";
   for (unsigned char c : raw) {
     switch (c) {
-      case '"': out += "\\\""; break;
-      case '\\': out += "\\\\"; break;
-      case '\b': out += "\\b"; break;
-      case '\f': out += "\\f"; break;
-      case '\n': out += "\\n"; break;
-      case '\r': out += "\\r"; break;
-      case '\t': out += "\\t"; break;
+      case '"': absl::StrAppend(&out, "\\\""); break;
+      case '\\': absl::StrAppend(&out, "\\\\"); break;
+      case '\b': absl::StrAppend(&out, "\\b"); break;
+      case '\f': absl::StrAppend(&out, "\\f"); break;
+      case '\n': absl::StrAppend(&out, "\\n"); break;
+      case '\r': absl::StrAppend(&out, "\\r"); break;
+      case '\t': absl::StrAppend(&out, "\\t"); break;
       default:
         if (c < 0x20) {
-          char buf[8];
-          std::snprintf(buf, sizeof(buf), "\\u%04X", c);
-          out += buf;
+          absl::StrAppendFormat(&out, "\\u%04X", c);
         } else {
           // Bytes >= 0x80 are passed through. A name never contains them, and
           // a map key is not part of the schema, so this only matters if a
           // caller quotes arbitrary bytes -- in which case emitting them raw
           // preserves what both parsers will actually see.
-          out += static_cast<char>(c);
+          out.push_back(static_cast<char>(c));
         }
     }
   }
-  out += "\"";
+  out.push_back('"');
   return out;
 }
 

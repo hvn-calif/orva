@@ -16,3 +16,6 @@ rust/target/
 # ANTLR (pulled in by FuzzTest) writes its runtime libraries here during the
 # build, into the source tree rather than the build directory.
 /dist/
+
+# Local fuzzing run output: logs, corpora and crash reproducers.
+/fuzzrun/
