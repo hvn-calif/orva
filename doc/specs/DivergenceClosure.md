@@ -108,6 +108,30 @@ so.
    `/home/hvn/avro-rs-0.21-d1`, and the count is reported. The two pre-existing
    failures there are unrelated and reproduce without any patch.
 
+## Progress
+
+| patch | status | closes |
+| --- | --- | --- |
+| A1 strict-eof | **landed** | `bridge-lenient` / "EOF reached" |
+| A2 empty-union | **landed** | `schema-acceptance` / "bad node of type union" |
+| A3 empty-enum | **landed** | `schema-acceptance` / "bad node of type enum" |
+| A4 empty-decimal | **landed** | `reencode-failed` / "decimal sign extension 0" |
+| A5 container block varint | open, needs measurement | no entry yet |
+| B1 trailing bytes after a datum | open | `trailing-bytes` |
+| C1 trailing bytes after schema text | open | `schema-trailing-bytes` |
+| C2 vertical tab and form feed | open | `json-whitespace-leniency` |
+| C3 lenient namespace | open, recommended last or not at all | `schema-acceptance` / "Invalid namespace" |
+| D1 duplicate full name | open | finding 4, no entry |
+| D2 duration render | open | finding 3, no entry |
+| E1/E2 map keys | open, needs its own spec | `avrocpp-lenient` / "Invalid utf-8 string", D2 |
+
+`kKnownDivergences`: 11 entries at the start, 7 now.
+
+Tier A is complete. Every one of its four patches is on unconditionally, and
+**three of the four are not additive** for other consumers of apache-avro: each
+changed a behaviour an upstream test asserted. Per-patch detail is in
+`patches/README.md`.
+
 ## The patch series
 
 Thirteen patches, in the order to take them. The tier boundaries are where the

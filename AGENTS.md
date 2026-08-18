@@ -158,10 +158,32 @@ Fifteen. Each has a test in `avro_bytes_fuzz_test.cc` or
 `fuzz/differential_test.cc` named after it. Full detail in `fuzz/FINDINGS.md`.
 
 **Closing them is now the work**, per `doc/specs/DivergenceClosure.md`, which
-orders twelve patches easiest first and records the policy they follow: avro-cpp's
-behaviour is the bridge's default, and every deviation from it is reachable
-through a knob. `kKnownDivergences` is down from 11 entries to 8; the pin in
-`KnownDivergenceTableSizeIsPinned` moves with it.
+orders thirteen patches easiest first and records the policy they follow:
+avro-cpp's behaviour is the bridge's default, and every deviation from it is
+reachable through a knob. `kKnownDivergences` is down from 11 entries to 7; the
+pin in `KnownDivergenceTableSizeIsPinned` moves with it.
+
+**Tier A is done**: four unconditional apache-avro patches, no knobs, because for
+all four avro-cpp is the stricter engine and apache-avro's behaviour was wrong
+rather than merely lenient. They stack in this order on top of the non-UTF-8 and
+uuid patches, all in orva's `patches/`:
+
+| patch | closes |
+| --- | --- |
+| `apache-avro-0.21-strict-eof.patch` | `bridge-lenient` / "EOF reached" |
+| `apache-avro-0.21-empty-union.patch` | `schema-acceptance` / "bad node of type union" |
+| `apache-avro-0.21-empty-enum.patch` | `schema-acceptance` / "bad node of type enum" |
+| `apache-avro-0.21-empty-decimal.patch` | `reencode-failed` / "decimal sign extension 0" |
+
+Three of the four are **not additive** for other consumers of the crate, and each
+had upstream tests asserting the behaviour it changes. That is recorded per patch
+in `patches/README.md`; do not describe this series as purely additive.
+
+Tier A also turned up a defect the fuzzer could not have found, because the
+harness has no object-container coverage: a container file cut inside a
+block-count varint reads as a clean end of iteration, 2 items and no error. It is
+A5 in the spec, with its reproducer, and needs a differential measurement before
+a fix.
 Entries 1 to 10 came from the first runs; 11 to 15 are in the second table below,
 from the parallel hour-long runs.
 

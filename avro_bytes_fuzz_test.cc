@@ -236,7 +236,6 @@ constexpr KnownDivergence kKnownDivergences[] = {
     // Likewise one root cause, three messages: see ParsesAsSchemaPrefix.
     {"schema-trailing-bytes", "disagree on whether this schema is legal"},
     {"avrocpp-lenient", "Invalid utf-8 string"},
-    {"reencode-failed", "decimal sign extension 0"},
     {"json-whitespace-leniency", "disagree on whether this schema is legal"},
 };
 
@@ -951,64 +950,49 @@ TEST(AvroBytes, AllocationCeilingChecksCountAgainstAByteLimit) {
       << allowed.status().message();
 }
 
-// reencode-failed / "decimal sign extension 0"
+// CLOSED. Was reencode-failed / "decimal sign extension 0", found by
+// ReencodingAgreesWhenBothDecode within five minutes and the first finding the
+// acceptance properties could not have reached: both engines accept the input, so
+// they never disagreed on acceptance.
 //
-// Found by ReencodingAgreesWhenBothDecode within five minutes of fuzzing, and
-// the first finding the acceptance properties could not have reached: both
-// engines accept the input, so they never disagree on acceptance.
-//
-// A single 0x00 byte under a decimal schema is a length prefix of zero, so the
-// unscaled value is an empty byte array. Avro's spec describes that value as a
+// A single 0x00 under a decimal schema is a length prefix of zero, so the
+// unscaled value is an empty byte array. Avro describes that value as a
 // two's-complement big-endian integer, which needs at least one byte, so the
 // input is arguably malformed and rejecting it would be reasonable. Neither
-// decoder does.
+// decoder does, and the bridge now follows avro-cpp rather than taking a
+// position, which is the policy for the whole series.
 //
-// What the bridge does instead is worse than either accepting or rejecting: it
-// reports success and hands back a value that says it is a decimal but whose
-// bytes cannot be read and which its own encoder will not take back, both
-// failing with the same message. A caller that decodes this input has no way to
-// use or forward the result. avro-cpp decodes it and re-encodes it to the byte
-// it came from.
-TEST(AvroBytes, EmptyDecimalDecodesToAValueTheBridgeCannotReadOrReencode) {
+// What the bridge used to do was worse than either accepting or rejecting: it
+// reported success and handed back a value that said it was a decimal but whose
+// bytes could not be read and which its own encoder would not take back, both
+// failing with the same message. The empty-decimal patch makes the round trip
+// give the empty slice back, so both engines now complete the circle to the byte
+// they were given.
+TEST(AvroBytes, EmptyDecimalRoundTripsThroughBothEngines) {
   const std::string schema =
       R"({"type":"bytes","logicalType":"decimal","precision":9,"scale":2})";
   const std::string bytes = Varint(0);  // a zero-length unscaled value
 
   auto bridge_schema = AvroSchema::Parse(schema);
   ASSERT_TRUE(bridge_schema.ok()) << bridge_schema.status();
-  ::avro::ValidSchema cpp_schema;
-  ASSERT_TRUE(ParseWithAvrocpp(schema, &cpp_schema).ok()) << schema;
+  ExpectDecodeAcceptance(schema, bytes, true, true);
 
   const auto bridge_value = security::avro::DecodeDatum(*bridge_schema, bytes);
-  ASSERT_TRUE(bridge_value.ok())
-      << "the bridge rejected the input outright, which would be a change: "
-      << bridge_value.status().message();
+  ASSERT_TRUE(bridge_value.ok()) << bridge_value.status();
   EXPECT_TRUE(bridge_value->IsDecimal());
 
-  // The value claims to be a decimal but will not yield its bytes.
+  // The value now yields its bytes, where it used to fail with
+  // "decimal sign extension 0". Empty in, empty out.
   const auto decimal_bytes = bridge_value->GetDecimalBytes();
-  EXPECT_FALSE(decimal_bytes.ok());
-  EXPECT_NE(std::string(decimal_bytes.status().message())
-                .find("decimal sign extension 0"),
-            std::string::npos)
-      << decimal_bytes.status().message();
+  ASSERT_TRUE(decimal_bytes.ok()) << decimal_bytes.status();
+  EXPECT_EQ(*decimal_bytes, "");
 
-  // And the bridge's own encoder refuses what its decoder produced.
-  const auto reencoded =
-      security::avro::EncodeDatum(*bridge_schema, *bridge_value);
-  EXPECT_FALSE(reencoded.ok());
-  EXPECT_NE(std::string(reencoded.status().message())
-                .find("decimal sign extension 0"),
-            std::string::npos)
-      << reencoded.status().message();
+  // And both engines close the circle back to the input byte.
+  ExpectReencodingAgrees(schema, bytes);
 
-  // avro-cpp completes the circle back to the input byte.
-  ::avro::GenericDatum cpp_value;
-  ASSERT_TRUE(DecodeWithAvrocpp(cpp_schema, bytes, &cpp_value).ok());
-  std::string cpp_reencoded;
-  ASSERT_TRUE(EncodeWithAvrocpp(cpp_schema, cpp_value, &cpp_reencoded).ok());
-  EXPECT_EQ(absl::BytesToHexString(cpp_reencoded),
-            absl::BytesToHexString(bytes));
+  // A one-byte unscaled value was never affected and still agrees, so the fix
+  // did not reach past the empty case.
+  ExpectReencodingAgrees(schema, Varint(1) + std::string(1, '\x2a'));
 }
 
 // schema-trailing-bytes
@@ -1207,7 +1191,7 @@ TEST(AvroBytes, VerticalTabAndFormFeedAreWhitespaceOnlyToAvrocpp) {
 }
 
 TEST(AvroBytes, KnownDivergenceTableSizeIsPinned) {
-  EXPECT_EQ(std::size(kKnownDivergences), 8u)
+  EXPECT_EQ(std::size(kKnownDivergences), 7u)
       << "adding an entry means adding a test named after it above; bump this "
          "count once you have";
 }
