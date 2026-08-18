@@ -83,7 +83,7 @@ bridge API that avro-cpp has no counterpart to is not a divergence and is not
 listed here; the one such bug this work turned up is written up separately in
 `doc/CanonicalFormBug.md`.
 
-### 1. The bridge decodes an empty buffer into fabricated nulls
+### 1. The bridge decoded an empty buffer into fabricated nulls (CLOSED)
 
 **The most serious finding here.** Found by `DecodersAgreeOnArbitraryBytes` on
 its first input.
@@ -97,12 +97,12 @@ bridge:  ok, {"a":null,"b":null}
 avrocpp: avro::decode: EOF reached
 ```
 
-Two things are wrong. Decoding zero bytes should fail, and the value returned
-does not inhabit its own schema: `null` is not a legal value of `boolean`. A
-caller handed a truncated message gets a success status and a record of nulls
+Two things were wrong. Decoding zero bytes should fail, and the value returned
+did not inhabit its own schema: `null` is not a legal value of `boolean`. A
+caller handed a truncated message got a success status and a record of nulls
 instead of an error.
 
-It is type-dependent rather than uniform, which is what makes it easy to miss:
+It was type-dependent rather than uniform, which is what made it easy to miss:
 
 | schema | empty input, bridge | avro-cpp |
 | --- | --- | --- |
@@ -112,11 +112,31 @@ It is type-dependent rather than uniform, which is what makes it easy to miss:
 | `["int"]` | **accepts, union branch is Null** | rejects |
 | record of booleans | **accepts, every field Null** | rejects |
 
-The register's worst class is silent data loss; this is its mirror image,
+The register's worst class is silent data loss; this was its mirror image,
 manufacturing data that was never on the wire.
 
-Pinned by `Differential.EmptyInputDecodesToFabricatedNulls` and
-`Differential.EmptyInputFabricatesNullForBooleanAndUnion`.
+**CLOSED** by `apache-avro-0.21-strict-eof.patch`. Three arms of
+`decode_internal` treated `ErrorKind::UnexpectedEof` as a value rather than an
+error -- `Schema::Boolean` and `Schema::String` returned `Ok(Value::Null)`, and
+`Schema::Union` returned `Ok(Value::Union(0, Null))` whatever branch 0 held. All
+three now propagate the error, and `Schema::Null` still decodes from an empty
+buffer because a `null` datum really does occupy zero bytes.
+
+Triage turned up a **third site the table above could not reach**: a `string`
+whose length prefix declares more bytes than are present. An empty buffer under
+`"string"` already failed, at the missing length prefix, so nothing exercised a
+truncated payload. `04 61` (length 2, one byte) decoded to `Value::Null` before
+the patch.
+
+Closing it also reversed an upstream behaviour rather than only adding to it.
+`reader::tests::test_from_avro_datum_with_union_to_struct` (AVRO-3240) encoded
+two of its record's five fields and relied on the union arm to fabricate the
+other three, described in the test as simulating missing keys. That is what
+schema resolution is for, not truncation, so the test now asserts the error.
+
+Now pinned by `Differential.EmptyInputIsRejectedByBothEngines`,
+`Differential.EmptyInputIsRejectedForBooleanAndUnion` and
+`AvroBytes.TruncatedInputIsRejectedByBothEngines`, which assert the agreement.
 
 ### 2. Empty union `[]` and empty enum: bridge accepts, avro-cpp rejects
 

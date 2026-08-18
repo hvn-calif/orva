@@ -19,3 +19,8 @@ rust/target/
 
 # Local fuzzing run output: logs, corpora and crash reproducers.
 /fuzzrun/
+
+# The machine-local redirect of apache-avro to a patched checkout. patches/
+# README.md rules out committing a checkout path, and the second Crubit cargo
+# invocation drops a [patch] written in rust/Cargo.toml, so it has to live here.
+/.cargo/

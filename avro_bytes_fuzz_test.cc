@@ -231,7 +231,6 @@ constexpr KnownDivergence kKnownDivergences[] = {
     {"schema-acceptance", "bad node of type union"},
     {"schema-acceptance", "bad node of type enum"},
     {"schema-acceptance", "Invalid namespace"},
-    {"bridge-lenient", "EOF reached"},
     {"trailing-bytes", "trailing bytes"},
     {"alloc-ceiling", "Unable to allocate"},
     // One root cause, four messages: see IsArraySchema above.
@@ -758,30 +757,43 @@ TEST(AvroBytes, NamespaceWithAnEmptyComponentIsAcceptedByAvrocppOnly) {
       true);
 }
 
-// bridge-lenient / "EOF reached"
-TEST(AvroBytes, EmptyInputIsDecodedByTheBridgeOnly) {
+// CLOSED. Was bridge-lenient / "EOF reached", the most serious of the eleven:
+// the bridge decoded a truncated buffer into data that was never on the wire.
+// The strict-eof patch closes it. Three arms of apache-avro's decoder treated
+// end of input as a value rather than an error, and all three now propagate it.
+//
+// The truncated-string row is the one the old pinning test could not reach. An
+// empty buffer under "string" already failed, because the length prefix is
+// missing, so nothing exercised a length prefix with too few bytes behind it.
+// That was the third fabrication site and it is closed by the same patch.
+TEST(AvroBytes, TruncatedInputIsRejectedByBothEngines) {
   const std::string record =
       R"({"type":"record","name":"R","fields":[)"
       R"({"name":"a","type":"boolean"},{"name":"b","type":"boolean"}]})";
-  ExpectDecodeAcceptance(record, std::string(), true, false);
+  ExpectDecodeAcceptance(record, std::string(), false, false);
 
-  // The value it returns does not inhabit its own schema: both boolean fields
-  // come back null, from no input at all.
-  auto bridge_schema = AvroSchema::Parse(record);
-  ASSERT_TRUE(bridge_schema.ok());
-  auto decoded = security::avro::DecodeDatum(*bridge_schema, std::string());
-  ASSERT_TRUE(decoded.ok());
-  auto json = decoded->ToJsonString();
-  ASSERT_TRUE(json.ok()) << json.status();
-  EXPECT_EQ(*json, R"({"a":null,"b":null})");
+  // Type-dependent before the fix, which is what made it easy to miss. Every
+  // row below used to differ; now every row agrees.
+  ExpectDecodeAcceptance(R"("boolean")", std::string(), false, false);
+  ExpectDecodeAcceptance(R"(["int"])", std::string(), false, false);
+  // Branch 0 is null here, so the fabricated value was type-correct by luck.
+  // It was still a value read from no input.
+  ExpectDecodeAcceptance(R"(["null","int"])", std::string(), false, false);
+  // A length prefix of 2 with one byte behind it.
+  const std::string truncated_payload = Varint(2) + "a";
+  ExpectDecodeAcceptance(R"("string")", truncated_payload, false, false);
+  ExpectDecodeAcceptance(R"("bytes")", truncated_payload, false, false);
 
-  // Type-dependent, which is what makes it easy to miss.
-  ExpectDecodeAcceptance(R"("boolean")", std::string(), true, false);
-  ExpectDecodeAcceptance(R"(["int"])", std::string(), true, false);
+  // Unchanged, and the reason the fix could not be "reject an empty buffer":
+  // a null datum really does occupy zero bytes, so both engines read one and
+  // both re-encode it to nothing.
+  ExpectDecodeAcceptance(R"("null")", std::string(), true, true);
+  ExpectReencodingAgrees(R"("null")", std::string());
+
+  // These two always agreed and still do, so the patch did not reach further
+  // than the fabrication.
   ExpectDecodeAcceptance(R"("int")", std::string(), false, false);
   ExpectDecodeAcceptance(R"("string")", std::string(), false, false);
-  // A null really is zero bytes, so this one is correct on both sides.
-  ExpectDecodeAcceptance(R"("null")", std::string(), true, true);
 }
 
 // trailing-bytes / "trailing bytes"
@@ -1170,7 +1182,7 @@ TEST(AvroBytes, VerticalTabAndFormFeedAreWhitespaceOnlyToAvrocpp) {
 }
 
 TEST(AvroBytes, KnownDivergenceTableSizeIsPinned) {
-  EXPECT_EQ(std::size(kKnownDivergences), 11u)
+  EXPECT_EQ(std::size(kKnownDivergences), 10u)
       << "adding an entry means adding a test named after it above; bump this "
          "count once you have";
 }

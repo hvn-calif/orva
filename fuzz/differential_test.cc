@@ -493,27 +493,25 @@ TEST(Differential, D2DuplicateMapKeyCollapsesInTheBridge) {
                             "at this commit; avro-cpp keeps both";
 }
 
-// NEW FINDING, found by DecodersAgreeOnArbitraryBytes on its first input.
+// CLOSED by the strict-eof patch. Found by DecodersAgreeOnArbitraryBytes on its
+// first input, when the bridge decoded an *empty* buffer into a fully-formed
+// value, fabricating nulls for fields with no bytes behind them:
 //
-// The bridge decodes an *empty* buffer into a fully-formed value, fabricating
-// nulls for fields that have no bytes behind them. avro-cpp reports EOF.
-//
-//   schema: {"type":"record","name":"R","fields":[
-//              {"name":"a","type":"boolean"},{"name":"b","type":"boolean"}]}
-//   input:  "" (zero bytes)
-//   bridge: ok, {"a":null,"b":null}
+//   schema:  {"type":"record","name":"R","fields":[
+//               {"name":"a","type":"boolean"},{"name":"b","type":"boolean"}]}
+//   input:   "" (zero bytes)
+//   bridge:  ok, {"a":null,"b":null}
 //   avrocpp: avro::decode: EOF reached
 //
-// Two things are wrong. Decoding zero bytes should fail, and the value that
-// comes back does not inhabit its own schema -- `null` is not a legal value of
-// `boolean`. A caller handed a truncated message gets a success status and a
-// record of nulls rather than an error, which is silent data fabrication: the
-// same class the register reserves for its worst entries, but manufacturing
-// data rather than losing it.
+// Two things were wrong. Decoding zero bytes should fail, and the value that
+// came back did not inhabit its own schema -- `null` is not a legal value of
+// `boolean`. A caller handed a truncated message got a success status and a
+// record of nulls rather than an error.
 //
-// The tree-based properties cannot reach this. A lowered value always encodes
-// to well-formed bytes, so no generated input is ever truncated.
-TEST(Differential, EmptyInputDecodesToFabricatedNulls) {
+// Both now report EOF. The tree-based properties still cannot reach this: a
+// lowered value always encodes to well-formed bytes, so no generated input is
+// ever truncated, which is why the byte-oriented properties found it.
+TEST(Differential, EmptyInputIsRejectedByBothEngines) {
   const std::string schema_text =
       R"({"type":"record","name":"R","fields":[)"
       R"({"name":"a","type":"boolean"},{"name":"b","type":"boolean"}]})";
@@ -533,47 +531,29 @@ TEST(Differential, EmptyInputDecodesToFabricatedNulls) {
   EXPECT_FALSE(cpp.ok()) << "avro-cpp is expected to report EOF on empty input";
 
   auto decoded = security::avro::DecodeDatum(*bridge_schema, std::string());
-  ASSERT_TRUE(decoded.ok())
-      << "the bridge is expected to accept empty input at this commit; if it "
-         "now fails, this finding is fixed and the expectations below need "
-         "flipping";
-  auto json = decoded->ToJsonString();
-  ASSERT_TRUE(json.ok()) << json.status();
-  EXPECT_EQ(*json, R"({"a":null,"b":null})")
-      << "both boolean fields were fabricated from no input at all";
+  EXPECT_FALSE(decoded.ok())
+      << "the bridge accepted an empty buffer and returned "
+      << decoded->ToJsonString().value_or("a value it could not render");
 }
 
-// Same finding, minimal shapes. A bare `boolean` decodes to Null, and a union
-// decodes to a union whose branch is Null -- neither inhabits its schema.
-TEST(Differential, EmptyInputFabricatesNullForBooleanAndUnion) {
-  auto boolean_schema = AvroSchema::Parse(R"("boolean")");
-  ASSERT_TRUE(boolean_schema.ok());
-  auto as_boolean = security::avro::DecodeDatum(*boolean_schema, std::string());
-  ASSERT_TRUE(as_boolean.ok());
-  EXPECT_TRUE(as_boolean->IsNull()) << "decoded Null under a boolean schema";
-  EXPECT_FALSE(as_boolean->GetBoolean().ok());
+// Same finding, minimal shapes. A bare `boolean` used to decode to Null and a
+// union to a union whose branch was Null, neither inhabiting its schema.
+TEST(Differential, EmptyInputIsRejectedForBooleanAndUnion) {
+  for (const char* text : {R"("boolean")", R"(["int"])", R"(["null","int"])",
+                           R"("int")"}) {
+    auto schema = AvroSchema::Parse(text);
+    ASSERT_TRUE(schema.ok()) << text;
+    EXPECT_FALSE(security::avro::DecodeDatum(*schema, std::string()).ok())
+        << "an empty buffer decoded under " << text;
+  }
 
-  auto union_schema = AvroSchema::Parse(R"(["int"])");
-  ASSERT_TRUE(union_schema.ok());
-  auto as_union = security::avro::DecodeDatum(*union_schema, std::string());
-  ASSERT_TRUE(as_union.ok());
-  ASSERT_TRUE(as_union->IsUnion());
-  auto branch = as_union->GetUnionValue();
-  ASSERT_TRUE(branch.ok());
-  EXPECT_TRUE(branch->IsNull())
-      << "a union of int alone decoded to a null branch from no input";
-
-  // `null` really does encode as zero bytes, so this one is correct and is
-  // here to show the finding is not just "empty input always succeeds".
+  // `null` really does encode as zero bytes, so this one must keep succeeding.
+  // It is why the fix could not be "reject an empty buffer".
   auto null_schema = AvroSchema::Parse(R"("null")");
   ASSERT_TRUE(null_schema.ok());
-  EXPECT_TRUE(security::avro::DecodeDatum(*null_schema, std::string()).ok());
-
-  // And an int does fail, so the fabrication is type-dependent rather than
-  // uniform -- which is what makes it easy to miss.
-  auto int_schema = AvroSchema::Parse(R"("int")");
-  ASSERT_TRUE(int_schema.ok());
-  EXPECT_FALSE(security::avro::DecodeDatum(*int_schema, std::string()).ok());
+  auto as_null = security::avro::DecodeDatum(*null_schema, std::string());
+  ASSERT_TRUE(as_null.ok()) << as_null.status();
+  EXPECT_TRUE(as_null->IsNull());
 }
 
 // NEW FINDING, found by SchemaTextVerdictsAgree on its first input.

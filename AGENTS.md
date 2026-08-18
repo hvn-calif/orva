@@ -156,12 +156,18 @@ Both counts moved with the one-hour runs' findings: 169 to 180 tests, and
 
 Fifteen. Each has a test in `avro_bytes_fuzz_test.cc` or
 `fuzz/differential_test.cc` named after it. Full detail in `fuzz/FINDINGS.md`.
+
+**Closing them is now the work**, per `doc/specs/DivergenceClosure.md`, which
+orders twelve patches easiest first and records the policy they follow: avro-cpp's
+behaviour is the bridge's default, and every deviation from it is reachable
+through a knob. `kKnownDivergences` is down from 11 entries to 10; the pin in
+`KnownDivergenceTableSizeIsPinned` moves with it.
 Entries 1 to 10 came from the first runs; 11 to 15 are in the second table below,
 from the parallel hour-long runs.
 
 | # | divergence | direction |
 | --- | --- | --- |
-| 1 | empty buffer decodes to a record of fabricated nulls | bridge accepts |
+| 1 | empty buffer decodes to a record of fabricated nulls | **CLOSED**, strict-eof patch |
 | 2 | empty union `[]` and empty enum | bridge accepts |
 | 3 | `duration` fixed re-renders as `{"type":{"type":"fixed",...}}`, name and namespace dropped | bridge output unreadable by avro-cpp |
 | 4 | apache-avro panics at encode time on a duplicate full name | bridge panics, contained by `catch_panic` |
