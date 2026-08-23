@@ -458,9 +458,13 @@ void Comparer::Compare(const AvroValue& bridge_in,
         }
         return;
       }
-      if (!bridge->IsString()) {
+      const bool bytes_stand_in_for_string =
+          options.allow_string_as_bytes && bridge->IsBytes();
+      if (!bridge->IsString() && !bytes_stand_in_for_string) {
         // Strict on purpose. Treating String and Bytes as interchangeable is
-        // exactly how D1 would be hidden.
+        // exactly how D1 would be hidden, so the leniency is opt-in and is
+        // only turned on by a binary that enables the patch which makes a
+        // non-UTF-8 string decode to bytes deliberately.
         Report(DivergenceId::kStringBytesTypeMismatch, here,
                absl::StrCat("avro-cpp holds a string of ", theirs.size(),
                             " bytes (", absl::BytesToHexString(theirs),

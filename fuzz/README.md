@@ -236,7 +236,9 @@ ASan intercepts it. Phase 2 adds sancov via
 | `ir.{h,cc}` | the `Node` tree, `Normalize`, and the mode-resolution scheme. Note `Normalize` legalises the tree, which is why the byte-oriented properties exist: it makes malformed shapes such as `[]` unreachable |
 | `domains.{h,cc}` | FuzzTest domains; depth is a hard structural bound |
 | `lower_schema.{h,cc}` | `Node` -> Avro schema JSON, plus name-scope resolution |
-| `suppress.{h,cc}` | divergence registry and suppression |
+| `suppress.{h,cc}` | divergence registry and suppression. Its own library, `avro_fuzz_suppress`, so the value oracles can use it without dragging the tree generator in |
+| `compare.{h,cc}` | the pairwise value walk. With `dump.{h,cc}` it forms `avro_fuzz_compare`, which the top-level `avro_bytes_fuzz_test` links for `DecodedValuesAgree` |
+| `dump.{h,cc}` | canonical rendering of a decoded value, one function per engine: the second value oracle |
 | `ir_test.cc` | generator-level properties; links neither engine |
 
 `lower_schema` depends only on `ir.h` -- not on the bridge, not on avro-cpp.

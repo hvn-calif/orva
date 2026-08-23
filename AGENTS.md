@@ -38,21 +38,32 @@ schema by construction. That is what makes it productive despite the Rust half
 being uninstrumented, since the oracle does the work coverage feedback would
 otherwise do.
 
-`avro_bytes_fuzz_test.cc` is byte-oriented and self-contained, because the
-project wanted something committable now while `fuzz/` is not ready. It
-duplicates two properties that also exist in `fuzz/differential_test.cc`
-(`SchemaTextVerdictsAgree`, `DecodersAgreeOnArbitraryBytes`). **If `fuzz/` ever
-lands, delete the duplicates from one side rather than maintaining both.**
+`avro_bytes_fuzz_test.cc` is byte-oriented. It was self-contained until
+`DecodedValuesAgree` landed; it now links `avro_fuzz_compare` (the two value
+oracles in `fuzz/`) and nothing else from there. The self-containment was
+temporary by design: it existed so the file was committable while `fuzz/` was
+not ready, and it was what made the earlier value comparison indirect (compare
+two re-encodings rather than the two values). It duplicates two properties that
+also exist in `fuzz/differential_test.cc` (`SchemaTextVerdictsAgree`,
+`DecodersAgreeOnArbitraryBytes`). **If `fuzz/` ever lands, delete the duplicates
+from one side rather than maintaining both.**
 
 Each finds things the other cannot:
 
 - The tree harness reaches the **write** path (`CreateString`, `MapPut`), which
-  a byte-oriented harness cannot touch at all. D1 and D2 both live there, so a
-  byte-only harness could not run the acceptance test.
+  a byte-oriented harness cannot touch at all. D1 lives there, so a byte-only
+  harness could not run the acceptance test for it.
 - The byte harness reaches malformed input the tree generator provably cannot
   produce, because `Normalize` legalises its output. `NormalizeChildren`
   (`fuzz/ir.cc:257-265`) tops an empty union up to one branch, so `[]` is
   unreachable however long the tree properties run.
+
+**Correction to an earlier claim in this file.** It said D2 (duplicate map keys)
+lives in the write path too, so only the tree harness could reach it. That was
+wrong: duplicate keys arrive on the *wire* just as easily as through `MapPut`,
+and `DecodedValuesAgree` found D2 from raw bytes in its first ten minutes.
+Nothing was reaching it byte-side before because the only value comparison
+there, `ReencodingAgreesWhenBothDecode`, excludes every map schema.
 
 ## Build and run
 
@@ -76,8 +87,8 @@ that build compiles abseil, RE2, ANTLR, FuzzTest and avro-cpp with ASan.
 ## Running every property at once
 
 `fuzz/run_all_parallel.sh <duration> <output-dir> [rss_limit_mb]` runs all
-thirteen properties concurrently, reading the list from the binaries rather than
-hardcoding it. It writes per-property logs, a corpus database, `status.tsv` with
+fourteen properties concurrently, reading the list from the binaries rather than
+hardcoding it, so `DecodedValuesAgree` was picked up without editing it. It writes per-property logs, a corpus database, `status.tsv` with
 each exit code, and `memory.tsv` / `memory_by_job.tsv` traces.
 
 ```sh
@@ -89,7 +100,31 @@ the history. Three hour-long runs from this session are there under `hour`,
 `hour2` and `hour3`; `hour3` is the validated one.
 
 **Validated: thirteen of thirteen exit 0 after a full hour**, peaking at 2.1 GB
-resident with 2.5 GB still available. Two earlier attempts got twelve of
+resident with 2.5 GB still available.
+
+Two later runs of fourteen properties. The first, stopped on request at 7h14m,
+put 1.26 billion inputs through them, peaking at 2.05 GB.
+`Differential.DecodersAgreeOnArbitraryBytes` found one class wearing three
+different IDs and was left stopped after the third. The second, three hours to
+its own deadline, put 510 million through and peaked at 2.08 GB with 1.79 GB
+available at its lowest; thirteen of fourteen exited 0, and the fourteenth is
+the same class, now muted by ID.
+
+Between the two runs both harnesses learned to ask **how many bytes each engine
+read** before comparing values (`ShortestPrefixReproducingTheValue`, and
+`CONSUMPTION_DIFFERS` in the registry). That is what the second run measured:
+`DecodersAgreeOnArbitraryBytes` went from five minutes before its first report
+to thirty, and after that one report was muted it ran the remaining 2h27m and
+15.6 million inputs finding nothing. The byte harness's counters, which
+`run_all_parallel.sh` now exports `AVRO_BYTES_FUZZ_STATS` to get, recorded 66.3
+million inputs past the length guard, 34.6 million value comparisons and 6.38
+million findings, every one of them already in the table.
+
+Do not read "shortest prefix that decodes" as consumption. avro-cpp accepts
+truncated input by reserving a collection and leaving the slots it never read,
+so it decodes prefixes far shorter than it consumes. The measurement compares
+the *value* a prefix produces against the whole buffer's value, which is also
+the one place the second value oracle's rendering does real work. Two earlier attempts got twelve of
 thirteen; the notes below are what the difference cost.
 
 Five things had to be true before thirteen properties could survive an hour
@@ -390,6 +425,17 @@ is a plain bridge bug and belongs in its own document.
    where you developed it can still fail under the sanitizer.
 
 ## Traps
+
+- **The fuzzing-mode build cannot run its own test suite to completion.**
+  `AvroBytes.ArrayBlockHeaderRecoveryDiverges` aborts at
+  `avro/GenericDatum.hh:577`, "reference binding to null pointer of type 'const
+  int'", because `avro_add_fuzz_test` turns UndefinedBehaviorSanitizer on per
+  target with `-fno-sanitize-recover` and the unit-test build does not. It
+  predates the value-comparison work: `/opt/dfz-fuzz`, built from the other
+  worktree, does the same. Run the suite there with
+  `--gtest_filter=-AvroBytes.ArrayBlockHeaderRecoveryDiverges`, or use a
+  unit-test build. It is also a finding in its own right that nobody has chased:
+  undefined behaviour inside avro-cpp, reached from decoded data.
 
 - **`options.suppressions` is never set by any `fuzz/` property.**
   `NormalizeOptions{}` defaults it to `nullptr`, so the `SanitizeUtf8` path at

@@ -57,9 +57,29 @@ export ASAN_OPTIONS="detect_leaks=0:allocator_may_return_null=1:max_allocation_s
 : "${AVRO_FUZZ_SUPPRESS=D1,D2,D9,SCHEMA_PARSE_VERDICT,CROSS_PARSE_ROUND_TRIP,\
 DECODE_VERDICT_BRIDGE_LENIENT,DECODE_VERDICT_AVROCPP_LENIENT,\
 UUID_INVALID_REJECTED,UUID_TEXT_NOT_PRESERVED,STRING_BYTES_TYPE_MISMATCH,\
-RUST_PANIC_CAUGHT,ARRAY_LEN,ARRAY_ITEM_FABRICATED,\
+RUST_PANIC_CAUGHT,ARRAY_LEN,ARRAY_ITEM_FABRICATED,CONSUMPTION_DIFFERS,\
+MAP_ARITY,MAP_KEY_SET,\
 SCALAR_VALUE:uuid values differ}"
 export AVRO_FUZZ_SUPPRESS
+
+# MAP_ARITY and MAP_KEY_SET are the open divergence the byte harness pins as
+# NestedCollectionsDecodeToDifferentValuesFromTheSameBytes: under a map whose
+# values are a collection, both engines read the whole buffer and still return
+# different entry counts and different keys. Muted here because it is recorded
+# and reproducible, not because it is understood.
+
+# CONSUMPTION_DIFFERS is the newest of these and the reason
+# DecodersAgreeOnArbitraryBytes can be run at length at all. It fires when both
+# engines decode an input but read a different number of bytes doing it, which
+# means the values they returned came from different offsets. Before it existed
+# that one class surfaced as MAP_ARITY, then MAP_KEY_SET, then SCALAR_VALUE, and
+# muting those in turn would have ended with the useful classes muted.
+
+# AVRO_BYTES_FUZZ_STATS makes avro_bytes_fuzz_test print, at exit, how many
+# inputs reached its value comparison. Without it a green run cannot be told
+# apart from a run that compared nothing, which is exactly what happened on the
+# first long run.
+export AVRO_BYTES_FUZZ_STATS=1
 
 # avro_bytes_fuzz_test.cc predates fuzz/suppress.h and carries its own table and
 # its own variable, so AVRO_FUZZ_SUPPRESS does not reach it. Empty by default

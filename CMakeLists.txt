@@ -242,13 +242,17 @@ if (AVRO_BUILD_FUZZERS)
     endforeach()
   endforeach()
 
-  # Self-contained byte-oriented differential fuzzer. Links the two engines and
-  # nothing from fuzz/.
+  # fuzz/ first: the byte-oriented fuzzer below links avro_fuzz_compare, which
+  # is defined there.
+  add_subdirectory(fuzz)
+
+  # Byte-oriented differential fuzzer. Links the two engines and, for the value
+  # comparison, the two oracles in fuzz/.
   if (TARGET avrocpp_iface)
     add_executable(avro_bytes_fuzz_test avro_bytes_fuzz_test.cc)
     target_include_directories(avro_bytes_fuzz_test PRIVATE ${CMAKE_SOURCE_DIR})
     target_link_libraries(avro_bytes_fuzz_test PRIVATE
-      avro_bridge rust avrocpp_iface)
+      avro_bridge rust avrocpp_iface avro_fuzz_compare)
     link_fuzztest(avro_bytes_fuzz_test)
     target_compile_options(avro_bytes_fuzz_test PRIVATE
       ${AVRO_FUZZ_COVERAGE_FLAGS})
@@ -261,6 +265,4 @@ if (AVRO_BUILD_FUZZERS)
       DISCOVERY_MODE PRE_TEST
       PROPERTIES TIMEOUT 300)
   endif()
-
-  add_subdirectory(fuzz)
 endif()

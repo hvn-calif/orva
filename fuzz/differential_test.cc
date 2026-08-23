@@ -28,6 +28,7 @@
 #include "avro/ValidSchema.hh"
 #include "avro_bridge.h"
 #include "fuzz/compare.h"
+#include "fuzz/dump.h"
 #include "fuzz/domains.h"
 #include "fuzz/ir.h"
 #include "fuzz/lower_avrocpp.h"
@@ -374,6 +375,34 @@ void SchemaTextVerdictsAgree(const std::string& text) {
 }
 FUZZ_TEST(Differential, SchemaTextVerdictsAgree).WithDomains(AnySchemaText());
 
+// How many bytes did the engine read? The shortest prefix that reproduces the
+// value the whole buffer produced.
+//
+// Not the shortest prefix that merely decodes: avro-cpp accepts a truncated
+// buffer, because it reserves a collection to its declared count and leaves the
+// slots it never read, so it decodes prefixes far shorter than what it consumes
+// and two engines can agree on that number while reading different amounts.
+// Everything consumed is needed to produce the value, and what follows is a
+// tail both engines ignore, so this length is what was read -- and reproducing
+// the value is monotone in the prefix length, which is what makes the search
+// binary.
+template <typename ReproducesTheValue>
+size_t ShortestPrefixReproducingTheValue(const std::string& bytes,
+                                         ReproducesTheValue reproduces) {
+  size_t too_short = 0;
+  size_t enough = bytes.size();
+  while (enough - too_short > 0) {
+    const size_t midpoint = too_short + (enough - too_short) / 2;
+    if (midpoint == too_short) break;
+    if (reproduces(bytes.substr(0, midpoint))) {
+      enough = midpoint;
+    } else {
+      too_short = midpoint;
+    }
+  }
+  return reproduces(std::string()) ? 0 : enough;
+}
+
 // A schema both engines accept, with arbitrary bytes as the encoded datum.
 //
 // The schema still comes from the tree generator, since random bytes are
@@ -446,7 +475,45 @@ void DecodersAgreeOnArbitraryBytes(const Node& raw, const std::string& bytes) {
                             absl::BytesToHexString(bytes), "]"),
                narrow);
   } else if (bridge_decoded.ok() && cpp_decoded.ok()) {
-    CompareValues(*bridge_decoded, cpp_datum, &log);
+    // Before comparing values, ask how far each decoder read. Two decoders
+    // standing at different offsets in the same buffer produce values that
+    // cannot be attributed to either of them, and this property spent an
+    // afternoon reporting one such class three times under three different IDs
+    // -- a map entry count, then a map key set, then an int field after the
+    // collection -- before the offsets were measured instead of the symptoms.
+    //
+    // Neither engine will say how far it read, so it is measured from the
+    // outside and identically for both; see ShortestPrefixReproducingTheValue.
+    //
+    // Note what this does and does not establish. Different lengths prove the
+    // two ended up at different offsets, and nothing they returned after that
+    // is attributable. Equal lengths do not prove they read the same bytes the
+    // same way: both can consume the whole buffer and still disagree about what
+    // it says, which is a real divergence and is reported as one.
+    const std::string bridge_whole = DumpBridgeValue(*bridge_decoded);
+    const size_t bridge_read = ShortestPrefixReproducingTheValue(
+        bytes, [&](const std::string& prefix) {
+          const auto value = security::avro::DecodeDatum(*bridge_schema, prefix);
+          return value.ok() && DumpBridgeValue(*value) == bridge_whole;
+        });
+    const std::string cpp_whole = DumpAvrocppDatum(cpp_datum);
+    const size_t cpp_read = ShortestPrefixReproducingTheValue(
+        bytes, [&](const std::string& prefix) {
+          ::avro::GenericDatum value;
+          return DecodeWithAvrocpp(cpp_schema, prefix, &value).ok() &&
+                 DumpAvrocppDatum(value) == cpp_whole;
+        });
+    if (bridge_read != cpp_read) {
+      log.Report(DivergenceId::kConsumptionDiffers, "$",
+                 absl::StrCat("both decoded these bytes but read a different "
+                              "number of them doing it: bridge ",
+                              bridge_read, ", avrocpp ", cpp_read, " of ",
+                              bytes.size(), " [",
+                              absl::BytesToHexString(bytes), "]"),
+                 "consumption differs");
+    } else {
+      CompareValues(*bridge_decoded, cpp_datum, &log);
+    }
   }
 
   ASSERT_TRUE(log.empty()) << log.Render() << "schema: " << schema_json;

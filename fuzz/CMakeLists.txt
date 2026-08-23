@@ -11,13 +11,24 @@
 # that is what lets a bridge-only target exist whose sanitizer reports are
 # unambiguously about the bridge rather than about the C++ library we compare
 # against.
+# The divergence registry and the suppression mechanism, on their own so that
+# both the tree harness and the value comparison can use them without either
+# one dragging in the other's dependencies: avro_ir_fuzz_test links neither
+# engine, and that is what makes a sanitizer report from it unambiguous.
+add_library(avro_fuzz_suppress suppress.cc suppress.h)
+target_include_directories(avro_fuzz_suppress PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(avro_fuzz_suppress PUBLIC absl::strings absl::str_format)
+if (AVRO_FUZZ_COVERAGE_FLAGS)
+  target_compile_options(avro_fuzz_suppress PRIVATE ${AVRO_FUZZ_COVERAGE_FLAGS})
+endif()
+
 add_library(avro_fuzz_ir
   ir.cc ir.h
-  suppress.cc suppress.h
   lower_schema.cc lower_schema.h
 )
 target_include_directories(avro_fuzz_ir PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(avro_fuzz_ir PUBLIC absl::strings absl::str_format)
+target_link_libraries(avro_fuzz_ir PUBLIC
+  absl::strings absl::str_format avro_fuzz_suppress)
 if (AVRO_FUZZ_COVERAGE_FLAGS)
   target_compile_options(avro_fuzz_ir PRIVATE ${AVRO_FUZZ_COVERAGE_FLAGS})
 endif()
@@ -69,13 +80,26 @@ avro_add_fuzz_test(avro_ir_fuzz_test SRCS ir_test.cc)
 
 # The differential harness. Only this target sees both engines.
 if (TARGET avrocpp_iface)
+  # The two value oracles: the pairwise walk in compare.cc and the per-engine
+  # rendering in dump.cc. Separate from avro_fuzz_lower because the
+  # byte-oriented fuzzer at the top level compares values without ever
+  # lowering a generated tree.
+  add_library(avro_fuzz_compare
+    compare.cc compare.h
+    dump.cc dump.h
+  )
+  target_link_libraries(avro_fuzz_compare PUBLIC
+    avro_fuzz_suppress avro_bridge rust avrocpp_iface)
+  if (AVRO_FUZZ_COVERAGE_FLAGS)
+    target_compile_options(avro_fuzz_compare PRIVATE ${AVRO_FUZZ_COVERAGE_FLAGS})
+  endif()
+
   add_library(avro_fuzz_lower
     lower_bridge.cc lower_bridge.h
     lower_avrocpp.cc lower_avrocpp.h
-    compare.cc compare.h
   )
   target_link_libraries(avro_fuzz_lower PUBLIC
-    avro_fuzz_ir avro_bridge rust avrocpp_iface)
+    avro_fuzz_ir avro_fuzz_compare avro_bridge rust avrocpp_iface)
   if (AVRO_FUZZ_COVERAGE_FLAGS)
     target_compile_options(avro_fuzz_lower PRIVATE ${AVRO_FUZZ_COVERAGE_FLAGS})
   endif()

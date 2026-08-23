@@ -91,7 +91,11 @@ namespace security::avro_fuzz {
   X(kStreamingDiverges, "STREAMING_DIVERGES",                                 \
     "the streaming reader disagrees with the whole-buffer reader")            \
   X(kReencodeNotByteIdentical, "REENCODE_NOT_BYTE_IDENTICAL",                 \
-    "decode-then-reencode did not reproduce the original bytes")
+    "decode-then-reencode did not reproduce the original bytes")               \
+  X(kConsumptionDiffers, "CONSUMPTION_DIFFERS",                                \
+    "both engines decoded the input but read a different number of bytes, so " \
+    "the values they returned came from different offsets and comparing them " \
+    "says nothing about either engine")
 
 enum class DivergenceId : uint16_t {
   kNone = 0,

@@ -32,6 +32,19 @@ struct CompareOptions {
   // long. When true, that is accepted as a version gap and the underlying
   // integers are compared instead of reporting a type mismatch.
   bool allow_missing_logical_types = true;
+
+  // Accept a bridge `bytes` where avro-cpp holds a `string`, comparing the
+  // payloads instead of reporting a type mismatch.
+  //
+  // Off by default, and the default is the point: treating String and Bytes as
+  // interchangeable is exactly how the non-UTF-8-string divergence would be
+  // hidden, which is what this comparer exists to rediscover.
+  //
+  // Turn it on only in a binary that enables SetNonUtf8StringAsBytes, where a
+  // string whose wire bytes are not valid UTF-8 decodes to bytes by design.
+  // There, every such input would otherwise report a type mismatch and bury
+  // everything else.
+  bool allow_string_as_bytes = false;
 };
 
 // Walks both values in lockstep, reporting differences into `log`. Returns true
