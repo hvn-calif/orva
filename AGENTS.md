@@ -138,13 +138,13 @@ findings 8 and 9 were attributed to `GenericDatum::init` and
 
 ## Expected state of the test suites
 
-`avro_bytes_fuzz_test`: **21/21 pass** with no environment variables, and also
+`avro_bytes_fuzz_test`: **22/22 pass** with no environment variables, and also
 under `ASAN_OPTIONS=detect_leaks=0` and with `allocator_may_return_null=1`.
 If it fails, the fuzz properties found something new, which is the design.
 
-`avro_bridge_test`: **61/61**, and `avro_bridge_strict_test` is the same 61 built
+`avro_bridge_test`: **63/63**, and `avro_bridge_strict_test` is the same 63 built
 from the same source with `AVRO_BRIDGE_TEST_STRICT_SETTINGS` defined, so
-**122/122** across the two. Every setting `avro_bridge.h` exposes is a set-once
+**126/126** across the two. Every setting `avro_bridge.h` exposes is a set-once
 process global, so one process can observe only one value of each; the second
 binary is how the strict value of each gets tested at all. A test whose outcome
 depends on a setting branches on `kStrictSettings` rather than being duplicated.
@@ -154,8 +154,8 @@ The bridge's own Rust suite is **65 tests** across four binaries (`cargo test` i
 because a `OnceLock` cannot be reset in-process, and the second C++ binary
 replaced it.
 
-`ctest` on the whole project: **244/250 or 245/250**, and `ctest -R AvroBytes` is
-21/21. The total is not stable, and that is worth understanding before reading any
+`ctest` on the whole project: **249/255 or 250/255**, and `ctest -R AvroBytes` is
+22/22. The total is not stable, and that is worth understanding before reading any
 change in it as a regression.
 
 Six tests do not pass. Five are by design and one is avro-cpp's own
@@ -193,13 +193,13 @@ stale rather than as a regression:
 | before `avro_bytes_fuzz_test` joined the build | 150/156 (`report.md` section 7) | -- |
 | after the one-hour runs' findings | 174/180 | 20/20 |
 | after the divergence-closure series | 176-177/182 | 21/21 |
-| after the closures were pinned in `avro_bridge_test` | **244-245/250** | **21/21** |
+| after the closures were pinned in `avro_bridge_test` | **249-250/255** | **22/22** |
 
-The last jump is 68 tests and almost none of it is coverage of new ground: six
+The last jump is 73 tests and almost none of it is coverage of new ground: six
 pin the Tier A and Tier B closures on the bridge's side of the comparison, one
-guards the toggle, and the other sixty-one are the second build of the same
-source under `AVRO_BRIDGE_TEST_STRICT_SETTINGS`. The five non-passes did not
-change.
+guards the toggle, two pin non-finite float handling, and the other sixty-three
+are the second build of the same source under
+`AVRO_BRIDGE_TEST_STRICT_SETTINGS`. The five non-passes did not change.
 
 Two things moved the totals before that: one differential test split in two when
 the empty union and empty enum closed separately, and one new test pinned finding
@@ -279,7 +279,7 @@ Both fixed harness bugs on the way out, and the second is the more important:
   `Differential.DecodersAgreeOnArbitraryBytes` now passes in unit-test mode and
   `ctest` has **five** non-passes rather than six.
 
-**Expected `ctest` state is now 244-245/250.** The five non-passes are
+**Expected `ctest` state is now 249-250/255.** The five non-passes are
 four `Differential.*` properties that still fail by design plus
 `AvrogencppTestReservedWords` reporting "Not Run". Do not silence the four.
 Entries 1 to 10 came from the first runs; 11 to 15 are in the second table below,
@@ -506,6 +506,14 @@ is a plain bridge bug and belongs in its own document.
   narration either. Prefer making the comment unnecessary: an `enum class` with
   named values beats a `// 0 = accepted, 1 = rejected` legend.
 
+- **Compare encoded bytes, not values, for anything holding a float or double.**
+  `AvroValue::operator==` delegates to Rust `PartialEq`, which is IEEE-754
+  equality: two NaNs with identical bits compare unequal, and `-0.0` compares
+  equal to `0.0` with different bits. `fuzz/compare.h` sets
+  `strict_float_bits` for this reason; `AvroValueTest.EqualityIsIeeeEqualityForFloats`
+  pins both directions. NaN payloads and signed zero survive both engines
+  bit-exact, measured, so `FLOAT_NAN_PAYLOAD` and `FLOAT_SIGNED_ZERO` have never
+  fired and neither is suppressed.
 - **A set-once global is tested by building the test twice, not by a second test.**
   Every setting `avro_bridge.h` exposes is first-call-wins, so one process
   observes one value. `avro_bridge_test.cc` is built as itself and as

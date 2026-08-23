@@ -1,6 +1,7 @@
 #include "avro_bridge.h"
 
 #include <cstddef>
+#include <cstring>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -660,6 +661,61 @@ TEST(DatumTest, UuidFollowsTheSetting) {
               "6F2B0E76-4D3D-4F8E-9D3A-2E1B8A7C6D5E");
     EXPECT_EQ(EncodeDatum(*schema, *uuid).value_or(""), non_canonical);
   }
+}
+
+// Avro carries raw IEEE-754 bits for `float` and `double`, so a NaN payload and
+// the sign of a zero are data rather than noise. Measured: neither engine
+// canonicalises either, so this is not a divergence -- see
+// AvroBytes.NanPayloadsAndSignedZeroSurviveBothEngines for the avrocpp half.
+// It is pinned because canonicalisation by either side would be a silent value
+// change, and because the differential harness carries two divergence IDs for
+// it, FLOAT_NAN_PAYLOAD and FLOAT_SIGNED_ZERO, that have never fired.
+//
+// The oracle is the encoded bytes, not operator==, and that is the second thing
+// this pins. See the caveat on AvroValue::operator== in avro_bridge.h.
+TEST(DatumTest, NonFiniteDoublesRoundTripBitExact) {
+  auto schema = AvroSchema::Parse(R"("double")");
+  ASSERT_TRUE(schema.ok());
+
+  // A quiet NaN, then one whose payload no arithmetic would produce: the
+  // signalling bit clear and low mantissa bits set. A canonicalising decoder
+  // would return the first for both.
+  const uint64_t kQuietNan = 0x7FF8000000000000ULL;
+  const uint64_t kOddPayloadNan = 0x7FF0000000ABCDEFULL;
+  const uint64_t kNegativeZero = 0x8000000000000000ULL;
+
+  for (uint64_t bits : {kQuietNan, kOddPayloadNan, kNegativeZero}) {
+    double value;
+    std::memcpy(&value, &bits, sizeof(value));
+    auto encoded = EncodeDatum(*schema, AvroValue::CreateDouble(value));
+    ASSERT_TRUE(encoded.ok()) << encoded.status();
+    auto decoded = DecodeDatum(*schema, *encoded);
+    ASSERT_TRUE(decoded.ok()) << decoded.status();
+
+    auto out = decoded->GetDouble();
+    ASSERT_TRUE(out.ok()) << out.status();
+    uint64_t out_bits;
+    std::memcpy(&out_bits, &*out, sizeof(out_bits));
+    EXPECT_EQ(out_bits, bits);
+    EXPECT_EQ(EncodeDatum(*schema, *decoded).value_or(""), *encoded);
+  }
+}
+
+// Why the test above compares bytes rather than values: operator== delegates to
+// Rust's PartialEq, which is IEEE-754 equality. It therefore reports a
+// difference where the bits are identical, and no difference where they are not.
+// Anything checking a float round-trip has to compare the encoded bytes.
+TEST(AvroValueTest, EqualityIsIeeeEqualityForFloats) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(AvroValue::CreateDouble(nan) == AvroValue::CreateDouble(nan));
+
+  // The other direction, and the one that hides data: two values that compare
+  // equal and do not encode to the same bytes.
+  EXPECT_TRUE(AvroValue::CreateDouble(-0.0) == AvroValue::CreateDouble(0.0));
+  auto schema = AvroSchema::Parse(R"("double")");
+  ASSERT_TRUE(schema.ok());
+  EXPECT_NE(EncodeDatum(*schema, AvroValue::CreateDouble(-0.0)).value_or(""),
+            EncodeDatum(*schema, AvroValue::CreateDouble(0.0)).value_or("x"));
 }
 
 // -- Object container files -------------------------------------------------

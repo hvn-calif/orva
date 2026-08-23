@@ -1281,6 +1281,38 @@ TEST(AvroBytes, AvrocppFabricatesAnArrayItemWithoutChangingTheLength) {
   }
 }
 
+// NOT a divergence, and pinned so that it stays one. Avro carries raw IEEE-754
+// bits for `float` and `double`, so a NaN payload and the sign of a zero are
+// data: a decoder that canonicalised either would change a value while
+// reporting success, which is the class of bug the array-of-`null` and uuid
+// findings are in.
+//
+// Measured: both engines return the bits they were given and re-encode them
+// unchanged, including a NaN payload no arithmetic would produce. The two
+// divergence IDs the tree harness carries for this, FLOAT_NAN_PAYLOAD and
+// FLOAT_SIGNED_ZERO, have reporting sites in Comparer and have never fired;
+// neither is in run_all_parallel.sh's suppression default, so nothing was
+// hiding them.
+//
+// `"float"` and `"double"` are both in DecodableSchemas, so
+// ReencodingAgreesWhenBothDecode reaches NaN on its own: one random byte in 256
+// gives a float an all-ones exponent. This test is the named case, so a
+// regression is legible without reading a fuzzer counterexample.
+TEST(AvroBytes, NanPayloadsAndSignedZeroSurviveBothEngines) {
+  // Avro writes IEEE bits little-endian, so these read backwards.
+  const std::string quiet_nan("\x00\x00\x00\x00\x00\x00\xf8\x7f", 8);
+  const std::string odd_payload_nan("\xef\xcd\xab\x00\x00\x00\xf0\x7f", 8);
+  const std::string negative_zero("\x00\x00\x00\x00\x00\x00\x00\x80", 8);
+  for (const std::string& bytes :
+       {quiet_nan, odd_payload_nan, negative_zero}) {
+    ExpectReencodingAgrees(R"("double")", bytes);
+  }
+
+  // float is a separate decode arm, and a signalling NaN on top.
+  ExpectReencodingAgrees(R"("float")", std::string("\x01\x00\xc0\x7f", 4));
+  ExpectReencodingAgrees(R"("float")", std::string("\x01\x00\x80\x7f", 4));
+}
+
 TEST(AvroBytes, KnownDivergenceTableSizeIsPinned) {
   EXPECT_EQ(std::size(kKnownDivergences), 6u)
       << "adding an entry means adding a test named after it above; bump this "

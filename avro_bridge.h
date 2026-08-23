@@ -246,9 +246,15 @@ class AvroValue final {
   // union branch selection, defaults).
   absl::StatusOr<AvroValue> Resolve(const AvroSchema& schema) const;
 
-  // Converts this value to a JSON string.
+  // Converts this value to a JSON string. Fails for a non-finite float or
+  // double, which JSON cannot represent.
   absl::StatusOr<std::string> ToJsonString() const;
 
+  // Equality is IEEE-754 equality for float and double, not bit equality, so
+  // it is the wrong check for a round-trip: two NaNs compare unequal though
+  // their bits match, and -0.0 compares equal to 0.0 though theirs do not.
+  // Avro carries raw IEEE bits, so compare the output of EncodeDatum when what
+  // you mean is "the same value came back".
   bool operator==(const AvroValue& other) const;
   bool operator!=(const AvroValue& other) const;
 

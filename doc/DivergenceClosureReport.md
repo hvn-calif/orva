@@ -297,7 +297,7 @@ that reveals a divergence is chance.
 | `Differential.SchemaTextVerdictsAgree` | 8 of 8 fail |
 | `Differential.DecodersAgreeOnArbitraryBytes` | **7 pass, 9 fail across 16 runs** |
 
-So `ctest` is 244 **or** 245 of 250. Pinning `FUZZTEST_PRNG_SEED` makes it
+So `ctest` is 249 **or** 250 of 255. Pinning `FUZZTEST_PRNG_SEED` makes it
 deterministic, measured at 6 of 6 failures with the seed fixed.
 
 **This is the change that would most improve the "did I break anything" question**, and
@@ -342,11 +342,11 @@ Suite state now:
 
 | suite | result |
 | --- | --- |
-| `avro_bytes_fuzz_test` | 21/21 |
-| `avro_bridge_test` | 61/61, and `avro_bridge_strict_test` the same 61 |
+| `avro_bytes_fuzz_test` | 22/22 |
+| `avro_bridge_test` | 63/63, and `avro_bridge_strict_test` the same 63 |
 | the bridge's Rust suite | 65/65 across four binaries |
 | apache-avro's own suite | 567, up from 558 |
-| `ctest` | 244-245/250, see the flakiness section |
+| `ctest` | 249-250/255, see the flakiness section |
 
 Tier checkpoint, all thirteen properties concurrently for 20 minutes:
 
@@ -481,6 +481,36 @@ reporting the default's behaviour.
 | `DatumTest.EmptyDecimalRoundTrips` | A4, the full circle back to the input byte |
 | `DatumTest.TrailingBytesFollowTheSetting` | B1, both values, all three decode entry points |
 | `DatumTest.NonUtf8StringFollowsTheSetting`, `DatumTest.UuidFollowsTheSetting` | the two pre-existing patches, both values |
+| `DatumTest.NonFiniteDoublesRoundTripBitExact`, `AvroValueTest.EqualityIsIeeeEqualityForFloats` | NaN and signed zero, measured and not a divergence |
+
+### NaN and signed zero: measured, and not a divergence
+
+Worth stating because the shape is the same as the two value divergences that
+*are* open. Avro carries raw IEEE-754 bits for `float` and `double`, so a NaN
+payload and the sign of a zero are data, and an engine that canonicalised either
+would change a value while reporting success.
+
+Measured on both sides: the bridge returns the bits it was given and re-encodes
+them unchanged, including `7ff0000000abcdef`, a payload no arithmetic produces,
+and `-0.0`; avro-cpp does the same, checked through `ExpectReencodingAgrees` on
+`"double"` and on `"float"`, whose decode arm is separate. So there is nothing to
+close. The tree harness has carried two divergence IDs for this all along,
+`FLOAT_NAN_PAYLOAD` and `FLOAT_SIGNED_ZERO`, both with live reporting sites in
+`Comparer` and neither in `run_all_parallel.sh`'s suppression default: they have
+never fired, and now it is written down why rather than left as an absence.
+`"float"` and `"double"` are both in `DecodableSchemas`, so
+`ReencodingAgreesWhenBothDecode` reaches NaN unaided -- one random byte in 256
+gives a float an all-ones exponent.
+
+What the measurement did turn up is a trap at the public API rather than a
+divergence. `AvroValue::operator==` delegates to Rust's `PartialEq`, which is
+IEEE equality, so it reports a difference between two NaNs whose bits match and
+no difference between `-0.0` and `0.0` whose bits do not. `fuzz/compare.h` had
+worked around this since the harness was written; `avro_bridge.h` did not
+mention it, and `operator==` had no comment at all. It does now, and
+`AvroValueTest.EqualityIsIeeeEqualityForFloats` pins both directions, including
+the one that hides data: two values that compare equal and encode to different
+bytes.
 
 The Rust suite drops from 70 tests across five binaries to 65 across four:
 `rust/tests/reject_trailing_bytes.rs` is deleted, along with the two trailing-bytes unit

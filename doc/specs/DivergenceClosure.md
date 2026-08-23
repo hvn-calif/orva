@@ -107,7 +107,7 @@ so.
    outcome depends on a setting branches on `kStrictSettings`.
 5. `avro_bytes_fuzz_test` and `ctest` do not regress. The baselines moved during
    the series, so the numbers are recorded rather than fixed: 20/20 and 174/180 at
-   the start, **21/21 and 244-245/250** now. The jump from 182 is 68 tests: seven
+   the start, **22/22 and 249-250/255** now. The jump from 182 is 73 tests: nine
    pin the Tier A and Tier B closures on the bridge's side, and sixty are the
    second build of `avro_bridge_test.cc` under
    `AVRO_BRIDGE_TEST_STRICT_SETTINGS`.
