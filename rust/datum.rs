@@ -143,9 +143,13 @@ pub fn set_max_allocation_bytes(num_bytes: usize) -> usize {
     apache_avro::util::max_allocation_bytes(num_bytes)
 }
 
-/// EXPERIMENT, do not commit. When on, a `string` whose wire bytes are not
-/// valid UTF-8 decodes as `Value::Bytes` instead of failing, which is what
-/// avrocpp already does. Needs the non-UTF-8 patch on apache-avro 0.21.
+/// When on, a `string` whose wire bytes are not valid UTF-8 decodes as
+/// `Value::Bytes` instead of failing, which is what avrocpp does. Needs the
+/// non-UTF-8 patch on apache-avro 0.21.
+///
+/// **On is the bridge's default**, installed by [`install_avro_cpp_defaults`].
+/// Pass `false` before the first Avro operation to get apache-avro's stricter
+/// reading, where such a `string` is an error.
 ///
 /// Like the allocation ceiling this is a process-global that only the first
 /// call sets, so it returns the setting actually in effect. It is read on the
@@ -154,12 +158,36 @@ pub fn set_non_utf8_string_as_bytes(as_bytes: bool) -> bool {
     apache_avro::util::set_non_utf8_string_as_bytes(as_bytes)
 }
 
-/// EXPERIMENT, do not commit. When on, a `uuid` decodes as an ordinary string
-/// rather than being parsed, so the bytes as written survive: no canonical
-/// rewriting, no reinterpretation of a 16-byte string, no rejection of text
-/// that is not a uuid. Needs the uuid-as-string patch on apache-avro 0.21.
+/// When on, a `uuid` decodes as an ordinary string rather than being parsed, so
+/// the bytes as written survive: no canonical rewriting, no reinterpretation of
+/// a 16-byte string, no rejection of text that is not a uuid. Needs the
+/// uuid-as-string patch on apache-avro 0.21.
+///
+/// **On is the bridge's default**, installed by [`install_avro_cpp_defaults`],
+/// because avrocpp never interprets the annotation. Pass `false` before the
+/// first Avro operation to get apache-avro's parsing behaviour back.
 pub fn set_uuid_as_string(as_string: bool) -> bool {
     apache_avro::util::set_uuid_as_string(as_string)
+}
+
+/// Installs avrocpp's behaviour as the bridge's default for every apache-avro
+/// setting whose crate default is something else. Called from `catch_panic`,
+/// which every entry point taking untrusted input already runs through.
+///
+/// Two defaults are in play and both are deliberate. Each patch in `patches/`
+/// keeps apache-avro's own behaviour as the *crate* default, so it stays
+/// additive for other consumers of the crate. The bridge wants avrocpp's,
+/// because the code being migrated was written against avrocpp. The setters are
+/// first-call-wins, so this only takes effect when nothing has set the value
+/// yet, and a caller wanting the stricter reading calls the setter itself before
+/// its first Avro operation and gets there first.
+///
+/// The allocation ceiling is deliberately not in here. avrocpp has no ceiling at
+/// all, so parity would mean removing a bound on untrusted input, which is one
+/// of the reasons for the migration; its 512 MiB crate default stands.
+pub(crate) fn install_avro_cpp_defaults() {
+    apache_avro::util::set_non_utf8_string_as_bytes(true);
+    apache_avro::util::set_uuid_as_string(true);
 }
 
 #[cfg(test)]
@@ -203,29 +231,6 @@ mod tests {
         let encoded = encode_datum(&schema, &point(1, 2)).unwrap();
         let truncated = &encoded.as_slice()[..encoded.len() - 1];
         assert!(decode_datum(&schema, truncated).is_err());
-    }
-
-    /// At the default the leftover bytes are ignored and the first datum comes
-    /// back, which is what avrocpp does. The rejecting case cannot be tested
-    /// here, because the setting is a OnceLock no test can reset: it lives in
-    /// tests/reject_trailing_bytes.rs, its own binary.
-    #[test]
-    fn decode_ignores_trailing_bytes_by_default() {
-        let schema = AvroSchema::parse(b"\"int\"").unwrap();
-        let mut encoded = encode_datum(&schema, &AvroValue::create_int(1)).unwrap().into_vec();
-        encoded.extend_from_slice(&[0xff, 0xfe]);
-        let decoded = decode_datum(&schema, &encoded).unwrap();
-        assert_eq!(decoded.get_int().unwrap(), 1);
-    }
-
-    /// A truncated datum is still an error. The setting governs bytes left over
-    /// after a complete datum, not bytes missing from one, and conflating the two
-    /// would undo the strict-eof patch.
-    #[test]
-    fn ignoring_trailing_bytes_does_not_accept_a_truncated_datum() {
-        let schema = AvroSchema::parse(b"\"string\"").unwrap();
-        // Length prefix of 2 with one byte behind it.
-        assert!(decode_datum(&schema, &[0x04, 0x61]).is_err());
     }
 
     #[test]

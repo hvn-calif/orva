@@ -278,7 +278,9 @@ This is the only patch in the series that removes a check the bridge shipped wit
 so both halves are pinned:
 `Differential.TrailingBytesAreIgnoredByBothEngines` and
 `AvroBytes.TrailingBytesAreIgnoredByBothEngines` for the default,
-`rust/tests/reject_trailing_bytes.rs` for the knob. Both also assert that a
+`DatumTest.TrailingBytesFollowTheSetting` in `avro_bridge_test.cc` for the knob,
+which reaches the knob's `true` value through a second build of the same source.
+All three also assert that a
 *truncated* datum is still an error, since ignoring leftovers and accepting a
 datum with bytes missing are different things.
 

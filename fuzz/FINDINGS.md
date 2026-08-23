@@ -293,9 +293,11 @@ It is also the only patch that **removes** a check the bridge shipped with, whic
 is why both halves are pinned:
 `Differential.TrailingBytesAreIgnoredByBothEngines` and
 `AvroBytes.TrailingBytesAreIgnoredByBothEngines` assert the engines now agree and
-read the same value, and `rust/tests/reject_trailing_bytes.rs` asserts the knob
-still rejects. That test needs its own binary, because the setting is a
-`OnceLock` no test can reset.
+read the same value, and `DatumTest.TrailingBytesFollowTheSetting` in
+`avro_bridge_test.cc` asserts the knob still rejects. That test needs a second
+binary, because the setting is a `OnceLock` no test can reset, so CMake builds
+`avro_bridge_test.cc` again as `avro_bridge_strict_test` with every setting
+flipped.
 
 Both pinned tests also assert that a **truncated** datum is still an error.
 Ignoring bytes left over after a complete datum and accepting a datum with bytes
@@ -425,10 +427,10 @@ disagreement rather than the counts, since a pinned regression must not depend o
 the build. This is `ARRAY_LEN`, another ID that had a reporting site but had never
 fired.
 
-### 12. A 16-byte uuid string is read as a binary uuid by the bridge
+### 12. A 16-byte uuid string is read as a binary uuid by the bridge -- CLOSED
 
-Found by `DecodersAgreeOnArbitraryBytes` after 293,811 runs. Both engines accept
-and neither errors, so the caller has no signal that the value changed meaning.
+Found by `DecodersAgreeOnArbitraryBytes` after 293,811 runs. Both engines accepted
+and neither errored, so the caller had no signal that the value changed meaning.
 
 ```
 schema: {"type":"string","logicalType":"uuid"}
@@ -445,10 +447,18 @@ what the spec says is there; apache-avro additionally accepts a 16-byte payload
 as a binary uuid, which is what a uuid-on-`fixed(16)` field carries in Avro 1.12.
 
 Reachable only at length exactly 16, which is why five figures of runs were
-needed. This is a different failure from finding 6: there the bridge rejected
-text avro-cpp kept, here both succeed and disagree on the value.
+needed. This was a different failure from finding 6: there the bridge rejected
+text avro-cpp kept, here both succeeded and disagreed on the value.
 
-Pinned by `Differential.SixteenByteUuidStringIsReadAsBinaryByTheBridge`.
+**Closed by a default rather than by a patch.** `install_avro_cpp_defaults` turns
+`uuid_as_string` on, so the bridge leaves the annotation uninterpreted as avro-cpp
+does and the sixteen bytes come back verbatim. The uuid-as-string patch had been
+in `patches/` all along and `avro_bytes_fuzz_test.cc` set it, which is why that
+binary already saw the two engines agree; `fuzz/differential_test.cc` never set
+it, so this finding was measured at the crate default rather than the bridge's.
+
+Pinned by `Differential.SixteenByteUuidStringSurvivesInBothEngines`, which now
+asserts the agreement and the whole circle back to the input bytes.
 
 ### 13. avro-cpp fabricates an array item without changing the length
 

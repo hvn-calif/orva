@@ -35,7 +35,14 @@ pub(crate) fn utf8(data: &[u8]) -> Result<&str, VecU8> {
 /// data (and several codec paths `unwrap` decompressor errors), so every
 /// entry point that touches untrusted bytes must run through this guard.
 /// Mirrors `pixel_bridge`'s `run_catching_panics`.
+///
+/// It is also where the bridge installs its avrocpp-compatible defaults for the
+/// apache-avro settings, because the set of entry points needing panic
+/// containment and the set needing those defaults are the same set: both are
+/// the untrusted-input surface. An entry point added without this guard would
+/// silently skip both, which is the cost of the one chokepoint.
 pub(crate) fn catch_panic<T>(f: impl FnOnce() -> Result<T, VecU8>) -> Result<T, VecU8> {
+    crate::datum::install_avro_cpp_defaults();
     // AssertUnwindSafe is sound here: every guarded operation either
     // produces a fresh value or fails, so a caught panic leaves no
     // half-updated shared state observable to the caller.

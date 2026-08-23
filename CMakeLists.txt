@@ -134,16 +134,32 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(googletest)
 
 enable_testing()
-add_executable(avro_bridge_test avro_bridge_test.cc)
-target_link_libraries(avro_bridge_test PRIVATE
-  avro_bridge
-  rust
-  GTest::gmock
-  GTest::gtest_main
-)
-
 include(GoogleTest)
+
+# Every setting avro_bridge.h exposes is a process-global that only the first
+# call sets, so one process can observe only one value of each. The same source
+# is therefore built twice: once at the bridge's avrocpp-compatible defaults,
+# and once with every setting flipped to its strict reading. Without the second
+# binary the strict half of each setting is untested, which is why it used to
+# need a Rust integration test of its own.
+add_executable(avro_bridge_test avro_bridge_test.cc)
+add_executable(avro_bridge_strict_test avro_bridge_test.cc)
+target_compile_definitions(avro_bridge_strict_test PRIVATE
+  AVRO_BRIDGE_TEST_STRICT_SETTINGS)
+
+foreach(target avro_bridge_test avro_bridge_strict_test)
+  target_link_libraries(${target} PRIVATE
+    avro_bridge
+    rust
+    GTest::gmock
+    GTest::gtest_main
+  )
+endforeach()
+
 gtest_discover_tests(avro_bridge_test)
+# Both binaries register the same gtest names, so the ctest names would collide
+# without a prefix.
+gtest_discover_tests(avro_bridge_strict_test TEST_PREFIX strict.)
 
 # ---- Apache avro-cpp ------------------------------------------------------
 # The benchmark and the differential fuzzer both need it, so acquisition is

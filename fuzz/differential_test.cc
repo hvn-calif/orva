@@ -651,9 +651,10 @@ TEST(Differential, DurationFixedRendersUnparseableByAvrocpp) {
 //
 // This is the only patch in the series that removes a check the bridge shipped
 // with, so both halves are pinned: here that the two engines now agree and read
-// the same value, and in rust/tests/reject_trailing_bytes.rs that the knob still
-// rejects. The knob is a set-once process global, so its `true` value cannot be
-// exercised from this binary.
+// the same value, and in avro_bridge_test.cc's
+// DatumTest.TrailingBytesFollowTheSetting that the knob still rejects. The knob
+// is a set-once process global, so its `true` value cannot be exercised from
+// this binary; that test's source is built a second time with the setting on.
 TEST(Differential, TrailingBytesAreIgnoredByBothEngines) {
   const std::string schema_text = R"("int")";
   const std::string bytes("\x02\xff", 2);  // one int, then a stray byte
@@ -901,11 +902,12 @@ TEST(Differential, ArrayOfNullLengthsDisagree) {
          "script's suppression list";
 }
 
-// NEW FINDING, found by DecodersAgreeOnArbitraryBytes after 293,811 runs.
+// CLOSED, and closed by a default rather than by a patch: finding 15, found by
+// DecodersAgreeOnArbitraryBytes after 293,811 runs.
 //
-// A string of exactly 16 bytes under a `uuid` logical type is read as a binary
-// UUID by the bridge and as the text it is by avro-cpp. Both succeed, so the
-// caller gets no signal that the value changed meaning.
+// A string of exactly 16 bytes under a `uuid` logical type used to be read as a
+// binary UUID by the bridge and as the text it is by avro-cpp. Both succeeded,
+// so the caller got no signal that the value had changed meaning:
 //
 //   schema: {"type":"string","logicalType":"uuid"}
 //   input:  20 00*12 62 6f 6c 73        (length 16, then twelve NULs, "bols")
@@ -913,16 +915,23 @@ TEST(Differential, ArrayOfNullLengthsDisagree) {
 //   avrocpp: the 16 bytes verbatim
 //   bridge:  "00000000-0000-0000-0000-0000626f6c73"
 //
-// The tail of the bridge's rendering, 626f6c73, is "bols" read as hex: the bytes
-// were reinterpreted, not reformatted. The Avro specification puts `uuid` on
-// `string` and defines its encoding as the 36-character text form, so avro-cpp is
-// reading what the spec says is there. apache-avro additionally accepts a
-// 16-byte payload as a binary UUID, which is what a uuid-on-fixed(16) field
-// carries in Avro 1.12.
+// The tail of the bridge's old rendering, 626f6c73, is "bols" read as hex: the
+// bytes were reinterpreted, not reformatted. Length 16 exactly is what made it
+// reachable, and why it took five figures of runs to find; at any other length
+// the two engines already agreed.
 //
-// Length 16 exactly is what makes it reachable, and why it took five figures of
-// runs to find: any other length and both engines agree.
-TEST(Differential, SixteenByteUuidStringIsReadAsBinaryByTheBridge) {
+// What closed it is `install_avro_cpp_defaults` turning `uuid_as_string` on, so
+// the bridge leaves the annotation uninterpreted as avrocpp does. The Avro
+// specification puts `uuid` on `string` and defines its encoding as the
+// 36-character text form, so that is also what the spec says is there;
+// apache-avro additionally accepted a 16-byte payload as a binary UUID, which is
+// what a uuid-on-fixed(16) field carries in Avro 1.12.
+//
+// This test used to run without either setting, so it measured the crate default
+// rather than the bridge's. It now pins the agreement, and the whole circle
+// rather than the verdict: accepting an input and writing something else back
+// looks closed to an acceptance property while corrupting data.
+TEST(Differential, SixteenByteUuidStringSurvivesInBothEngines) {
   const std::string schema_text = R"({"type":"string","logicalType":"uuid"})";
   const std::string payload = std::string(12, '\0') + "bols";
   ASSERT_EQ(payload.size(), 16u);
@@ -941,17 +950,22 @@ TEST(Differential, SixteenByteUuidStringIsReadAsBinaryByTheBridge) {
   ::avro::GenericDatum cpp_datum;
   CppOutcome cpp = DecodeWithAvrocpp(cpp_schema, bytes, &cpp_datum);
   ASSERT_TRUE(cpp.ok()) << cpp.what;
-  EXPECT_EQ(cpp_datum.value<std::string>(), payload)
-      << "avro-cpp is expected to hand back the bytes as written";
+  EXPECT_EQ(cpp_datum.value<std::string>(), payload);
 
   auto decoded = security::avro::DecodeDatum(*bridge_schema, bytes);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
-  auto text = decoded->GetUuid();
+
+  // A string, not a uuid: the annotation is left uninterpreted, which is the
+  // whole of the fix. GetUuid failing is the observable form of that.
+  auto text = decoded->GetString();
   ASSERT_TRUE(text.ok()) << text.status();
-  EXPECT_EQ(*text, "00000000-0000-0000-0000-0000626f6c73")
-      << "the bridge is expected to read the 16 bytes as a binary uuid; if it "
-         "now returns them verbatim, this finding is fixed";
-  EXPECT_NE(*text, payload) << "the two engines now agree";
+  EXPECT_EQ(*text, payload) << "the bridge no longer reinterprets 16 bytes";
+  EXPECT_FALSE(decoded->GetUuid().ok());
+
+  // And the circle closes: what the bridge writes back is what arrived.
+  auto reencoded = security::avro::EncodeDatum(*bridge_schema, *decoded);
+  ASSERT_TRUE(reencoded.ok()) << reencoded.status();
+  EXPECT_EQ(*reencoded, bytes);
 }
 
 // The harness's own sanity check: a plain record must survive the full circle.

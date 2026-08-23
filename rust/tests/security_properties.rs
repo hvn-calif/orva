@@ -1,40 +1,16 @@
-//! Demonstrations of the three untrusted-input properties surfaced in the
-//! security review of this binding. Two are hardenings this crate enforces
-//! (panic containment is covered by unit tests);
-//! one is a documented residual limitation (decompression amplification,
-//! unbounded decode recursion). Each test is written to be safe to run in
-//! CI -- it illustrates the issue at a bounded magnitude rather than
-//! actually exhausting memory or the stack.
+//! Demonstrations of the untrusted-input properties surfaced in the security
+//! review of this binding that have no C++ counterpart. Each test is written to
+//! be safe to run in CI -- it illustrates the issue at a bounded magnitude
+//! rather than actually exhausting memory or the stack.
+//!
+//! Issue 1, trailing bytes after a single datum, used to be here. It lives in
+//! `avro_bridge_test.cc` now, which is built twice so that both values of the
+//! setting are covered; see `DatumTest.TrailingBytesFollowTheSetting`.
 
 use rust::container::{AvroCodec, DataFileReader, DataFileWriter};
 use rust::datum::{decode_datum, encode_datum};
 use rust::schema::AvroSchema;
 use rust::value::AvroValue;
-
-/// Issue 1: trailing bytes after a single datum. This binding now follows
-/// avrocpp and ignores them, because code being migrated may hand a padded or
-/// over-allocated buffer to a decode. The rejecting behaviour is still available
-/// through `set_reject_trailing_bytes`, and lives in tests/reject_trailing_bytes.rs
-/// because the setting is a OnceLock and needs its own process.
-///
-/// What must not change is that a *truncated* datum is an error. Ignoring bytes
-/// left over after a complete datum and accepting a datum with bytes missing are
-/// different things, and this asserts the second is still refused.
-#[test]
-fn trailing_bytes_are_ignored_but_a_truncated_datum_is_not() {
-    let schema = AvroSchema::parse(b"\"int\"").unwrap();
-
-    let mut buf = encode_datum(&schema, &AvroValue::create_int(7)).unwrap().into_vec();
-    buf.extend_from_slice(b"\xde\xad\xbe\xef");
-    assert_eq!(decode_datum(&schema, &buf).unwrap().get_int().unwrap(), 7);
-
-    let clean = encode_datum(&schema, &AvroValue::create_int(7)).unwrap();
-    assert_eq!(decode_datum(&schema, clean.as_slice()).unwrap().get_int().unwrap(), 7);
-
-    // A length prefix of 2 with one byte behind it.
-    let string_schema = AvroSchema::parse(b"\"string\"").unwrap();
-    assert!(decode_datum(&string_schema, &[0x04, 0x61]).is_err());
-}
 
 /// Issue 2 (documented limitation): compressed container files amplify a
 /// tiny input into a large in-memory payload, with no cap.

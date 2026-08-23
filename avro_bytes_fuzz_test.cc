@@ -63,9 +63,12 @@ const bool kAllocationCeilingSet = [] {
   return true;
 }();
 
-// EXPERIMENT, do not commit. Both patched apache-avro behaviours on: a
-// non-UTF-8 `string` decodes as bytes, and a `uuid` decodes as an ordinary
-// string. Together these are what avrocpp already does.
+// Both patched apache-avro behaviours on: a non-UTF-8 `string` decodes as
+// bytes, and a `uuid` decodes as an ordinary string. Together these are what
+// avrocpp already does, so they are also the bridge's own defaults now. Set
+// here anyway, so the properties below state what they are comparing against
+// rather than inheriting it, and so a change to those defaults shows up as a
+// failure here rather than as a silent shift in what the fuzzer measures.
 const bool kNonUtf8StringAsBytes =
     security::avro::SetNonUtf8StringAsBytes(true);
 const bool kUuidAsString = security::avro::SetUuidAsString(true);
@@ -828,7 +831,8 @@ TEST(AvroBytes, TruncatedInputIsRejectedByBothEngines) {
 // may hand over a padded or over-allocated buffer.
 //
 // The knob is a set-once process global, so this file cannot exercise its `true`
-// value: that lives in rust/tests/reject_trailing_bytes.rs, its own binary.
+// value: that is DatumTest.TrailingBytesFollowTheSetting in avro_bridge_test.cc,
+// which is built a second time with every setting flipped.
 TEST(AvroBytes, TrailingBytesAreIgnoredByBothEngines) {
   // One int, then a byte that is not part of it.
   const std::string trailing = Varint(1) + std::string(1, '\x7f');

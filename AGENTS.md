@@ -142,12 +142,19 @@ findings 8 and 9 were attributed to `GenericDatum::init` and
 under `ASAN_OPTIONS=detect_leaks=0` and with `allocator_may_return_null=1`.
 If it fails, the fuzz properties found something new, which is the design.
 
-`avro_bridge_test`: **54/54**. The bridge's own Rust suite is **70 tests** across
-five binaries (`cargo test` in `rust/`), one of which,
-`tests/reject_trailing_bytes.rs`, exists only because a `OnceLock` cannot be reset
-in-process.
+`avro_bridge_test`: **61/61**, and `avro_bridge_strict_test` is the same 61 built
+from the same source with `AVRO_BRIDGE_TEST_STRICT_SETTINGS` defined, so
+**122/122** across the two. Every setting `avro_bridge.h` exposes is a set-once
+process global, so one process can observe only one value of each; the second
+binary is how the strict value of each gets tested at all. A test whose outcome
+depends on a setting branches on `kStrictSettings` rather than being duplicated.
 
-`ctest` on the whole project: **176/182 or 177/182**, and `ctest -R AvroBytes` is
+The bridge's own Rust suite is **65 tests** across four binaries (`cargo test` in
+`rust/`). It was 70 across five: `tests/reject_trailing_bytes.rs` existed only
+because a `OnceLock` cannot be reset in-process, and the second C++ binary
+replaced it.
+
+`ctest` on the whole project: **244/250 or 245/250**, and `ctest -R AvroBytes` is
 21/21. The total is not stable, and that is worth understanding before reading any
 change in it as a regression.
 
@@ -178,17 +185,25 @@ longer reported as a pile of independent findings. The remaining failures are ot
 open divergences, and `DECODE_VERDICT_AVROCPP_LENIENT` under `"string"` is the one
 seen most often.
 
-The counts have moved three times, so treat any older number in this repository as
+The counts have moved four times, so treat any older number in this repository as
 stale rather than as a regression:
 
 | when | ctest | AvroBytes |
 | --- | --- | --- |
 | before `avro_bytes_fuzz_test` joined the build | 150/156 (`report.md` section 7) | -- |
 | after the one-hour runs' findings | 174/180 | 20/20 |
-| after the divergence-closure series | **176-177/182** | **21/21** |
+| after the divergence-closure series | 176-177/182 | 21/21 |
+| after the closures were pinned in `avro_bridge_test` | **244-245/250** | **21/21** |
 
-Two things moved the totals: one differential test split in two when the empty
-union and empty enum closed separately, and one new test pinned finding 13. The
+The last jump is 68 tests and almost none of it is coverage of new ground: six
+pin the Tier A and Tier B closures on the bridge's side of the comparison, one
+guards the toggle, and the other sixty-one are the second build of the same
+source under `AVRO_BRIDGE_TEST_STRICT_SETTINGS`. The five non-passes did not
+change.
+
+Two things moved the totals before that: one differential test split in two when
+the empty union and empty enum closed separately, and one new test pinned finding
+13. The
 cascade fix in `Comparer` did not remove a non-pass, as first reported here from a
 single lucky run; it turned one deterministic failure into a flaky one. That is a
 harness change and not a change to either engine.
@@ -209,8 +224,9 @@ pin in `KnownDivergenceTableSizeIsPinned` moves with it.
 apache-avro's `from_avro_datum` already stops at the end of the first datum like
 avro-cpp and the rejection was the bridge's own addition at `rust/datum.rs`. It is
 also the only patch that **removes** a check the bridge shipped with, so the knob's
-`true` value has its own test binary, `rust/tests/reject_trailing_bytes.rs` -- the
-setting is a `OnceLock` and no test can reset it.
+`true` value is covered by `avro_bridge_strict_test` -- the setting is a `OnceLock`
+and no test can reset it, so the strict value needs a second process rather than a
+second test.
 
 Closing it deleted two things rather than leaving them to rot: the
 `TRAILING_BYTES` divergence ID, and `TrailingBytesExplainIt` in
@@ -261,9 +277,9 @@ Both fixed harness bugs on the way out, and the second is the more important:
   stops the walk at the first difference that proves the byte counts diverged, and
   sets that flag even when the finding is suppressed. This is why
   `Differential.DecodersAgreeOnArbitraryBytes` now passes in unit-test mode and
-  `ctest` is at 177/182 with **five** non-passes rather than six.
+  `ctest` has **five** non-passes rather than six.
 
-**Expected `ctest` state is now 177/182**, not 174/180. The five non-passes are
+**Expected `ctest` state is now 244-245/250.** The five non-passes are
 four `Differential.*` properties that still fail by design plus
 `AvrogencppTestReservedWords` reporting "Not Run". Do not silence the four.
 Entries 1 to 10 came from the first runs; 11 to 15 are in the second table below,
@@ -276,11 +292,20 @@ from the parallel hour-long runs.
 | 3 | `duration` fixed re-renders as `{"type":{"type":"fixed",...}}`, name and namespace dropped | bridge output unreadable by avro-cpp |
 | 4 | apache-avro panics at encode time on a duplicate full name | bridge panics, contained by `catch_panic` |
 | 5 | namespace `ns..bad` with an empty component | avro-cpp accepts |
-| 6 | non-UTF-8 in a `string` | avro-cpp accepts |
-| 7 | text that is not a well-formed uuid | avro-cpp accepts |
+| 6 | non-UTF-8 in a `string` | **read side CLOSED**, bridge default; write side open |
+| 7 | text that is not a well-formed uuid | **CLOSED**, bridge default |
 | 8 | trailing bytes after a single datum | **CLOSED**, bridge-side, knob |
 | 9 | truncated array block, avro-cpp returns 29 of 30 declared items | avro-cpp accepts |
 | 10 | oversized `vector::resize`, avro-cpp throws `std::length_error` | **untriaged, not in any table** |
+
+Entries 6 and 7 closed without a patch of their own. Both patches were already in
+`patches/` and off by default, and `install_avro_cpp_defaults` now turns them on,
+so the bridge accepts a non-UTF-8 `string` on decode and leaves a `uuid`
+uninterpreted, as avro-cpp does. Entry 6's **write** side is untouched:
+`create_string` (`rust/value.rs:66`) validates UTF-8 whatever the setting says, so
+`AvroValue::CreateString("\xff\xfe")` still fails, which is what
+`Differential.D1NonUtf8StringIsRejectedByTheBridge` pins and what keeps the
+harness's acceptance test meaningful.
 
 Finding 10 is **triaged**: it is `avro::GenericReader::read` (`Generic.cc:112`)
 resizing an array or map to its declared block count before reading any item,
@@ -300,12 +325,18 @@ Five more divergences came out of the parallel hour-long runs, all written up in
 | 12 | declared block count reserved before reading items | avro-cpp allocates unboundedly |
 | 13 | vertical tab and form feed accepted as JSON whitespace | avro-cpp accepts |
 | 14 | array of `null`: both accept, lengths differ, and differ by build | **value divergence** |
-| 15 | a 16-byte string under `uuid` is read as a binary uuid | **value divergence** |
+| 15 | a 16-byte string under `uuid` is read as a binary uuid | **CLOSED**, bridge default |
 
-Numbers 14 and 15 are the ones to look at next: both are value divergences where
-neither engine errors, so a caller gets no signal at all. For 14 the counts also
-move between the ASan and plain builds, which means at least one side's length
-does not come from the input alone.
+Number 14 is the one to look at next: a value divergence where neither engine
+errors, so a caller gets no signal at all, and the counts move between the ASan
+and plain builds, which means at least one side's length does not come from the
+input alone.
+
+Number 15 closed without a patch. The uuid-as-string patch was already in
+`patches/`, and `install_avro_cpp_defaults` now turns it on, so the bridge leaves
+the annotation uninterpreted as avro-cpp does. `avro_bytes_fuzz_test.cc` set the
+setting itself and had always seen the engines agree; `fuzz/differential_test.cc`
+did not, so it was measuring the crate default rather than the bridge's.
 
 `DecodersAgreeOnArbitraryBytes` also grows its resident set monotonically under
 load, 112 MB to 847 MB over eighteen minutes, which a corpus of 1,789 small inputs
@@ -475,6 +506,26 @@ is a plain bridge bug and belongs in its own document.
   narration either. Prefer making the comment unnecessary: an `enum class` with
   named values beats a `// 0 = accepted, 1 = rejected` legend.
 
+- **A set-once global is tested by building the test twice, not by a second test.**
+  Every setting `avro_bridge.h` exposes is first-call-wins, so one process
+  observes one value. `avro_bridge_test.cc` is built as itself and as
+  `avro_bridge_strict_test` with `AVRO_BRIDGE_TEST_STRICT_SETTINGS`, and a
+  `::testing::Environment` flips every setting in `SetUp` -- which is early
+  enough, since gtest runs it before the first test body and nothing in the
+  binary touches the bridge earlier. A test whose outcome depends on a setting
+  branches on `kStrictSettings`; it is not duplicated. This replaced
+  `rust/tests/reject_trailing_bytes.rs`, whose only reason to exist was that a
+  `OnceLock` cannot be reset in-process.
+- **The bridge's defaults are avrocpp's, and they are installed from one place.**
+  `install_avro_cpp_defaults` in `rust/datum.rs`, called from `catch_panic`,
+  turns on `non_utf8_string_as_bytes` and `uuid_as_string`, whose *crate*
+  defaults are apache-avro's so that each patch in `patches/` stays additive for
+  other consumers. Two defaults, both deliberate. It is in `catch_panic` because
+  the entry points needing panic containment and the entry points needing these
+  defaults are the same set: the untrusted-input surface. An entry point added
+  without that guard skips both. The allocation ceiling is deliberately not
+  installed there, since avrocpp has no ceiling at all and parity would mean
+  removing a bound on untrusted input.
 - Assert what was measured, including numbers that are not yet explained, and
   say in a comment that they are unexplained. `TruncatedArrayBlockIs...` asserts
   29 items without knowing why it is not 30.

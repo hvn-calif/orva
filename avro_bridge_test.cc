@@ -9,12 +9,66 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/status/status.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 
 namespace security::avro {
 namespace {
 
 using ::testing::ElementsAre;
 using ::testing::HasSubstr;
+
+// Every setting this binding exposes is a process-global that only the first
+// call sets, so one process can only ever observe one value of each. CMake
+// therefore builds this source twice: `avro_bridge_test` runs it at the
+// bridge's defaults, and `avro_bridge_strict_test` defines the macro below and
+// flips every setting to its strict reading before any test body runs. Tests
+// whose expected outcome depends on a setting branch on `kStrictSettings`
+// rather than being duplicated.
+#ifdef AVRO_BRIDGE_TEST_STRICT_SETTINGS
+constexpr bool kStrictSettings = true;
+#else
+constexpr bool kStrictSettings = false;
+#endif
+
+// Installs the strict settings, in the strict binary only. This is where a
+// caller wanting them has to do it: the settings are first-call-wins and the
+// bridge installs its avrocpp-compatible defaults on its first Avro operation,
+// so anything set after that loses. gtest runs environment SetUp before the
+// first test body and nothing in this binary touches the bridge earlier, so
+// these calls get there first -- which is what the return values assert.
+class SettingsEnvironment : public ::testing::Environment {
+ public:
+  void SetUp() override {
+    if (!kStrictSettings) return;
+    ASSERT_TRUE(SetRejectTrailingBytes(true));
+    ASSERT_FALSE(SetNonUtf8StringAsBytes(false));
+    ASSERT_FALSE(SetUuidAsString(false));
+  }
+};
+
+const ::testing::Environment* const kSettingsEnvironment =
+    ::testing::AddGlobalTestEnvironment(new SettingsEnvironment);
+
+// One Avro long, zigzag-varint encoded: a length prefix, a union branch index,
+// an enum position or a block count, depending on where it sits.
+std::string Varint(int64_t value) {
+  uint64_t n = (static_cast<uint64_t>(value) << 1) ^
+               static_cast<uint64_t>(value >> 63);
+  std::string out;
+  do {
+    uint8_t byte = n & 0x7f;
+    n >>= 7;
+    if (n != 0) byte |= 0x80;
+    out.push_back(static_cast<char>(byte));
+  } while (n != 0);
+  return out;
+}
+
+// One Avro string or bytes datum: the length prefix, then the payload.
+std::string LengthPrefixed(absl::string_view payload) {
+  return Varint(static_cast<int64_t>(payload.size())) + std::string(payload);
+}
 
 constexpr char kRecordSchema[] = R"({
   "type": "record",
@@ -340,6 +394,274 @@ TEST(DatumTest, SetMaxAllocationBytesFirstCallWins) {
   EXPECT_EQ(first, second);
 }
 
+// -- Closed avrocpp divergences --------------------------------------------
+// The differential fuzzer found each of these as a place where this binding and
+// avrocpp disagreed, and each is now closed by a patch in orva's `patches/`.
+// The tests below pin the binding's half in the always-built suite; the
+// differential half, which needs avrocpp linked, stays in
+// avro_bytes_fuzz_test.cc behind AVRO_BUILD_FUZZERS. See
+// doc/specs/DivergenceClosure.md for the series and its policy.
+
+// Asserts that the settings in force are the ones this build asked for, before
+// any test relies on them. Reading a first-call-wins setting means calling its
+// setter and seeing what comes back: the value actually in effect.
+//
+// What this catches is the strict binary losing the race -- something touching
+// the bridge before SettingsEnvironment runs, or the environment registration
+// being dropped. `SetNonUtf8StringAsBytes` is asked for false there and must
+// report false, which holds only if SetUp got in before the bridge installed its
+// own default of true.
+//
+// What it cannot catch is `AVRO_BRIDGE_TEST_STRICT_SETTINGS` never reaching the
+// strict target: `kStrictSettings` would be false, the expectations here would
+// flip with it, and the binary would become a duplicate of the default one
+// rather than a failing one. Nothing inside the source can tell which build it
+// is meant to be; that one is on the CMake block.
+TEST(DatumTest, SettingsMatchTheBuild) {
+  EXPECT_EQ(SetRejectTrailingBytes(kStrictSettings), kStrictSettings);
+  EXPECT_EQ(SetNonUtf8StringAsBytes(!kStrictSettings), !kStrictSettings);
+  EXPECT_EQ(SetUuidAsString(!kStrictSettings), !kStrictSettings);
+}
+
+// A1, and the most serious of the eleven: a truncated buffer decoded into
+// values that were never on the wire. Three arms of apache-avro's decoder
+// treated end of input as a value rather than an error, so a record of two
+// booleans decoded from *zero bytes* into two nulls with an OK status, where
+// avrocpp reports "EOF reached". None of the three fabricated values inhabits
+// the schema it was decoded under.
+TEST(DatumTest, TruncatedInputDoesNotFabricateValues) {
+  for (const char* text : {
+           R"("boolean")",
+           R"(["int"])",
+           R"({"type":"record","name":"R","fields":[)"
+           R"({"name":"a","type":"boolean"},{"name":"b","type":"boolean"}]})",
+       }) {
+    auto schema = AvroSchema::Parse(text);
+    ASSERT_TRUE(schema.ok()) << text << ": " << schema.status();
+    EXPECT_FALSE(DecodeDatum(*schema, "").ok()) << text;
+  }
+
+  // The third fabrication site, and the one nothing had reached: an empty
+  // buffer under "string" already failed at the missing length prefix, so no
+  // test exercised a prefix with too few bytes behind it.
+  auto string_schema = AvroSchema::Parse(R"("string")");
+  ASSERT_TRUE(string_schema.ok());
+  EXPECT_FALSE(DecodeDatum(*string_schema, "").ok());
+  EXPECT_FALSE(DecodeDatum(*string_schema, Varint(2) + "a").ok());
+
+  // "null" still decodes from an empty buffer, and has to: a null datum
+  // occupies no bytes. This is why the fix could not be "reject an empty
+  // buffer".
+  auto null_schema = AvroSchema::Parse(R"("null")");
+  ASSERT_TRUE(null_schema.ok());
+  auto decoded = DecodeDatum(*null_schema, "");
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_TRUE(decoded->IsNull());
+}
+
+// A2. No branch index is in range for a union with no members, so nothing
+// encodes into one and no bytes decode under one, yet `[]` used to parse and
+// render straight back -- producing a schema avrocpp cannot read.
+TEST(AvroSchemaTest, EmptyUnionIsRejected) {
+  for (const char* text : {
+           R"([])",
+           R"([[]])",
+           R"({"type":"record","name":"R","fields":[{"name":"a","type":[]}]})",
+           R"({"type":"array","items":[]})",
+           R"({"type":"map","values":[]})",
+       }) {
+    EXPECT_EQ(AvroSchema::Parse(text).status().code(),
+              absl::StatusCode::kInvalidArgument)
+        << text;
+  }
+
+  // A one-branch union stays legal, because index 0 is in range and it does
+  // have a valid encoding. This is what keeps the fix from over-reaching.
+  auto one_branch = AvroSchema::Parse(R"(["int"])");
+  ASSERT_TRUE(one_branch.ok()) << one_branch.status();
+  auto decoded = DecodeDatum(*one_branch, Varint(0) + Varint(42));
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(decoded->GetUnionValue()->GetInt().value_or(0), 42);
+}
+
+// A3, the same defect as A2 on a different construct: no symbol index is in
+// range for an enum with no symbols.
+//
+// The check covers the parse path only. `EnumSchema` has public fields and a
+// builder, unlike `UnionSchema` whose fields are crate-private, so Rust code
+// can still hand-build one with no symbols. Untrusted input arrives by parsing,
+// which is what this covers.
+TEST(AvroSchemaTest, EmptyEnumIsRejected) {
+  for (const char* text : {
+           R"({"type":"enum","name":"E","symbols":[]})",
+           R"({"type":"enum","name":"E","namespace":"ns","symbols":[]})",
+           R"({"type":"record","name":"R","fields":[{"name":"a","type":)"
+           R"({"type":"enum","name":"E","symbols":[]}}]})",
+           R"({"type":"array","items":)"
+           R"({"type":"enum","name":"E","symbols":[]}})",
+       }) {
+    EXPECT_EQ(AvroSchema::Parse(text).status().code(),
+              absl::StatusCode::kInvalidArgument)
+        << text;
+  }
+
+  // One symbol is enough: index 0 is in range.
+  auto one_symbol =
+      AvroSchema::Parse(R"({"type":"enum","name":"E","symbols":["A"]})");
+  ASSERT_TRUE(one_symbol.ok()) << one_symbol.status();
+  auto decoded = DecodeDatum(*one_symbol, Varint(0));
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(decoded->GetEnumSymbol().value_or(""), "A");
+}
+
+// A4. A length prefix of zero under a decimal schema means an empty unscaled
+// byte array, which both engines accept. avrocpp re-encodes it to the byte it
+// came from; this binding used to hand back a value that said it was a decimal
+// and could then be neither read nor re-encoded, both failing with the same
+// sign-extension message, so a caller had no way to use or forward the result.
+TEST(DatumTest, EmptyDecimalRoundTrips) {
+  auto schema = AvroSchema::Parse(
+      R"({"type":"bytes","logicalType":"decimal","precision":9,"scale":2})");
+  ASSERT_TRUE(schema.ok()) << schema.status();
+
+  const std::string zero_length = Varint(0);
+  auto decoded = DecodeDatum(*schema, zero_length);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_TRUE(decoded->IsDecimal());
+
+  auto bytes = decoded->GetDecimalBytes();
+  ASSERT_TRUE(bytes.ok()) << bytes.status();
+  EXPECT_EQ(*bytes, "");
+
+  auto reencoded = EncodeDatum(*schema, *decoded);
+  ASSERT_TRUE(reencoded.ok()) << reencoded.status();
+  EXPECT_EQ(*reencoded, zero_length);
+
+  // A one-byte unscaled value was never affected and still round-trips, so the
+  // fix did not reach past the empty case.
+  const std::string unscaled_42(1, '\x2a');
+  const std::string one_byte = LengthPrefixed(unscaled_42);
+  auto small = DecodeDatum(*schema, one_byte);
+  ASSERT_TRUE(small.ok()) << small.status();
+  EXPECT_EQ(small->GetDecimalBytes().value_or(""), unscaled_42);
+  EXPECT_EQ(EncodeDatum(*schema, *small).value_or(""), one_byte);
+}
+
+// B1, the one closure that is this binding's own rather than an apache-avro
+// patch: apache-avro's decoder already stops at the end of the first datum like
+// avrocpp, and the rejection was something the binding added.
+//
+// Off is the default, which is avrocpp's behaviour, so code being migrated
+// that hands a padded or over-allocated buffer to a decode keeps working. On
+// is the stricter reading and stays reachable, because leftover bytes usually
+// do mean framing has gone wrong.
+TEST(DatumTest, TrailingBytesFollowTheSetting) {
+  auto schema = AvroSchema::Parse(R"("int")");
+  ASSERT_TRUE(schema.ok());
+  auto encoded = EncodeDatum(*schema, AvroValue::CreateInt(7));
+  ASSERT_TRUE(encoded.ok());
+  const std::string padded = *encoded + std::string("\xde\xad", 2);
+
+  auto decoded = DecodeDatum(*schema, padded);
+  if (kStrictSettings) {
+    ASSERT_FALSE(decoded.ok());
+    EXPECT_THAT(decoded.status().message(), HasSubstr("trailing bytes"));
+  } else {
+    ASSERT_TRUE(decoded.ok()) << decoded.status();
+    EXPECT_EQ(decoded->GetInt().value_or(0), 7);
+  }
+
+  // The setting is checked at every decode entry point, not just the plain one.
+  auto long_schema = AvroSchema::Parse(R"("long")");
+  ASSERT_TRUE(long_schema.ok());
+  EXPECT_EQ(DecodeDatumResolved(*schema, *long_schema, padded).ok(),
+            !kStrictSettings);
+  EXPECT_EQ(DecodeDatumSchemata(*schema, absl::MakeConstSpan(&*schema, 1),
+                                padded)
+                .ok(),
+            !kStrictSettings);
+
+  // A correctly framed datum decodes either way, so what the setting governs is
+  // the leftovers rather than the decode.
+  auto clean = DecodeDatum(*schema, *encoded);
+  ASSERT_TRUE(clean.ok()) << clean.status();
+  EXPECT_EQ(clean->GetInt().value_or(0), 7);
+
+  // And bytes *missing* from a datum are an error either way. Ignoring bytes
+  // left over after a complete datum and accepting a datum cut short are
+  // different things, and conflating them would undo A1 above.
+  auto string_schema = AvroSchema::Parse(R"("string")");
+  ASSERT_TRUE(string_schema.ok());
+  EXPECT_FALSE(DecodeDatum(*string_schema, Varint(2) + "a").ok());
+}
+
+// Not a closure but a default this binding chose: avrocpp copies a `string`'s
+// wire bytes into a byte-oriented std::string without validating them, and
+// Java's Utf8 holds a raw byte[], so files carrying non-UTF-8 round-trip
+// through both. Rejecting them here would make that data unreadable, so the
+// bytes are kept in a distinct variant that re-encodes to exactly what arrived.
+TEST(DatumTest, NonUtf8StringFollowsTheSetting) {
+  auto schema = AvroSchema::Parse(R"("string")");
+  ASSERT_TRUE(schema.ok());
+  const std::string datum = LengthPrefixed(std::string("\xff\xfe", 2));
+
+  auto decoded = DecodeDatum(*schema, datum);
+  if (kStrictSettings) {
+    ASSERT_FALSE(decoded.ok());
+    EXPECT_THAT(decoded.status().message(), HasSubstr("utf-8"));
+  } else {
+    ASSERT_TRUE(decoded.ok()) << decoded.status();
+    EXPECT_TRUE(decoded->IsBytes());
+    EXPECT_EQ(decoded->GetBytes().value_or(""), std::string("\xff\xfe", 2));
+    // Byte-exact: a value read and written back is the value that arrived.
+    EXPECT_EQ(EncodeDatum(*schema, *decoded).value_or(""), datum);
+  }
+
+  // Valid UTF-8 decodes as a string either way, so the setting reaches only the
+  // invalid case.
+  auto text = DecodeDatum(*schema, LengthPrefixed("hi"));
+  ASSERT_TRUE(text.ok()) << text.status();
+  EXPECT_EQ(text->GetString().value_or(""), "hi");
+}
+
+// Also a default rather than a closure. Avro defines `uuid` as an annotation on
+// `string` and a reader may leave it uninterpreted, which is what avrocpp
+// does: it never parses or validates one. Parsing it rewrites the bytes into
+// canonical form, reinterprets any 16-byte string as a raw uuid, and rejects
+// text other implementations wrote, so the annotation is left uninterpreted
+// here too.
+TEST(DatumTest, UuidFollowsTheSetting) {
+  auto schema = AvroSchema::Parse(R"({"type":"string","logicalType":"uuid"})");
+  ASSERT_TRUE(schema.ok()) << schema.status();
+
+  // Text that is not a uuid at all. avrocpp accepts it; parsing rejects it.
+  const std::string not_a_uuid = LengthPrefixed("nope");
+  auto decoded = DecodeDatum(*schema, not_a_uuid);
+  if (kStrictSettings) {
+    EXPECT_FALSE(decoded.ok());
+  } else {
+    ASSERT_TRUE(decoded.ok()) << decoded.status();
+    EXPECT_EQ(decoded->GetString().value_or(""), "nope");
+    EXPECT_EQ(EncodeDatum(*schema, *decoded).value_or(""), not_a_uuid);
+  }
+
+  // A well-formed uuid whose hex is upper case, which the canonical form is
+  // not. Parsing rewrites it, so the value read back is not the value that
+  // arrived; left uninterpreted, the text survives.
+  const std::string non_canonical =
+      LengthPrefixed("6F2B0E76-4D3D-4F8E-9D3A-2E1B8A7C6D5E");
+  auto uuid = DecodeDatum(*schema, non_canonical);
+  ASSERT_TRUE(uuid.ok()) << uuid.status();
+  if (kStrictSettings) {
+    EXPECT_EQ(uuid->GetUuid().value_or(""),
+              "6f2b0e76-4d3d-4f8e-9d3a-2e1b8a7c6d5e");
+  } else {
+    EXPECT_EQ(uuid->GetString().value_or(""),
+              "6F2B0E76-4D3D-4F8E-9D3A-2E1B8A7C6D5E");
+    EXPECT_EQ(EncodeDatum(*schema, *uuid).value_or(""), non_canonical);
+  }
+}
+
 // -- Object container files -------------------------------------------------
 
 class ContainerCodecTest : public ::testing::TestWithParam<Codec> {};
@@ -487,7 +809,7 @@ TEST(ContainerTest, OcfMagicPresent) {
 // Tests added to close gaps surfaced by the security review: the
 // timestamp/local-timestamp family, map length/key predicates,
 // AvroValue::TypeName, AvroSchema::ToJsonString, non-finite-float JSON
-// error paths, the empty container file, and trailing-byte handling.
+// error paths, and the empty container file.
 // (SetMaxAllocationBytes-actually-rejects-oversized-input is covered by the
 // Rust integration test tests/max_allocation.rs, which runs in its own
 // process because the limit is a one-shot process global.)
@@ -573,29 +895,6 @@ TEST(ContainerTest, EmptyFileRoundtrips) {
   ASSERT_TRUE(reader.ok());
   EXPECT_EQ(reader->Count(), 0u);
   EXPECT_FALSE(reader->HasNext());
-}
-
-TEST(DatumTest, DecodeIgnoresTrailingBytesByDefault) {
-  // avrocpp stops at the end of the first datum and ignores what follows, and
-  // this binding now does the same, so code moving off avrocpp that passes a
-  // padded or over-allocated buffer keeps working. SetRejectTrailingBytes
-  // restores the stricter reading; its `true` value is exercised by
-  // rust/tests/reject_trailing_bytes.rs, which needs its own process because the
-  // setting is a one-shot process global.
-  auto schema = AvroSchema::Parse("\"int\"");
-  ASSERT_TRUE(schema.ok());
-  auto encoded = EncodeDatum(*schema, AvroValue::CreateInt(7));
-  ASSERT_TRUE(encoded.ok());
-  std::string with_trailing = *encoded + std::string("\xde\xad", 2);
-  auto decoded = DecodeDatum(*schema, with_trailing);
-  ASSERT_TRUE(decoded.ok()) << decoded.status();
-  EXPECT_EQ(decoded->GetInt().value_or(0), 7);
-
-  // Bytes missing from a datum are still an error, which is a different thing
-  // from bytes left over after one.
-  auto string_schema = AvroSchema::Parse("\"string\"");
-  ASSERT_TRUE(string_schema.ok());
-  EXPECT_FALSE(DecodeDatum(*string_schema, std::string("\x04\x61", 2)).ok());
 }
 
 // -- Streaming container files ----------------------------------------------

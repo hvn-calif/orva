@@ -144,10 +144,11 @@ SetRejectTrailingBytes(bool)   // avro_bridge.h, off by default
 ```
 
 Off by default is avro-cpp's behaviour, and code being migrated may hand a padded or
-over-allocated buffer to a decode. The knob's `true` value needs its own test binary,
-`rust/tests/reject_trailing_bytes.rs`, because the setting is a `OnceLock` no test can
-reset; that file records that any test wanting the value *off* needs a third binary
-rather than a place in it.
+over-allocated buffer to a decode. The knob's `true` value needs its own process,
+because the setting is a `OnceLock` no test can reset. That used to be
+`rust/tests/reject_trailing_bytes.rs`; it is now the second build of
+`avro_bridge_test.cc`, `avro_bridge_strict_test`, which flips every setting the
+header exposes and so covers both values of each without a binary per knob.
 
 Every pinned test also asserts a **truncated** datum is still an error. Ignoring bytes
 left over after a complete datum and accepting a datum with bytes missing are different
@@ -296,7 +297,7 @@ that reveals a divergence is chance.
 | `Differential.SchemaTextVerdictsAgree` | 8 of 8 fail |
 | `Differential.DecodersAgreeOnArbitraryBytes` | **7 pass, 9 fail across 16 runs** |
 
-So `ctest` is 176 **or** 177 of 182. Pinning `FUZZTEST_PRNG_SEED` makes it
+So `ctest` is 244 **or** 245 of 250. Pinning `FUZZTEST_PRNG_SEED` makes it
 deterministic, measured at 6 of 6 failures with the seed fixed.
 
 **This is the change that would most improve the "did I break anything" question**, and
@@ -342,10 +343,10 @@ Suite state now:
 | suite | result |
 | --- | --- |
 | `avro_bytes_fuzz_test` | 21/21 |
-| `avro_bridge_test` | 54/54 |
-| the bridge's Rust suite | 70/70 across five binaries |
+| `avro_bridge_test` | 61/61, and `avro_bridge_strict_test` the same 61 |
+| the bridge's Rust suite | 65/65 across four binaries |
 | apache-avro's own suite | 567, up from 558 |
-| `ctest` | 176-177/182, see the flakiness section |
+| `ctest` | 244-245/250, see the flakiness section |
 
 Tier checkpoint, all thirteen properties concurrently for 20 minutes:
 
@@ -380,10 +381,10 @@ reproducing its fabrication; and the three avro-cpp bugs with no bridge-side fix
 allocation ceiling, `GenericDatum` stack exhaustion on a name cycle, and the
 declared-count `resize`).
 
-## One decision needed before Tier C
+## The decision that was needed before Tier C, and what was done
 
 Tier C is the first group whose knob must live in `apache_avro::util` rather than in the
-bridge, and that forces a question the spec deferred.
+bridge, and that forced a question this report originally left open.
 
 Tier A flipped crate defaults outright, which was defensible because upstream's
 behaviour was *unsound*. Tier C is different: upstream's behaviour is **correct**. RFC
@@ -392,10 +393,10 @@ namespace component. A patch making `Schema::parse_str` accept trailing garbage 
 default would rightly be refused upstream, and would leave the crate
 specification-noncompliant for anyone else using it.
 
-So the knob should default to upstream's strict behaviour and the bridge should flip it,
-which needs an initialisation point that runs before the first parse and still lets a
-caller who wants strictness win the `OnceLock`. Three options, differing in how easy it
-is to silently miss a site:
+So the knob defaults to upstream's strict behaviour and the bridge flips it, which needs
+an initialisation point that runs before the first parse and still lets a caller who
+wants strictness win the `OnceLock`. Three options were weighed, differing in how easy
+it is to silently miss a site:
 
 1. **Call it at the top of every affected bridge entry point.** `rust/schema.rs` alone
    has 29 `pub fn`. A missed one is a silent inconsistency.
@@ -407,6 +408,82 @@ is to silently miss a site:
    no site to miss, but it makes three patches unupstreamable and the crate
    specification-noncompliant by default.
 
-Recommendation: option 2, with a comment at `catch_panic` naming the coupling so it is
+**Option 2 is what shipped.** `install_avro_cpp_defaults()` in `rust/datum.rs` is called
+from `catch_panic`, and `catch_panic`'s doc comment names the coupling so it is
 discoverable. The set of entry points needing settings and the set needing panic
-containment are the same set for a reason: both are the untrusted-input surface.
+containment are the same set for a reason: both are the untrusted-input surface. It
+installs `non_utf8_string_as_bytes` and `uuid_as_string`, the two settings whose crate
+default is not avro-cpp's behaviour, and deliberately not the allocation ceiling, since
+avro-cpp has no ceiling and parity there would mean removing a bound on untrusted input.
+
+Two consequences worth knowing:
+
+- **The `fuzz/` properties now run at parity on both settings.** `fuzz/differential_test.cc`
+  never called either setter, so it ran at the crate defaults; `fuzz/README.md`'s claim
+  that D1's read side was closed was therefore true of the patch and not of that binary.
+  It is true of both now. D1's **write** side is unaffected: `CreateString` still rejects
+  non-UTF-8 at `rust/value.rs:75`, which is what
+  `Differential.D1NonUtf8StringIsRejectedByTheBridge` pins.
+- **Per-instance settings were considered and rejected.** A constructor argument would
+  let one process hold several instances with different settings, which is what the
+  trailing-bytes knob got for free had it been the only one. The other three are read
+  inside apache-avro, so per-instance there costs either a parameter threaded through
+  the crate's recursion, breaking its public API and conflicting on every rebase, or
+  thread-local ambient state with an install point at every entry point that can be
+  silently missed. They stay process-global, and the second test binary is how both
+  values of each get tested.
+
+### The checkpoint run
+
+Thirteen properties concurrently for five minutes in the fuzzing tree, with the
+new defaults in force:
+
+```
+./fuzz/run_all_parallel.sh 5m ./fuzzrun/defaults 1200
+```
+
+**Thirteen of thirteen exit 0**, 19.0 million executions total. Read
+`status.tsv`, not the wrapper's exit code. Nothing new surfaced from the default
+flip, which is the result the flip needed: it changes what five of the thirteen
+properties compare, since `fuzz/differential_test.cc` had never set either
+setting.
+
+## How a set-once setting is tested at both values
+
+The knobs are first-call-wins, so one process observes one value of each and no test can
+reset one. That used to mean a Rust integration test per value per knob:
+`rust/tests/reject_trailing_bytes.rs` existed for exactly that, and its own header
+recorded that a test wanting the value *off* would need a third binary.
+
+`avro_bridge_test.cc` is now built twice instead. `avro_bridge_strict_test` is the same
+source with `AVRO_BRIDGE_TEST_STRICT_SETTINGS` defined; a `::testing::Environment` flips
+every setting the header exposes in `SetUp`, which is early enough because gtest runs it
+before the first test body and nothing in the binary touches the bridge earlier. Its
+return values are asserted, so a setting that failed to take fails the run rather than
+quietly reporting the other value's behaviour.
+
+A test whose outcome depends on a setting branches on `kStrictSettings` rather than being
+duplicated, so the two binaries cannot drift apart. One extra binary covers every knob,
+where the crate side needs one per knob per value.
+
+Six tests pin the closures on the bridge's side, which is what the always-built suite was
+missing: the closures were pinned only in `avro_bytes_fuzz_test.cc`, which needs avro-cpp
+linked and only builds under `AVRO_BUILD_FUZZERS`. The differential half stays there. A
+seventh, `DatumTest.SettingsMatchTheBuild`, asserts that the settings in force are the
+ones the build asked for, so the strict binary losing the race fails rather than quietly
+reporting the default's behaviour.
+
+| test | closure |
+| --- | --- |
+| `DatumTest.TruncatedInputDoesNotFabricateValues` | A1, including the `Schema::String` site and `"null"` still decoding from zero bytes |
+| `AvroSchemaTest.EmptyUnionIsRejected` | A2, with `["int"]` still legal |
+| `AvroSchemaTest.EmptyEnumIsRejected` | A3, with a one-symbol enum still legal |
+| `DatumTest.EmptyDecimalRoundTrips` | A4, the full circle back to the input byte |
+| `DatumTest.TrailingBytesFollowTheSetting` | B1, both values, all three decode entry points |
+| `DatumTest.NonUtf8StringFollowsTheSetting`, `DatumTest.UuidFollowsTheSetting` | the two pre-existing patches, both values |
+
+The Rust suite drops from 70 tests across five binaries to 65 across four:
+`rust/tests/reject_trailing_bytes.rs` is deleted, along with the two trailing-bytes unit
+tests in `rust/datum.rs` and issue 1 of `rust/tests/security_properties.rs`. What stays
+is what has no C++ counterpart: the allocation ceiling, which needs its own process for
+the same reason, and the two documented residual limitations.

@@ -70,8 +70,11 @@ separate:
 - **The knob's crate default stays apache-avro's current behaviour**, so each
   patch remains additive and upstreamable on its own terms.
 - **The bridge sets the knobs to avro-cpp-compatible values** at one place,
-  `avro_bridge_defaults()` in `rust/lib.rs`, called from the top of every bridge
-  entry point. The bridge's default is therefore parity.
+  `install_avro_cpp_defaults()` in `rust/datum.rs`, called from `catch_panic`.
+  The bridge's default is therefore parity. `catch_panic` is the chokepoint
+  because the entry points needing panic containment and the ones needing these
+  defaults are the same set, the untrusted-input surface; the cost is that an
+  entry point added without that guard silently skips both.
 - **A caller who wants strictness calls the bridge's `SetStrict*` wrapper before
   its first Avro call**, and wins the `OnceLock` because it got there first. This
   is the rule `SetMaxAllocationBytes` already documents, so it is not a new
@@ -94,12 +97,20 @@ so.
    back looks closed to an acceptance property while corrupting data.
    `NonUtf8StringRoundTripsThroughBothEngines` checks the whole circle and is the
    shape to copy.
-4. Each knob gets a test at both of its values. A `OnceLock` cannot be reset
-   in-process, so the second value needs its own test binary, as
-   `avro/tests/non_utf8_string_as_bytes.rs` does.
+4. Each knob gets a test at both of its values, in `avro_bridge_test.cc`. A
+   `OnceLock` cannot be reset in-process, so the second value needs a second
+   *process*, not a second test: CMake builds that source twice, and
+   `avro_bridge_strict_test` defines `AVRO_BRIDGE_TEST_STRICT_SETTINGS`, whose
+   `::testing::Environment` flips every setting before the first test body runs.
+   One extra binary covers every knob, rather than one binary per knob as
+   `avro/tests/non_utf8_string_as_bytes.rs` needs on the crate side. A test whose
+   outcome depends on a setting branches on `kStrictSettings`.
 5. `avro_bytes_fuzz_test` and `ctest` do not regress. The baselines moved during
    the series, so the numbers are recorded rather than fixed: 20/20 and 174/180 at
-   the start, **21/21 and 176-177/182** now.
+   the start, **21/21 and 244-245/250** now. The jump from 182 is 68 tests: seven
+   pin the Tier A and Tier B closures on the bridge's side, and sixty are the
+   second build of `avro_bridge_test.cc` under
+   `AVRO_BRIDGE_TEST_STRICT_SETTINGS`.
 
    The `ctest` total is a range because `Differential.DecodersAgreeOnArbitraryBytes`
    is flaky in unit-test mode: a `FUZZ_TEST` there is a one-second run from a random
@@ -556,9 +567,16 @@ migration.
   suites, `/opt/dfz-fuzz` (fuzzing mode) for the hour-long runs.
   `--parallel 2` in the fuzzing tree: 7 GB of RAM, and that build compiles
   abseil, RE2, ANTLR, FuzzTest and avro-cpp under AddressSanitizer.
-- **A knob is set-once.** `avro_bridge_defaults()` must run before the first
-  decode and after any caller-supplied `SetStrict*`, which means it runs at the
-  top of each bridge entry point rather than from a constructor.
+- **A knob is set-once**, and stays a process global rather than becoming a
+  per-instance constructor argument. Only the trailing-bytes knob is read in the
+  bridge; the rest are read inside apache-avro's `decode.rs`, `encode.rs` and
+  `types.rs`, so per-instance values there would mean either threading a
+  parameter through the crate's recursion, which breaks its public API and
+  conflicts on every rebase, or thread-local ambient state with an install point
+  at every entry point. Neither is worth it, so `install_avro_cpp_defaults()`
+  runs inside `catch_panic`, before the first decode and after any
+  caller-supplied setter, and a caller wanting a different value calls the setter
+  before its first Avro operation and wins the `OnceLock`.
 
 ## Out of scope
 

@@ -300,16 +300,29 @@ absl::StatusOr<AvroValue> DecodeDatumSchemata(
 // decompression of compressed container codecs (see DataFileReader).
 size_t SetMaxAllocationBytes(size_t num_bytes);
 
-// EXPERIMENT, do not commit. When on, a `string` whose wire bytes are not valid
-// UTF-8 decodes as bytes instead of failing, matching what avrocpp does.
-// Process-global and first-call-wins like SetMaxAllocationBytes, and read on
-// the first string decode, so call it before decoding anything. Returns the
-// setting actually in effect.
+// When on, a `string` whose wire bytes are not valid UTF-8 decodes as bytes
+// instead of failing, matching what avrocpp does: it copies the bytes into a
+// byte-oriented std::string without validating them, so files carrying such
+// bytes round-trip through it and rejecting them here would make that data
+// unreadable. The bytes come back in a distinct variant, so re-encoding writes
+// back exactly what was read.
+//
+// On is the default. Pass false to get apache-avro's stricter reading, where
+// such a `string` is an error. Process-global and first-call-wins like
+// SetMaxAllocationBytes, and read on the first string decode, so call it before
+// decoding anything. Returns the setting actually in effect.
 bool SetNonUtf8StringAsBytes(bool as_bytes);
 
-// EXPERIMENT, do not commit. When on, a `uuid` decodes as an ordinary string
-// rather than being parsed, preserving the bytes as written. Process-global and
-// first-call-wins; call before decoding anything.
+// When on, a `uuid` decodes as an ordinary string rather than being parsed, so
+// the bytes as written survive. Avro defines `uuid` as an annotation on
+// `string` and a reader may leave it uninterpreted, which is what avrocpp does:
+// it never parses or validates one. Parsing has three effects reading it as a
+// string does not -- the bytes are rewritten into canonical form, any 16-byte
+// string is reinterpreted as a raw uuid, and text that is not a uuid is
+// rejected, making data other implementations wrote unreadable.
+//
+// On is the default. Pass false to get the parsing behaviour back.
+// Process-global and first-call-wins; call before decoding anything.
 bool SetUuidAsString(bool as_string);
 
 // When on, DecodeDatum and its variants require the buffer to hold exactly one
@@ -325,6 +338,9 @@ bool SetUuidAsString(bool as_string);
 // one: a truncated datum is an error either way. Process-global and
 // first-call-wins like SetMaxAllocationBytes, read on the first decode, so call
 // it before decoding anything. Returns the setting actually in effect.
+//
+// Both values are covered by DatumTest.TrailingBytesFollowTheSetting, which is
+// built twice; see the CMake comment above avro_bridge_strict_test.
 bool SetRejectTrailingBytes(bool reject);
 
 // Writes Avro object container files. Replaces avrocpp's

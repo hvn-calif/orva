@@ -29,11 +29,15 @@ UTF-8, RAM, ID).
 ## Why this baseline
 
 This tree is pinned at `84ce4af`, deliberately. Two divergences the register
-documents are open here in both directions:
+documents are still open here, D1 on its write side and D2 in both directions:
 
 - **D1** -- a `string` holding non-UTF-8 bytes. avro-cpp accepts it unvalidated;
   the bridge rejects it on write (`rust/value.rs`, `create_string` calls
-  `utf8(v)?`) and on read.
+  `utf8(v)?`). The **read** side is closed: the non-UTF-8 patch is in
+  `patches/` and `install_avro_cpp_defaults` (`rust/datum.rs`) turns it on, so a
+  decode now yields the bytes. Note that this binary used not to set that
+  setting, so it measured the crate default rather than the bridge's; the row in
+  the table below said "closed" of the patch, not of what ran here.
 - **D2** -- duplicate keys in a map. avro-cpp keeps both entries; the bridge
   collapses them last-write-wins (`entries.insert` into a `HashMap`).
 
