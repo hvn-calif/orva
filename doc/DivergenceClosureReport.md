@@ -56,7 +56,7 @@ Six commits on `avro-diff-fuzz`, one divergence each, nothing batched.
 | `8f1db74` | `schema-acceptance` / "bad node of type enum" | `apache-avro-0.21-empty-enum.patch` |
 | `f71d34a` | `reencode-failed` / "decimal sign extension 0" | `apache-avro-0.21-empty-decimal.patch` |
 | `afd4aed` | `trailing-bytes` / "trailing bytes" | the bridge, `rust/datum.rs` |
-| the C1 commit | `schema-trailing-bytes` / "disagree on whether this schema is legal" | the bridge, `rust/schema.rs` |
+| `5801a91` | `schema-trailing-bytes` / "disagree on whether this schema is legal" | the bridge, `rust/schema.rs` |
 
 The four patches live in `/home/hvn/orva/patches/`, each a `git format-patch`
 artifact with a row and a section in `patches/README.md`. They stack in the order
