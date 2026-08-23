@@ -185,11 +185,17 @@ sweep produced another spelling of something already understood.
 So: **when several findings share a cause, classify them in the harness and give
 them one tag and one entry.** Two examples already in the file to copy:
 
-- `IsArraySchema` assigns `array-block-framing` by schema shape, replacing four
+- `SchemaHoldsAnArray` (named `IsArraySchema` when this was written) assigns
+  `array-block-framing` by schema shape, replacing four
   message-specific entries.
-- `ParsesAsSchemaPrefix` assigns `schema-trailing-bytes` when a proper prefix of
-  the schema text parses on its own, replacing two and absorbing a third message
-  found later.
+- `ParsesAsSchemaPrefix` assigned `schema-trailing-bytes` when a proper prefix of
+  the schema text parsed on its own, replacing two messages and absorbing a third
+  found later. **It has since been deleted**, with the C1 closure: it never asked
+  *why* the binding rejected, so once trailing text stopped being a reason to
+  reject, the next rejection that happened to have a parsing prefix would have
+  been given the wrong cause. Copy the technique, and copy that lesson with it --
+  a shape-based classifier has to be retired when the shape stops implying the
+  cause.
 
 Both are deliberately broader than the entries they replaced, and both say so in
 a comment. The consolidated test is what holds the line: it pins the measured

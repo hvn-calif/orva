@@ -52,10 +52,17 @@ Preference order, and the reason for it:
    its own wrappers -- the schema in an object container file header is parsed
    inside apache-avro, so a validation walk written in `rust/schema.rs` would
    not see it.
-2. **A bridge patch in `rust/`.** Only when apache-avro has no site to change,
-   because the behaviour is the bridge's own. The trailing-bytes check at
-   `rust/datum.rs:12` is the one case: apache-avro's `from_avro_datum` already
-   behaves like avro-cpp, and it is the bridge that added the rejection.
+2. **A bridge patch in `rust/`.** When apache-avro has no site to change because
+   the behaviour is the binding's own, or when the crate patch would not reach
+   further than a binding-side one. Two cases so far:
+   - The trailing-bytes check at `rust/datum.rs:12`: apache-avro's
+     `from_avro_datum` already behaves like avro-cpp, and it is the binding that
+     added the rejection.
+   - C1, text after the schema JSON. Two of its three refusals came from the
+     binding's own whole-buffer UTF-8 check rather than from the crate, the crate
+     is called from two adjacent functions, and a knob inside `Schema::parse_str`
+     would still have missed the container file header, which reads its schema
+     through `serde_json::from_slice` (`reader.rs:221`). See C1 below.
 
 ### Reconciling the two polarities
 
@@ -107,10 +114,12 @@ so.
    outcome depends on a setting branches on `kStrictSettings`.
 5. `avro_bytes_fuzz_test` and `ctest` do not regress. The baselines moved during
    the series, so the numbers are recorded rather than fixed: 20/20 and 174/180 at
-   the start, **22/22 and 249-250/255** now. The jump from 182 is 73 tests: nine
-   pin the Tier A and Tier B closures on the bridge's side, and sixty are the
-   second build of `avro_bridge_test.cc` under
-   `AVRO_BRIDGE_TEST_STRICT_SETTINGS`.
+   the start, 22/22 and 249-250/255 at the end of Tier B, and **28/28 and
+   257-258/263** after the value comparison and C1. The jump from 182 is 73
+   tests: nine pin the Tier A and Tier B closures on the bridge's side, and sixty
+   are the second build of `avro_bridge_test.cc` under
+   `AVRO_BRIDGE_TEST_STRICT_SETTINGS`. The eight after that are six from the
+   value comparison and two from C1, which is one test built twice.
 
    The `ctest` total is a range because `Differential.DecodersAgreeOnArbitraryBytes`
    is flaky in unit-test mode: a `FUZZ_TEST` there is a one-second run from a random
@@ -146,14 +155,18 @@ so.
 | A4 empty-decimal | **landed** | `reencode-failed` / "decimal sign extension 0" |
 | A5 container block varint | open, needs measurement | no entry yet |
 | B1 trailing bytes after a datum | **landed** | `trailing-bytes` |
-| C1 trailing bytes after schema text | open | `schema-trailing-bytes` |
-| C2 vertical tab and form feed | open | `json-whitespace-leniency` |
+| C1 text after the schema JSON | **landed** | `schema-trailing-bytes`, plus one of the three positions behind `json-whitespace-leniency` |
+| C2 vertical tab and form feed | open, narrowed by C1 | `json-whitespace-leniency` |
 | C3 lenient namespace | open, recommended last or not at all | `schema-acceptance` / "Invalid namespace" |
 | D1 duplicate full name | open | finding 4, no entry |
 | D2 duration render | open | finding 3, no entry |
 | E1/E2 map keys | open, needs its own spec | `avrocpp-lenient` / "Invalid utf-8 string", D2 |
 
-`kKnownDivergences`: 11 entries at the start, 6 now.
+`kKnownDivergences`: 11 entries at the start, **9 now**. It went *up* in between,
+not down: comparing decoded values rather than re-encoded bytes (commit `d4619fc`)
+added four entries, three of them one open class and one of them the register's
+D2 reached from raw bytes for the first time. Any count of 6 or 7 elsewhere in
+this repository predates that commit.
 
 The Tier A checkpoint run also surfaced **finding 13**, an avro-cpp bug rather
 than a bridge divergence: it fabricates an array item without changing the array's
@@ -341,28 +354,67 @@ bridge rejects.
 
 ### Tier C - avro-cpp leniency the bridge does not have
 
-Each of these three is a knob in `apache_avro::util`, crate default matching
-apache-avro's current behaviour, set to avro-cpp's by `avro_bridge_defaults()`.
+C2 and C3 are knobs in `apache_avro::util`, crate default matching apache-avro's
+current behaviour, set to avro-cpp's by `install_avro_cpp_defaults()`. C1 landed
+without one: it turned out to be entirely the binding's, and the section below
+records why.
 
-#### C1. Trailing bytes after the schema JSON
+#### C1. Text after the schema JSON -- **landed, bridge-side**
 
 Closes `{"schema-trailing-bytes", "disagree on whether this schema is legal"}`.
 
 avro-cpp stops once it has one complete JSON value and never looks at what
-follows, so `"int"` followed by anything still parses. `Schema::parse_str` calls
-`serde_json::from_str`, which rejects trailing content. The bridge reports it
-three different ways depending on where the trailing bytes fail first, which is
-why the harness classifies this by shape (`ParsesAsSchemaPrefix`) rather than by
-message.
+follows, so `"int"` followed by anything still parses. The binding reported that
+three different ways depending on where the trailing text failed first, which is
+why the harness used to classify it by shape rather than by message.
 
-Fix: parse through `serde_json::Deserializer::from_str` and take the first value,
-ignoring the remainder, under
+**Only one of the three came from serde_json.** The other two, invalid UTF-8 and
+a UTF-8 sequence cut short, came from `AvroSchema::parse` validating the *whole*
+buffer as UTF-8 before any parsing, so bytes after a perfectly good schema were
+enough to lose it. That is the binding's own check, not the crate's, and it is
+why the fix cuts bytes rather than text.
 
 ```
-util::set_strict_schema_trailing_bytes(bool)   // crate default true
+SetRejectTextAfterSchemaJson(bool)   // avro_bridge.h, off by default
 ```
 
-Both `parse_str` and `parse_list` need it.
+Off is avro-cpp's behaviour. `AvroSchema::parse` and `AvroSchema::parse_list` cut
+the input at the end of its first JSON document and parse that, using
+`serde_json::Deserializer::from_slice(..).into_iter::<Value>()` for the boundary
+and `byte_offset()` for where it is. The retry runs **only after the whole buffer
+has already failed**, so an input that parses today cannot change meaning and
+pays nothing; the extra scan is on the error path alone. The name says what it
+rejects, since "strict" tells a reader nothing without the rest of this document.
+
+**Why not the `apache_avro::util` knob this section originally specified.** Two
+reasons, both measured rather than argued:
+
+- The crate is called from exactly two places in the binding's non-test code,
+  `rust/schema.rs:28` and `:43`. The "one missed site is a silent
+  inconsistency" argument that put the other settings in the crate is about
+  values read deep inside decode, and does not apply to two adjacent functions.
+- A knob inside `Schema::parse_str` **would not have covered the container file
+  header either**. `Reader::new` reads the `avro.schema` metadata with
+  `serde_json::from_slice` (`reader.rs:221`) and then calls `Schema::parse` on
+  the `Value`, which is a separate decision point from `Parser::parse_str`
+  (`reader.rs:237`, `schema.rs:1317`). So the header needs its own change under
+  every option, and its avro-cpp behaviour is unmeasured for the same reason A5
+  is: there is no object-container coverage.
+
+The header therefore stays a **known residual gap**: a container file whose
+embedded schema JSON carries trailing text is still refused by the binding, and
+whether avro-cpp accepts it has not been measured.
+
+Landing it this way also meant no fifth patch on the apache-avro stack to rebase,
+and it left `catch_panic` alone. Decoupling `install_avro_cpp_defaults()` from
+`catch_panic`, by resolving each knob's default from a cargo feature instead of a
+runtime install call, is a separate change and is not part of this closure.
+
+**It narrowed C2 without being asked to.** A vertical tab or form feed *after*
+the document is no longer a disagreement, because the binding never reads what
+follows the first document. That is not serde_json accepting the byte as
+whitespace, and the distinction is pinned: between two tokens, and before the
+document, both bytes are still rejected. Two positions remain, not three.
 
 #### C2. Vertical tab and form feed as JSON whitespace
 
@@ -374,6 +426,11 @@ vertical tab (0x0B) and form feed (0x0C). RFC 8259 permits exactly four bytes
 there, and serde_json enforces that. A pipeline that fed avro-cpp a
 pretty-printed schema containing a form feed starts failing to parse after the
 migration, which is the direction that matters.
+
+**Two positions remain, not three.** C1 closed the third: a form feed after the
+document is no longer read at all. What is left is a form feed *before* the
+document and one *between two tokens*, which is where the byte really does have
+to count as whitespace.
 
 Fix: a pre-pass in `Schema::parse_str` replacing 0x0B and 0x0C with 0x20
 **outside string literals**, under

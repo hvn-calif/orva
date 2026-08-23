@@ -374,7 +374,7 @@ class does not end every run; `avro_bytes_fuzz_test.cc` already guards it with
 `kMaxDeclaredLengthBytes` and pins the ceiling arithmetic in
 `AllocationCeilingChecksCountAgainstAByteLimit`.
 
-### 10. Vertical tab and form feed are whitespace only to avro-cpp
+### 10. Vertical tab and form feed are whitespace only to avro-cpp -- two positions of three
 
 Found by `ParsersAgreeOnSchemaAcceptance` after 23 seconds. avro-cpp skips
 whitespace with `isspace()` (`JsonIO.cc:42`), which accepts vertical tab (0x0B)
@@ -383,11 +383,17 @@ carriage return, space -- and serde_json, under the bridge, enforces that.
 
 ```
 0x0B "int"      avrocpp accepts   bridge rejects
-"int" 0x0B      avrocpp accepts   bridge rejects
+"int" 0x0B      both accept, since C1        (was: bridge rejects)
 {"type": 0x0B "int"}   avrocpp accepts   bridge rejects
 0x09 / 0x0A / 0x0D / 0x20   both accept
 every other byte 0x00 to 0x20   both agree
 ```
+
+The middle row closed as a side effect of C1, and **not** because serde_json
+started treating the byte as whitespace: the binding now stops at the end of the
+first JSON document and never reads what follows it. Between two tokens the byte
+still has to count as whitespace to be skipped, and it does not, which is why the
+third row stands and why the pinning test asserts both halves.
 
 Direction is avro-cpp-lenient, so nothing is mis-decoded. It matters the other
 way round: a pipeline that fed avro-cpp a pretty-printed schema containing a form

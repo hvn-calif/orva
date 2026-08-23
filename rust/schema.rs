@@ -7,6 +7,7 @@ use apache_avro::schema_compatibility::SchemaCompatibility;
 use apache_avro::Schema;
 use md5::Md5;
 use sha2::Sha256;
+use std::sync::OnceLock;
 
 /// Wrapper around an Avro schema. Replaces avrocpp's `ValidSchema`.
 #[derive(Debug, Clone, PartialEq)]
@@ -20,34 +21,120 @@ impl Default for AvroSchema {
     }
 }
 
+/// Whether parsing rejects text after the schema's JSON document.
+///
+/// Off by default, which is avrocpp's behaviour: its JSON reader stops once it
+/// has one complete value and never looks at what follows, so `"int"` followed
+/// by anything is still the schema `"int"`. Off also matters more than it looks,
+/// because a schema is a cache key and a fingerprint input: a producer on
+/// avrocpp can write a document with a NUL pad, a stray byte or a second
+/// document behind it, and rejecting those makes data that avrocpp reads
+/// unreadable here. Trailing whitespace was never at issue, since serde_json
+/// accepts it either way.
+///
+/// On, the input must be one JSON document and nothing else, which is what
+/// serde_json enforces and what this binding shipped with. Text after a
+/// complete document usually does mean a truncated write or two documents
+/// concatenated by mistake, so it stays available to whoever wants it.
+static REJECT_TEXT_AFTER_SCHEMA_JSON: OnceLock<bool> = OnceLock::new();
+
+const DEFAULT_REJECT_TEXT_AFTER_SCHEMA_JSON: bool = false;
+
+/// Sets whether [`AvroSchema::parse`] and [`AvroSchema::parse_list`] reject text
+/// after the schema's JSON document. Process-global and first-call-wins, like
+/// [`crate::datum::set_max_allocation_bytes`], and read on the first parse, so
+/// call it before parsing anything. Returns the setting actually in effect,
+/// which differs from the argument if something already set it.
+pub fn set_reject_text_after_schema_json(reject: bool) -> bool {
+    *REJECT_TEXT_AFTER_SCHEMA_JSON.get_or_init(|| reject)
+}
+
+fn reject_text_after_schema_json() -> bool {
+    *REJECT_TEXT_AFTER_SCHEMA_JSON.get_or_init(|| DEFAULT_REJECT_TEXT_AFTER_SCHEMA_JSON)
+}
+
+/// `raw` cut at the end of its first complete JSON document, when anything
+/// follows it. `None` when the document already runs to the end of `raw`, when
+/// there is no complete document to find, or when the caller asked for the text
+/// after it to be rejected.
+///
+/// Cuts bytes rather than a `&str` because two of the three ways this binding
+/// used to refuse such an input happen before any JSON parsing: `parse`
+/// validates the whole buffer as UTF-8 first, so invalid bytes *after* a
+/// perfectly good schema were enough to lose it.
+fn json_document_prefix(raw: &[u8]) -> Option<&[u8]> {
+    if reject_text_after_schema_json() {
+        return None;
+    }
+    let mut documents =
+        serde_json::Deserializer::from_slice(raw).into_iter::<serde_json::Value>();
+    documents.next()?.ok()?;
+    let end = documents.byte_offset();
+    if end < raw.len() { Some(&raw[..end]) } else { None }
+}
+
+/// Parses one schema from bytes that must be entirely one JSON document.
+fn parse_document(raw_json: &[u8]) -> Result<AvroSchema, VecU8> {
+    let json = utf8(raw_json)?;
+    match Schema::parse_str(json) {
+        Ok(schema) => Ok(AvroSchema { schema }),
+        Err(err) => Err(err.to_string().into()),
+    }
+}
+
+/// Parses cross-referencing schemas from buffers that must each be entirely one
+/// JSON document.
+fn parse_document_list(raw_jsons: &[&[u8]]) -> Result<VecAvroSchema, VecU8> {
+    let mut jsons = Vec::with_capacity(raw_jsons.len());
+    for raw_json in raw_jsons {
+        jsons.push(utf8(raw_json)?);
+    }
+    match Schema::parse_list(jsons) {
+        Ok(schemas) => Ok(schemas
+            .into_iter()
+            .map(|schema| AvroSchema { schema })
+            .collect::<Vec<AvroSchema>>()
+            .into()),
+        Err(err) => Err(err.to_string().into()),
+    }
+}
+
 impl AvroSchema {
     /// Parses an Avro schema from its JSON representation.
+    ///
+    /// Text after the schema's JSON document is ignored, as avrocpp ignores it,
+    /// unless [`set_reject_text_after_schema_json`] asked otherwise. The retry
+    /// on a shorter input runs only when the whole buffer failed, so an input
+    /// that parses today cannot change meaning and pays nothing.
     pub fn parse(raw_json: &[u8]) -> Result<AvroSchema, VecU8> {
-        catch_panic(|| {
-            let json = utf8(raw_json)?;
-            match Schema::parse_str(json) {
-                Ok(schema) => Ok(AvroSchema { schema }),
-                Err(err) => Err(err.to_string().into()),
-            }
+        catch_panic(|| match parse_document(raw_json) {
+            Ok(schema) => Ok(schema),
+            Err(err) => match json_document_prefix(raw_json) {
+                Some(prefix) => parse_document(prefix),
+                None => Err(err),
+            },
         })
     }
 
     /// Parses a list of schemas that may reference each other by name.
     /// The returned schemas are in the same order as the input.
+    ///
+    /// Text after each schema's JSON document is ignored, as in [`Self::parse`].
     pub fn parse_list(raw_jsons: &[VecU8]) -> Result<VecAvroSchema, VecU8> {
         catch_panic(|| {
-            let mut jsons = Vec::with_capacity(raw_jsons.len());
-            for raw_json in raw_jsons {
-                jsons.push(utf8(raw_json.as_slice())?);
+            let raws: Vec<&[u8]> = raw_jsons.iter().map(|raw| raw.as_slice()).collect();
+            let parsed = parse_document_list(&raws);
+            if parsed.is_ok() {
+                return parsed;
             }
-            match Schema::parse_list(jsons) {
-                Ok(schemas) => Ok(schemas
-                    .into_iter()
-                    .map(|schema| AvroSchema { schema })
-                    .collect::<Vec<AvroSchema>>()
-                    .into()),
-                Err(err) => Err(err.to_string().into()),
+            let prefixes: Vec<&[u8]> = raws
+                .iter()
+                .map(|raw| json_document_prefix(raw).unwrap_or(raw))
+                .collect();
+            if prefixes == raws {
+                return parsed;
             }
+            parse_document_list(&prefixes)
         })
     }
 
@@ -341,6 +428,88 @@ mod tests {
         assert_eq!(schemas.len(), 2);
         assert_eq!(schemas.as_slice()[0].name().unwrap().as_slice(), b"Address");
         assert_eq!(schemas.as_slice()[1].name().unwrap().as_slice(), b"Person");
+    }
+
+    // C1. avrocpp's JSON reader stops at the end of the first value and never
+    // looks at what follows, so a schema with anything behind it is still that
+    // schema. These are the three ways this binding used to refuse one: bad
+    // JSON, invalid UTF-8, and a UTF-8 sequence cut short. The last two never
+    // reached the JSON parser, because `parse` validated the whole buffer as
+    // UTF-8 first, which is why the cut is made on bytes.
+    //
+    // Only the default is testable here. The setting is a `OnceLock` no test can
+    // reset, so its other value lives in `avro_bridge_strict_test`.
+    #[test]
+    fn text_after_the_schema_json_is_ignored() {
+        let clean = AvroSchema::parse(b"\"string\"").unwrap();
+        for raw in [
+            b"\"string\"!".as_slice(),
+            b"\"string\" \n]".as_slice(),
+            b"\"string\"\"".as_slice(),
+            b"\"string\"f_\xc3\x28y".as_slice(),
+            b"\"string\"l5\xe2\x82".as_slice(),
+        ] {
+            assert_eq!(AvroSchema::parse(raw).unwrap(), clean);
+        }
+    }
+
+    // The cut is at the end of the first JSON document, not at the first byte
+    // that looks like the end of one: a brace inside a string, and an escaped
+    // quote, both stay inside the string.
+    #[test]
+    fn text_after_the_schema_json_respects_string_literals() {
+        const BRACES_IN_A_STRING: &str =
+            r#"{"type":"record","name":"R","doc":"} \" }","fields":[]}"#;
+        let clean = AvroSchema::parse(BRACES_IN_A_STRING.as_bytes()).unwrap();
+        let trailing =
+            AvroSchema::parse(format!("{BRACES_IN_A_STRING}!").as_bytes()).unwrap();
+        assert_eq!(trailing, clean);
+        assert_eq!(clean.name().unwrap().as_slice(), b"R");
+    }
+
+    // Ignoring text after a complete document and accepting a document cut
+    // short are different things: there is no complete document to fall back to
+    // here, so these stay errors.
+    #[test]
+    fn a_truncated_schema_is_still_rejected() {
+        assert!(AvroSchema::parse(br#"{"type":"reco"#).is_err());
+        assert!(AvroSchema::parse(b"[\"int\"").is_err());
+        assert!(AvroSchema::parse(b"").is_err());
+    }
+
+    // A complete JSON document that is not a legal schema reports why, rather
+    // than reporting the trailing text that is no longer the problem. The two
+    // messages match because the second parse sees exactly the first input.
+    #[test]
+    fn an_illegal_schema_reports_its_own_error() {
+        let plain = AvroSchema::parse(br#"{"type":"nonsense"}"#).unwrap_err();
+        let trailing = AvroSchema::parse(br#"{"type":"nonsense"}!"#).unwrap_err();
+        assert_eq!(plain.as_slice(), trailing.as_slice());
+    }
+
+    #[test]
+    fn text_after_each_schema_in_a_list_is_ignored() {
+        let dependency = VecU8::from(
+            r#"{"type": "record", "name": "Address", "fields": [
+                {"name": "city", "type": "string"}]}!"#,
+        );
+        let dependent = VecU8::from(
+            r#"{"type": "record", "name": "Person", "fields": [
+                {"name": "address", "type": "Address"}]} {"stray": 1}"#,
+        );
+        let schemas = AvroSchema::parse_list(&[dependency, dependent]).unwrap();
+        assert_eq!(schemas.len(), 2);
+        assert_eq!(schemas.as_slice()[0].name().unwrap().as_slice(), b"Address");
+        assert_eq!(schemas.as_slice()[1].name().unwrap().as_slice(), b"Person");
+    }
+
+    // The retry parses the same list again with each document cut, so an error
+    // that has nothing to do with trailing text survives it.
+    #[test]
+    fn a_duplicate_name_in_a_list_is_still_rejected() {
+        let first = VecU8::from(r#"{"type":"record","name":"R","fields":[]}"#);
+        let second = VecU8::from(r#"{"type":"record","name":"R","fields":[]} !"#);
+        assert!(AvroSchema::parse_list(&[first, second]).is_err());
     }
 
     #[test]

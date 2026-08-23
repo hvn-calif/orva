@@ -349,6 +349,33 @@ bool SetUuidAsString(bool as_string);
 // built twice; see the CMake comment above avro_bridge_strict_test.
 bool SetRejectTrailingBytes(bool reject);
 
+// When on, AvroSchema::Parse and AvroSchema::ParseList require the input to be
+// one JSON document and nothing else. Off by default, which is what avrocpp
+// does: its JSON reader stops once it has one complete value and never looks at
+// what follows, so `"int"` followed by anything is still the schema `"int"`.
+//
+// Off matters more here than the size of the difference suggests. Two of the
+// three ways such an input used to be refused happened before any JSON parsing,
+// because the whole buffer is validated as UTF-8 first: bytes after a perfectly
+// good schema were enough to lose it. And a schema is a cache key and a
+// fingerprint input, so a producer on avrocpp can write a document with a NUL
+// pad, a stray byte or a second document behind it that the bridge would not
+// load at all. Trailing *whitespace* was never at issue: serde_json accepts it
+// under either setting.
+//
+// Turn it on to be stricter than avrocpp: text after a complete document
+// usually means a truncated write or two documents concatenated by mistake.
+//
+// This governs text after a complete document, not a document cut short: a
+// truncated schema is an error either way. Process-global and first-call-wins
+// like SetMaxAllocationBytes, read on the first parse, so call it before parsing
+// anything. Returns the setting actually in effect.
+//
+// Both values are covered by
+// AvroSchemaTest.TextAfterSchemaJsonFollowsTheSetting, which is built twice;
+// see the CMake comment above avro_bridge_strict_test.
+bool SetRejectTextAfterSchemaJson(bool reject);
+
 // Writes Avro object container files. Replaces avrocpp's
 // DataFileWriter<GenericDatum>. Values are validated and buffered by
 // Append; the encoded file is produced by ToBytes or WriteToPath.

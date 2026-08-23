@@ -653,6 +653,10 @@ bool SetRejectTrailingBytes(bool reject) {
   return rust::datum::set_reject_trailing_bytes(reject);
 }
 
+bool SetRejectTextAfterSchemaJson(bool reject) {
+  return rust::schema::set_reject_text_after_schema_json(reject);
+}
+
 // ---------------------------------------------------------------------------
 // DataFileWriter
 // ---------------------------------------------------------------------------

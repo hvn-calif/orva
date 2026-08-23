@@ -284,21 +284,6 @@ bool SchemaHoldsAnArray(const std::string& schema_text) {
   return schema_text.find(R"("type":"array")") != std::string::npos;
 }
 
-// avrocpp stops once it has a complete JSON value and never looks at what
-// follows, so a schema with anything after it still parses while the bridge
-// refuses it. The bridge reports that three different ways depending on where
-// the trailing bytes fail first, which is why this is classified by shape
-// rather than by message: a proper prefix of the text parses on its own.
-//
-// The scan is linear in the length of the text and runs only once a divergence
-// has already been found, never on the hot path.
-bool ParsesAsSchemaPrefix(const std::string& text) {
-  for (size_t len = text.size(); len-- > 1;) {
-    if (AvroSchema::Parse(text.substr(0, len)).ok()) return true;
-  }
-  return false;
-}
-
 // Divergences already triaged. A long run stays quiet on these and stops only
 // on something new, so no environment setup is needed to fuzz for hours.
 //
@@ -319,8 +304,6 @@ constexpr KnownDivergence kKnownDivergences[] = {
     {"alloc-ceiling", "Unable to allocate"},
     // One root cause, four messages: see SchemaHoldsAnArray above.
     {"array-block-framing", R"("type":"array")"},
-    // Likewise one root cause, three messages: see ParsesAsSchemaPrefix.
-    {"schema-trailing-bytes", "disagree on whether this schema is legal"},
     {"avrocpp-lenient", "Invalid utf-8 string"},
     {"json-whitespace-leniency", "disagree on whether this schema is legal"},
     // D2 in the divergence register, open at this commit. Reachable here only
@@ -589,9 +572,11 @@ fuzztest::Domain<std::string> AnySchemaText() {
 // avro-cpp decides whitespace with isspace() (JsonIO.cc:42), which accepts
 // vertical tab and form feed. JSON allows only tab, newline, carriage return
 // and space, so those two bytes are avro-cpp's alone: it accepts them before,
-// after and inside a schema, and the bridge rejects all three positions. Given
-// its own tag so the table entry that mutes it cannot also mute an unrelated
-// parser disagreement.
+// after and inside a schema, and the bridge rejects two of the three positions.
+// After the document is no longer one of them, since C1 closed: the binding
+// stops at the end of the first document and never sees what follows. Given its
+// own tag so the table entry that mutes it cannot also mute an unrelated parser
+// disagreement.
 bool HoldsNonJsonWhitespace(absl::string_view text) {
   for (const char c : text) {
     if (c == '\v' || c == '\f') return true;
@@ -614,8 +599,6 @@ void ParsersAgreeOnSchemaAcceptance(const std::string& text) {
   absl::string_view tag = "schema-acceptance";
   if (!bridge.ok() && cpp.ok() && HoldsNonJsonWhitespace(text)) {
     tag = "json-whitespace-leniency";
-  } else if (!bridge.ok() && cpp.ok() && ParsesAsSchemaPrefix(text)) {
-    tag = "schema-trailing-bytes";
   }
   ReportDivergence(std::string(tag),
                    "the two parsers disagree on whether this schema is legal"
@@ -1428,44 +1411,76 @@ TEST(AvroBytes, EmptyDecimalRoundTripsThroughBothEngines) {
   ExpectReencodingAgrees(schema, Varint(1) + std::string(1, '\x2a'));
 }
 
-// schema-trailing-bytes
+// C1, closed. avrocpp stops once it has one complete JSON value and never looks
+// at what follows, so a schema document with anything behind it still parses.
+// The binding refused it, in three different messages depending on where the
+// trailing text failed first: bad JSON, invalid UTF-8, or a UTF-8 sequence cut
+// short. Only the first came from the JSON parser; the other two came from the
+// whole-buffer UTF-8 check the binding does before parsing, which is why the
+// closure cuts bytes rather than text.
 //
-// avrocpp stops once it has a complete JSON value and never looks at what
-// follows, so a schema document with anything after it still parses. The bridge
-// refuses it, in three different messages depending on where the trailing bytes
-// fail first: bad JSON, invalid UTF-8, or a UTF-8 sequence cut short. One root
-// cause, so one entry, classified by ParsesAsSchemaPrefix rather than by which
-// message came back.
+// It matters more than parser strictness. A schema is a cache key and a
+// fingerprint input, so two documents differing only in what follows them were
+// the same schema to avrocpp and not a schema at all to the binding, and a
+// producer on the avrocpp side could write something the binding would not
+// load. Which is also why the assertions below compare what each engine
+// produced and not just that it accepted: parsing padded text into a different
+// schema would be worse than refusing it.
 //
-// More than parser strictness: a schema is a cache key and a fingerprint input.
-// Two documents differing only in trailing bytes are the same schema to avrocpp
-// and not a schema at all to the bridge, so a producer on one side can write
-// something the other will not load.
-TEST(AvroBytes, TrailingBytesAfterASchemaAreAcceptedByAvrocppOnly) {
-  // Trailing text that is valid UTF-8: the JSON parser is what refuses it.
-  for (const std::string& suffix : {"\"", "!", " x", "\n\n]"}) {
-    ExpectSchemaAcceptance(R"("string")" + suffix, false, true);
+// The closure is the binding's own rather than an apache-avro patch, and
+// `SetRejectTextAfterSchemaJson` restores the refusal. That setting is off in
+// this binary, as it is by default.
+TEST(AvroBytes, TrailingTextAfterASchemaIsIgnoredByBothEngines) {
+  const auto expect_trailing_text_ignored = [](const std::string& schema,
+                                               const std::string& suffix) {
+    const std::string padded = schema + suffix;
+    ExpectSchemaAcceptance(padded, true, true);
+
+    auto bridge_clean = AvroSchema::Parse(schema);
+    auto bridge_padded = AvroSchema::Parse(padded);
+    ASSERT_TRUE(bridge_clean.ok()) << bridge_clean.status();
+    ASSERT_TRUE(bridge_padded.ok()) << bridge_padded.status();
+    EXPECT_EQ(bridge_padded->CanonicalForm(), bridge_clean->CanonicalForm());
+    EXPECT_EQ(bridge_padded->FingerprintRabin(),
+              bridge_clean->FingerprintRabin());
+
+    ::avro::ValidSchema cpp_clean;
+    ::avro::ValidSchema cpp_padded;
+    ASSERT_TRUE(ParseWithAvrocpp(schema, &cpp_clean).ok());
+    ASSERT_TRUE(ParseWithAvrocpp(padded, &cpp_padded).ok());
+    EXPECT_EQ(cpp_padded.toJson(false), cpp_clean.toJson(false));
+  };
+
+  // Trailing text that is valid UTF-8, then bytes that are not, then a UTF-8
+  // sequence cut short.
+  for (const std::string& suffix : {std::string("\""), std::string("!"),
+                                    std::string(" x"), std::string("\n\n]"),
+                                    std::string("f_\xc3\x28y", 5),
+                                    std::string("l5\xe2\x82", 4)}) {
+    expect_trailing_text_ignored(R"("string")", suffix);
   }
-  // Trailing bytes that are not valid UTF-8, and a UTF-8 sequence cut short.
-  // Both are checked before the text reaches the JSON parser.
-  ExpectSchemaAcceptance(R"("int")" + std::string("f_\xc3\x28y", 5), false,
-                         true);
-  ExpectSchemaAcceptance(R"("double")" + std::string("l5\xe2\x82", 4), false,
-                         true);
 
-  // All three are one shape, which is what the classifier keys on.
-  EXPECT_TRUE(ParsesAsSchemaPrefix(R"("string")"
-                                   "!"));
-  EXPECT_TRUE(ParsesAsSchemaPrefix(R"("int")" + std::string("f_\xc3\x28y", 5)));
-  // A schema that is merely truncated has no prefix that parses, so it stays a
-  // plain schema-acceptance divergence rather than being absorbed here.
-  EXPECT_FALSE(ParsesAsSchemaPrefix(R"({"type":"reco)"));
+  // A whole second document, and a named schema rather than a primitive, so the
+  // fingerprint comparison above has a name and fields to lose.
+  expect_trailing_text_ignored(
+      R"({"type":"record","name":"R","fields":[{"name":"f0","type":"int"}]})",
+      R"( {"type":"record","name":"R2","fields":[]})");
 
-  // Trailing whitespace alone is fine on both sides, so the divergence is the
-  // trailing content and not merely a length mismatch.
-  ExpectSchemaAcceptance(R"("string")"
-                         "  \n",
-                         true, true);
+  // The cut lands at the end of the first document, not at the first byte that
+  // looks like the end of one: the brace and the escaped quote inside `doc` stay
+  // inside the string they are in.
+  expect_trailing_text_ignored(
+      R"({"type":"record","name":"R","doc":"} \" }","fields":[]})", "!");
+
+  // Trailing whitespace was never the divergence, on either side.
+  expect_trailing_text_ignored(R"("string")", "  \n");
+
+  // A document cut short is still rejected by both, and by the binding for the
+  // same reason as before: there is no complete document to fall back to.
+  // Ignoring text after a schema and accepting a schema cut short are different
+  // things, and conflating them would undo A1.
+  ExpectSchemaAcceptance(R"({"type":"reco)", false, false);
+  ExpectSchemaAcceptance(R"(["int")", false, false);
 }
 
 // avrocpp-lenient / "Invalid utf-8 string"
@@ -1598,13 +1613,18 @@ TEST(AvroBytes, ArrayBlockHeaderRecoveryDiverges) {
 // accepts, avro-cpp also accepts. It matters the other way round, when a
 // pipeline that fed avro-cpp a pretty-printed schema containing a form feed
 // starts failing to parse after moving to the bridge.
+//
+// Two positions, not three, since C1 closed. A form feed *after* the document
+// is no longer a disagreement, because the binding now stops at the end of the
+// first document and never reads it. That is not serde_json calling it
+// whitespace, and the difference is what the third case below pins: between two
+// tokens the byte still has to be whitespace to be skipped, and it is not.
 TEST(AvroBytes, VerticalTabAndFormFeedAreWhitespaceOnlyToAvrocpp) {
   for (const char byte : {'\v', '\f'}) {
     const std::string before = std::string(1, byte) + R"("int")";
-    const std::string after = R"("int")" + std::string(1, byte);
     const std::string inside =
         R"({"type":)" + std::string(1, byte) + R"("int"})";
-    for (const std::string& text : {before, after, inside}) {
+    for (const std::string& text : {before, inside}) {
       EXPECT_TRUE(ParseWithAvrocpp(text, nullptr).ok())
           << "avro-cpp is expected to treat 0x" << std::hex
           << static_cast<int>(byte) << " as whitespace: " << text;
@@ -1612,6 +1632,16 @@ TEST(AvroBytes, VerticalTabAndFormFeedAreWhitespaceOnlyToAvrocpp) {
           << "the bridge is expected to reject it; if it now accepts, "
              "serde_json widened its whitespace set and this finding is closed";
     }
+
+    // After the document, both engines now accept, and the binding returns the
+    // schema in front of the byte rather than something else.
+    const std::string after = R"("int")" + std::string(1, byte);
+    EXPECT_TRUE(ParseWithAvrocpp(after, nullptr).ok()) << after;
+    auto clean = AvroSchema::Parse(R"("int")");
+    ASSERT_TRUE(clean.ok()) << clean.status();
+    auto parsed = AvroSchema::Parse(after);
+    ASSERT_TRUE(parsed.ok()) << parsed.status();
+    EXPECT_EQ(parsed->CanonicalForm(), clean->CanonicalForm());
   }
 
   // The four JSON whitespace bytes agree, which is what makes the two above a
@@ -1853,7 +1883,7 @@ TEST(AvroBytes, NestedCollectionsCanLeaveTheDecodersAtDifferentOffsets) {
 }
 
 TEST(AvroBytes, KnownDivergenceTableSizeIsPinned) {
-  EXPECT_EQ(std::size(kKnownDivergences), 10u)
+  EXPECT_EQ(std::size(kKnownDivergences), 9u)
       << "adding an entry means adding a test named after it above; bump this "
          "count once you have";
 }

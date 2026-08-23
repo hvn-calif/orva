@@ -43,6 +43,7 @@ class SettingsEnvironment : public ::testing::Environment {
   void SetUp() override {
     if (!kStrictSettings) return;
     ASSERT_TRUE(SetRejectTrailingBytes(true));
+    ASSERT_TRUE(SetRejectTextAfterSchemaJson(true));
     ASSERT_FALSE(SetNonUtf8StringAsBytes(false));
     ASSERT_FALSE(SetUuidAsString(false));
   }
@@ -420,6 +421,7 @@ TEST(DatumTest, SetMaxAllocationBytesFirstCallWins) {
 // is meant to be; that one is on the CMake block.
 TEST(DatumTest, SettingsMatchTheBuild) {
   EXPECT_EQ(SetRejectTrailingBytes(kStrictSettings), kStrictSettings);
+  EXPECT_EQ(SetRejectTextAfterSchemaJson(kStrictSettings), kStrictSettings);
   EXPECT_EQ(SetNonUtf8StringAsBytes(!kStrictSettings), !kStrictSettings);
   EXPECT_EQ(SetUuidAsString(!kStrictSettings), !kStrictSettings);
 }
@@ -594,6 +596,101 @@ TEST(DatumTest, TrailingBytesFollowTheSetting) {
   auto string_schema = AvroSchema::Parse(R"("string")");
   ASSERT_TRUE(string_schema.ok());
   EXPECT_FALSE(DecodeDatum(*string_schema, Varint(2) + "a").ok());
+}
+
+// C1, the second closure that is this binding's own rather than a patch on
+// apache-avro: serde_json refuses text after a JSON document, and avrocpp's
+// reader stops at the end of the first value and never looks at what follows.
+//
+// Off is the default, which is avrocpp's behaviour, so a document with a NUL
+// pad, a stray byte or a second document behind it still loads. That is worth
+// more than the size of the difference suggests: a schema is a cache key and a
+// fingerprint input, so refusing one avrocpp accepts means a producer on the
+// avrocpp side can write something this side will not load.
+//
+// Trailing whitespace was never at issue on either setting, and one assertion
+// below says so, because it would otherwise look like part of what closed.
+TEST(AvroSchemaTest, TextAfterSchemaJsonFollowsTheSetting) {
+  auto clean = AvroSchema::Parse(R"("string")");
+  ASSERT_TRUE(clean.ok()) << clean.status();
+
+  // The three ways this used to be refused. Only the first reached the JSON
+  // parser; the other two are invalid UTF-8 and a UTF-8 sequence cut short,
+  // which the whole-buffer UTF-8 check caught before any parsing, which is why
+  // the cut is made on bytes rather than on text.
+  for (const std::string& text : {
+           std::string(R"("string")") + "!",
+           std::string(R"("string")") + std::string("f_\xc3\x28y", 5),
+           std::string(R"("string")") + std::string("l5\xe2\x82", 4),
+       }) {
+    auto parsed = AvroSchema::Parse(text);
+    if (kStrictSettings) {
+      EXPECT_FALSE(parsed.ok()) << text;
+      continue;
+    }
+    ASSERT_TRUE(parsed.ok()) << parsed.status();
+    // Accepting it is not enough: it has to be the schema the document in front
+    // of the trailing text describes, since a schema that parsed into something
+    // else would corrupt every fingerprint taken from it.
+    EXPECT_TRUE(parsed->IsString());
+    EXPECT_EQ(parsed->CanonicalForm(), clean->CanonicalForm());
+    EXPECT_EQ(parsed->FingerprintRabin(), clean->FingerprintRabin());
+  }
+
+  // Trailing whitespace is not trailing text on either setting: serde_json
+  // accepts it, so it is the one padded input that never needed this closure.
+  EXPECT_TRUE(AvroSchema::Parse(R"("string")"
+                                "  \n")
+                  .ok());
+
+  // The cut lands at the end of the first document, not at the first byte that
+  // looks like the end of one: the brace and the escaped quote inside `doc` stay
+  // inside the string they are in.
+  const std::string braces_in_a_string =
+      R"({"type":"record","name":"R","doc":"} \" }","fields":[]})";
+  auto with_braces = AvroSchema::Parse(braces_in_a_string);
+  ASSERT_TRUE(with_braces.ok()) << with_braces.status();
+  auto padded_braces = AvroSchema::Parse(braces_in_a_string + "!");
+  EXPECT_EQ(padded_braces.ok(), !kStrictSettings);
+  if (padded_braces.ok()) {
+    EXPECT_EQ(padded_braces->ToJsonString().value_or(""),
+              with_braces->ToJsonString().value_or("unset"));
+  }
+
+  // ParseList applies it to each document, and the second one here carries a
+  // whole second JSON document rather than a stray byte.
+  const std::string address =
+      R"({"type":"record","name":"Address","fields":[
+          {"name":"city","type":"string"}]})";
+  const std::string person =
+      R"({"type":"record","name":"Person","fields":[
+          {"name":"address","type":"Address"}]})";
+  const std::string padded_address = address + "!";
+  const std::string padded_person = person + R"( {"stray":1})";
+  const std::vector<absl::string_view> jsons = {padded_address, padded_person};
+  auto list = AvroSchema::ParseList(jsons);
+  EXPECT_EQ(list.ok(), !kStrictSettings);
+  if (list.ok()) {
+    ASSERT_EQ(list->size(), 2u);
+    EXPECT_EQ((*list)[0].Name().value_or(""), "Address");
+    EXPECT_EQ((*list)[1].Name().value_or(""), "Person");
+  }
+
+  // A document cut short is rejected under both settings. Ignoring text after a
+  // complete schema and accepting a schema cut short are different things, and
+  // conflating them is what A1 above was about.
+  EXPECT_FALSE(AvroSchema::Parse(R"({"type":"reco)").ok());
+  EXPECT_FALSE(AvroSchema::Parse(R"(["int")").ok());
+  EXPECT_FALSE(AvroSchema::Parse("").ok());
+
+  // And a complete document that is not a legal schema reports why, rather than
+  // reporting the trailing text that is no longer the problem.
+  auto illegal = AvroSchema::Parse(R"({"type":"nonsense"}!)");
+  ASSERT_FALSE(illegal.ok());
+  if (!kStrictSettings) {
+    EXPECT_EQ(illegal.status().message(),
+              AvroSchema::Parse(R"({"type":"nonsense"})").status().message());
+  }
 }
 
 // Not a closure but a default this binding chose: avrocpp copies a `string`'s

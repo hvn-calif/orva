@@ -173,24 +173,24 @@ findings 8 and 9 were attributed to `GenericDatum::init` and
 
 ## Expected state of the test suites
 
-`avro_bytes_fuzz_test`: **22/22 pass** with no environment variables, and also
+`avro_bytes_fuzz_test`: **28/28 pass** with no environment variables, and also
 under `ASAN_OPTIONS=detect_leaks=0` and with `allocator_may_return_null=1`.
 If it fails, the fuzz properties found something new, which is the design.
 
-`avro_bridge_test`: **63/63**, and `avro_bridge_strict_test` is the same 63 built
+`avro_bridge_test`: **64/64**, and `avro_bridge_strict_test` is the same 64 built
 from the same source with `AVRO_BRIDGE_TEST_STRICT_SETTINGS` defined, so
-**126/126** across the two. Every setting `avro_bridge.h` exposes is a set-once
+**128/128** across the two. Every setting `avro_bridge.h` exposes is a set-once
 process global, so one process can observe only one value of each; the second
 binary is how the strict value of each gets tested at all. A test whose outcome
 depends on a setting branches on `kStrictSettings` rather than being duplicated.
 
-The bridge's own Rust suite is **65 tests** across four binaries (`cargo test` in
+The bridge's own Rust suite is **71 tests** across four binaries (`cargo test` in
 `rust/`). It was 70 across five: `tests/reject_trailing_bytes.rs` existed only
 because a `OnceLock` cannot be reset in-process, and the second C++ binary
 replaced it.
 
-`ctest` on the whole project: **249/255 or 250/255**, and `ctest -R AvroBytes` is
-22/22. The total is not stable, and that is worth understanding before reading any
+`ctest` on the whole project: **257/263 or 258/263**, and `ctest -R AvroBytes` is
+28/28. The total is not stable, and that is worth understanding before reading any
 change in it as a regression.
 
 Six tests do not pass. Five are by design and one is avro-cpp's own
@@ -228,13 +228,18 @@ stale rather than as a regression:
 | before `avro_bytes_fuzz_test` joined the build | 150/156 (`report.md` section 7) | -- |
 | after the one-hour runs' findings | 174/180 | 20/20 |
 | after the divergence-closure series | 176-177/182 | 21/21 |
-| after the closures were pinned in `avro_bridge_test` | **249-250/255** | **22/22** |
+| after the closures were pinned in `avro_bridge_test` | 249-250/255 | 22/22 |
+| after decoded values were compared, and after C1 | **257-258/263** | **28/28** |
 
-The last jump is 73 tests and almost none of it is coverage of new ground: six
+The 249-250 jump is 73 tests and almost none of it is coverage of new ground: six
 pin the Tier A and Tier B closures on the bridge's side of the comparison, one
 guards the toggle, two pin non-finite float handling, and the other sixty-three
 are the second build of the same source under
 `AVRO_BRIDGE_TEST_STRICT_SETTINGS`. The five non-passes did not change.
+
+The eight after it are six from the value comparison, all in the byte harness,
+and two from C1: one test, built twice. C1 replaced a test rather than adding
+one on the byte side, so `AvroBytes` did not move for it.
 
 Two things moved the totals before that: one differential test split in two when
 the empty union and empty enum closed separately, and one new test pinned finding
@@ -251,10 +256,54 @@ Fifteen. Each has a test in `avro_bytes_fuzz_test.cc` or
 **Closing them is now the work**, per `doc/specs/DivergenceClosure.md`, which
 orders thirteen patches easiest first and records the policy they follow:
 avro-cpp's behaviour is the bridge's default, and every deviation from it is
-reachable through a knob. `kKnownDivergences` is down from 11 entries to 6; the
-pin in `KnownDivergenceTableSizeIsPinned` moves with it.
+reachable through a knob. `kKnownDivergences` started at 11 entries and is at
+**9**; the pin in `KnownDivergenceTableSizeIsPinned` moves with it. It went *up*
+in between rather than only down: comparing decoded values instead of re-encoded
+bytes added four entries, so any count of 6 or 7 in an older document here is
+stale rather than a regression.
 
-**Tier B is done too**, and it is the only bridge-side patch in the series:
+**Tier C has begun with C1, text after the schema JSON**, and it is the second
+bridge-side closure rather than the crate knob the spec first specified:
+`SetRejectTextAfterSchemaJson` in `avro_bridge.h`, off by default, because
+avrocpp's JSON reader stops at the end of the first document and never looks at
+what follows. `AvroSchema::Parse` and `ParseList` now cut the input at the end of
+its first JSON document and parse that, and only after the whole buffer has
+already failed, so an input that parses today cannot change meaning.
+
+Two things worth carrying forward from it:
+
+- **Only one of the three refusals came from serde_json.** The other two, invalid
+  UTF-8 and a UTF-8 sequence cut short, came from `AvroSchema::parse` validating
+  the *whole* buffer as UTF-8 before parsing anything, so bytes after a perfectly
+  good schema were enough to lose it. That is why the cut is made on bytes.
+- **A knob inside `Schema::parse_str` would not have covered the container file
+  header.** `Reader::new` reads the `avro.schema` metadata with
+  `serde_json::from_slice` (`reader.rs:221`) and parses the resulting `Value`, a
+  separate site from `Parser::parse_str`. So the header is a residual gap under
+  every option: a container file whose embedded schema carries trailing text is
+  still refused, and avrocpp's behaviour there is unmeasured because the harness
+  has no object-container coverage.
+
+C1 also **narrowed the vertical-tab and form-feed finding** (row 13 below) from
+three positions to two, without being asked to: a form feed after the document is
+no longer read at all. That is not serde_json accepting it as whitespace, and the
+test pins the difference -- before the document and between two tokens, both bytes
+are still rejected.
+
+Verified the way the earlier closures were: the property that would catch a
+recurrence, `AvroBytes.ParsersAgreeOnSchemaAcceptance`, ran 20 minutes in the
+fuzzing tree with the table entry already removed -- **28.4 million executions,
+exit 0, nothing found**. That run also covers the other direction, which is the
+one a closure like this can break: the property reports a verdict difference
+either way, and `schema-acceptance` is muted only for "Invalid namespace", so a
+schema the binding now accepts and avrocpp rejects would have failed it.
+
+`ParsesAsSchemaPrefix` was deleted with the closure, for the same reason
+`TrailingBytesExplainIt` was deleted with B1: it never looked at *why* the binding
+rejected, so with trailing text no longer a reason to reject, it would have named
+the wrong cause for the next rejection that happened to have a parsing prefix.
+
+**Tier B is done too**, and it is the first bridge-side patch in the series:
 `SetRejectTrailingBytes` in `avro_bridge.h`, off by default, because
 apache-avro's `from_avro_datum` already stops at the end of the first datum like
 avro-cpp and the rejection was the bridge's own addition at `rust/datum.rs`. It is
@@ -358,7 +407,7 @@ Five more divergences came out of the parallel hour-long runs, all written up in
 | --- | --- | --- |
 | 11 | `GenericDatum(NodePtr)` recurses to SIGSEGV on a record-only name cycle | avro-cpp crashes |
 | 12 | declared block count reserved before reading items | avro-cpp allocates unboundedly |
-| 13 | vertical tab and form feed accepted as JSON whitespace | avro-cpp accepts |
+| 13 | vertical tab and form feed accepted as JSON whitespace | avro-cpp accepts, in two positions of three since C1 |
 | 14 | array of `null`: both accept, lengths differ, and differ by build | **value divergence** |
 | 15 | a 16-byte string under `uuid` is read as a binary uuid | **CLOSED**, bridge default |
 
@@ -522,6 +571,10 @@ is a plain bridge bug and belongs in its own document.
    uninvestigated, and findings 3 and 4 both land on schema handling. Sketched
    in the plan as an `EvolvePlan` edit applied to the writer tree.
 6. **Object container round-trips** across the null, deflate and snappy codecs.
+   Two open items need this coverage before they can be settled: A5, a file cut
+   inside a block-count varint reading as a clean end, and the header schema's
+   trailing-text behaviour, which C1 did not reach because `Reader::new` parses
+   the `avro.schema` metadata itself.
 7. **Register entries.** The new divergences need `D13`+ entries in
    `doc/AvrocppDivergences.md` on `main`. That file does not exist on this
    branch, so nothing was added to it.
