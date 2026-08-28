@@ -1,0 +1,269 @@
+From bb6f9a55f483be47c561c5a3dd8496c6653c5f77 Mon Sep 17 00:00:00 2001
+From: Viet Hung Nguyen <hvn@calif.io>
+Date: Tue, 18 Aug 2026 19:12:53 +0700
+Subject: [PATCH] fix: Do not fabricate a value when the input runs out
+ mid-datum
+
+Three arms of `decode_internal` treated `ErrorKind::UnexpectedEof` as a value
+rather than as an error, so a truncated buffer decoded successfully into data
+that was never on the wire:
+
+  Schema::Boolean  ->  Ok(Value::Null)
+  Schema::String   ->  Ok(Value::Null)
+  Schema::Union    ->  Ok(Value::Union(0, Box::new(Value::Null)))
+
+None of the three inhabits the schema it was decoded under. `null` is not a
+value of `boolean` or of `string`, and branch 0 of a union is only `null` when
+the union happens to declare it first, so `["int"]` yielded a union whose
+payload had the wrong type. A record of two booleans decoded from zero bytes
+into a record of two nulls, with an Ok status and no indication that nothing had
+been read. Apache Avro C++ reports "EOF reached" for every one of these.
+
+All three now propagate the io error. `Schema::Null` still decodes from an empty
+buffer, which is correct: a `null` datum occupies zero bytes, so the fix could
+not be "reject an empty buffer".
+
+This is not additive for existing consumers, unlike the two settings-based
+patches. `test_from_avro_datum_with_union_to_struct` relied on the union arm
+directly: its payload encodes two of the record's five fields and let the three
+trailing unions decode from nothing, described in the test as simulating missing
+keys. Truncation is not the same thing as a writer that lacked those fields,
+which is what schema resolution is for, so the test now asserts the error and
+gained a companion payload with all five fields encoded. It still covers what it
+was written for, a key absent from the target struct, via the field the struct
+omits.
+
+Verified on apache-avro 0.21 with the non-UTF-8 and uuid patches applied:
+`cargo test -p apache-avro --features derive` goes from 558 to 562, the four
+tests this adds. `cargo fmt --check` clean, and clippy reports nothing in
+`decode.rs` or `reader.rs`.
+---
+ avro/src/decode.rs | 154 ++++++++++++++++++++++++++-------------------
+ avro/src/reader.rs |  13 +++-
+ 2 files changed, 102 insertions(+), 65 deletions(-)
+
+diff --git a/avro/src/decode.rs b/avro/src/decode.rs
+index d3a0729..e5ef5fb 100644
+--- a/avro/src/decode.rs
++++ b/avro/src/decode.rs
+@@ -16,7 +16,7 @@
+ // under the License.
+ 
+ use crate::{
+-    AvroResult, Error,
++    AvroResult,
+     bigdecimal::deserialize_big_decimal,
+     decimal::Decimal,
+     duration::Duration,
+@@ -28,11 +28,7 @@ use crate::{
+     types::{Value, ValueKind},
+     util::{non_utf8_string_as_bytes, safe_len, uuid_as_string, zag_i32, zag_i64},
+ };
+-use std::{
+-    borrow::Borrow,
+-    collections::HashMap,
+-    io::{ErrorKind, Read},
+-};
++use std::{borrow::Borrow, collections::HashMap, io::Read};
+ use uuid::Uuid;
+ 
+ #[inline]
+@@ -86,19 +82,13 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
+         Schema::Null => Ok(Value::Null),
+         Schema::Boolean => {
+             let mut buf = [0u8; 1];
+-            match reader.read_exact(&mut buf[..]) {
+-                Ok(_) => match buf[0] {
+-                    0u8 => Ok(Value::Boolean(false)),
+-                    1u8 => Ok(Value::Boolean(true)),
+-                    _ => Err(Details::BoolValue(buf[0]).into()),
+-                },
+-                Err(io_err) => {
+-                    if let ErrorKind::UnexpectedEof = io_err.kind() {
+-                        Ok(Value::Null)
+-                    } else {
+-                        Err(Details::ReadBoolean(io_err).into())
+-                    }
+-                }
++            reader
++                .read_exact(&mut buf[..])
++                .map_err(Details::ReadBoolean)?;
++            match buf[0] {
++                0u8 => Ok(Value::Boolean(false)),
++                1u8 => Ok(Value::Boolean(true)),
++                _ => Err(Details::BoolValue(buf[0]).into()),
+             }
+         }
+         Schema::Decimal(DecimalSchema { ref inner, .. }) => match &**inner {
+@@ -183,30 +173,22 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
+         Schema::String => {
+             let len = decode_len(reader)?;
+             let mut buf = vec![0u8; len];
+-            match reader.read_exact(&mut buf) {
+-                // Avro specifies `string` as UTF-8, but writers exist that
+-                // never enforced it (avro-cpp copies the bytes into a
+-                // byte-oriented `std::string` unchecked; Java's `Utf8` holds a
+-                // raw `byte[]`), so rejecting makes their data unreadable.
+-                // Opt-in, since accepting them changes the variant a caller
+-                // gets: see `util::set_non_utf8_string_as_bytes`.
+-                // `Value::Bytes` rather than an escape into `String`: keeping
+-                // the variants distinct keeps the wire-bytes-to-value mapping
+-                // injective, so re-encoding is unambiguous. `into_bytes`
+-                // reuses the same buffer.
+-                Ok(_) => Ok(match String::from_utf8(buf) {
+-                    Ok(string) => Value::String(string),
+-                    Err(error) if non_utf8_string_as_bytes() => Value::Bytes(error.into_bytes()),
+-                    Err(error) => return Err(Details::ConvertToUtf8(error).into()),
+-                }),
+-                Err(io_err) => {
+-                    if let ErrorKind::UnexpectedEof = io_err.kind() {
+-                        Ok(Value::Null)
+-                    } else {
+-                        Err(Details::ReadString(io_err).into())
+-                    }
+-                }
+-            }
++            reader.read_exact(&mut buf).map_err(Details::ReadString)?;
++            // Avro specifies `string` as UTF-8, but writers exist that never
++            // enforced it (avro-cpp copies the bytes into a byte-oriented
++            // `std::string` unchecked; Java's `Utf8` holds a raw `byte[]`), so
++            // rejecting makes their data unreadable. Opt-in, since accepting
++            // them changes the variant a caller gets: see
++            // `util::set_non_utf8_string_as_bytes`.
++            // `Value::Bytes` rather than an escape into `String`: keeping the
++            // variants distinct keeps the wire-bytes-to-value mapping
++            // injective, so re-encoding is unambiguous. `into_bytes` reuses the
++            // same buffer.
++            Ok(match String::from_utf8(buf) {
++                Ok(string) => Value::String(string),
++                Err(error) if non_utf8_string_as_bytes() => Value::Bytes(error.into_bytes()),
++                Err(error) => return Err(Details::ConvertToUtf8(error).into()),
++            })
+         }
+         Schema::Fixed(FixedSchema { size, .. }) => {
+             let mut buf = vec![0u8; size];
+@@ -273,27 +255,18 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
+ 
+             Ok(Value::Map(items))
+         }
+-        Schema::Union(ref inner) => match zag_i64(reader).map_err(Error::into_details) {
+-            Ok(index) => {
+-                let variants = inner.variants();
+-                let variant = variants
+-                    .get(usize::try_from(index).map_err(|e| Details::ConvertI64ToUsize(e, index))?)
+-                    .ok_or(Details::GetUnionVariant {
+-                        index,
+-                        num_variants: variants.len(),
+-                    })?;
+-                let value = decode_internal(variant, names, enclosing_namespace, reader)?;
+-                Ok(Value::Union(index as u32, Box::new(value)))
+-            }
+-            Err(Details::ReadVariableIntegerBytes(io_err)) => {
+-                if let ErrorKind::UnexpectedEof = io_err.kind() {
+-                    Ok(Value::Union(0, Box::new(Value::Null)))
+-                } else {
+-                    Err(Details::ReadVariableIntegerBytes(io_err).into())
+-                }
+-            }
+-            Err(io_err) => Err(Error::new(io_err)),
+-        },
++        Schema::Union(ref inner) => {
++            let index = zag_i64(reader)?;
++            let variants = inner.variants();
++            let variant = variants
++                .get(usize::try_from(index).map_err(|e| Details::ConvertI64ToUsize(e, index))?)
++                .ok_or(Details::GetUnionVariant {
++                    index,
++                    num_variants: variants.len(),
++                })?;
++            let value = decode_internal(variant, names, enclosing_namespace, reader)?;
++            Ok(Value::Union(index as u32, Box::new(value)))
++        }
+         Schema::Record(RecordSchema {
+             ref name,
+             ref fields,
+@@ -957,4 +930,57 @@ mod tests {
+         )
+         .expect_err("Value::Bytes must not encode as a string with the setting off");
+     }
++
++    /// A buffer that runs out mid-datum must report the error rather than
++    /// substitute a value. Three arms used to swallow `UnexpectedEof` and
++    /// return `Value::Null`, which is not a value of `boolean`, of `string`,
++    /// or of a union whose first branch is not `null`. avro-cpp reports
++    /// "EOF reached" for every case here.
++    #[test]
++    fn truncated_input_is_an_error_not_a_fabricated_null() {
++        let cases: &[(&str, Schema, &[u8])] = &[
++            ("boolean, no bytes at all", Schema::Boolean, &[]),
++            // A length prefix of 2 with one byte behind it.
++            ("string, truncated payload", Schema::String, &[0x04, 0x61]),
++            ("bytes, truncated payload", Schema::Bytes, &[0x04, 0x61]),
++        ];
++        for (case, schema, mut input) in cases.iter().map(|(c, s, i)| (c, s, *i)) {
++            decode(schema, &mut input).expect_err(&format!("{case} must not decode"));
++        }
++    }
++
++    /// The union arm's fabrication was worse than the others, because the
++    /// value it invented was `Value::Union(0, Null)` whatever branch 0 held.
++    #[test]
++    fn truncated_union_is_an_error_even_when_branch_zero_is_null() {
++        for text in [r#"["int"]"#, r#"["null","int"]"#] {
++            let schema = Schema::parse_str(text).unwrap();
++            let mut empty: &[u8] = &[];
++            decode(&schema, &mut empty)
++                .expect_err(&format!("{text} has no branch index in an empty buffer"));
++        }
++    }
++
++    /// The shape a caller actually meets: a record whose fields are all
++    /// booleans decoded from zero bytes used to succeed with every field
++    /// `null`, so a truncated message arrived as data rather than as an error.
++    #[test]
++    fn a_record_of_booleans_does_not_decode_from_an_empty_buffer() {
++        let schema = Schema::parse_str(
++            r#"{"type":"record","name":"R","fields":[
++                 {"name":"a","type":"boolean"},{"name":"b","type":"boolean"}]}"#,
++        )
++        .unwrap();
++        let mut empty: &[u8] = &[];
++        decode(&schema, &mut empty).expect_err("an empty buffer holds no record");
++    }
++
++    /// `null` occupies zero bytes, so an empty buffer really is a whole `null`
++    /// datum. This is the one case that must keep succeeding, and it is why the
++    /// fix could not be "reject an empty buffer".
++    #[test]
++    fn null_still_decodes_from_an_empty_buffer() {
++        let mut empty: &[u8] = &[];
++        assert_eq!(decode(&Schema::Null, &mut empty).unwrap(), Value::Null);
++    }
+ }
+diff --git a/avro/src/reader.rs b/avro/src/reader.rs
+index e2f7570..ef05694 100644
+--- a/avro/src/reader.rs
++++ b/avro/src/reader.rs
+@@ -702,7 +702,18 @@ mod tests {
+         }
+ 
+         let schema = Schema::parse_str(TEST_RECORD_SCHEMA_3240)?;
+-        let mut encoded: &'static [u8] = &[54, 6, 102, 111, 111];
++
++        // Only `a` and `b` are on the wire; the three union fields that follow
++        // have no bytes at all. A truncated buffer is not the same thing as a
++        // writer that did not have those fields, which is what schema
++        // resolution is for, so this must fail rather than yield a record.
++        let mut truncated: &'static [u8] = &[54, 6, 102, 111, 111];
++        assert!(from_avro_datum(&schema, &mut truncated, None).is_err());
++
++        // Every field encoded, the three unions each selecting their `null`
++        // branch. The struct omits `a_nullable_boolean`, so this still covers
++        // what the test was written for: a key missing from the target struct.
++        let mut encoded: &'static [u8] = &[54, 6, 102, 111, 111, 0, 0, 0];
+ 
+         let expected_record: TestRecord3240 = TestRecord3240 {
+             a: 27i64,
+-- 
+2.52.0
+

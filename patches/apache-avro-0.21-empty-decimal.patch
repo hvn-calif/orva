@@ -1,0 +1,93 @@
+From 9786b7e45a4912c6bd43a5b184d9796de894a754 Mon Sep 17 00:00:00 2001
+From: Viet Hung Nguyen <hvn@calif.io>
+Date: Tue, 18 Aug 2026 20:09:34 +0700
+Subject: [PATCH] fix: Let a zero-length unscaled decimal value round-trip
+
+A `bytes` decimal whose length prefix is 0 carries a zero-length unscaled value.
+Decoding it succeeded and produced a `Decimal`, but that value could then be
+neither read nor re-encoded: `to_vec`, `TryFrom<&Decimal> for Vec<u8>` and the
+encoder all failed with the same sign-extension error. A caller who decoded such
+an input had no way to use or forward the result, which is worse than either
+accepting or rejecting it. Apache Avro C++ decodes it and re-encodes it to the
+byte it came from.
+
+`Decimal::from(&[])` stores `len = 0` and `value = 0`, since
+`BigInt::from_signed_bytes_be(&[])` is zero. In
+`to_sign_extended_bytes_with_len`, `BigInt::to_signed_bytes_be()` of zero is one
+byte, so `num_raw_bytes` is 1 and `len.checked_sub(1)` on `len == 0` underflows
+into `Details::SignExtend { requested: 0, needed: 1 }`.
+
+The guard returns the empty slice for a zero value at `len == 0`, which is the
+byte sequence the value was decoded from. It is deliberately narrow: a non-zero
+value asked for zero bytes still has nowhere to put them and still fails, and a
+zero value asked for a wider field is still sign-extended as before. Both are
+pinned by `asking_for_too_few_bytes_still_fails`.
+
+Whether the input is well formed at all is a separate question and not one this
+patch takes a position on. Avro describes an unscaled value as a two's-complement
+big-endian integer, which needs at least one byte, so rejecting a zero-length one
+would also be defensible; avro-cpp accepts it, so the bridge follows avro-cpp.
+
+Verified on apache-avro 0.21 with the four patches before it applied:
+`cargo test -p apache-avro --features derive` goes from 565 to 567,
+`cargo fmt --check` clean, and clippy reports nothing in `decimal.rs`.
+---
+ avro/src/decimal.rs | 37 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/avro/src/decimal.rs b/avro/src/decimal.rs
+index c219b5d..c531050 100644
+--- a/avro/src/decimal.rs
++++ b/avro/src/decimal.rs
+@@ -89,6 +89,15 @@ impl Decimal {
+     }
+ 
+     pub(crate) fn to_sign_extended_bytes_with_len(&self, len: usize) -> AvroResult<Vec<u8>> {
++        // A zero-length unscaled value is what a `bytes` decimal holds when its
++        // length prefix is 0, and `BigInt::from_signed_bytes_be(&[])` is zero, so
++        // the round trip has to give the empty slice back. Without this the
++        // sign-extension arithmetic below underflows: `to_signed_bytes_be()` of
++        // zero is one byte, so `len.checked_sub(1)` on `len == 0` fails and a
++        // decoded value could be neither read nor re-encoded.
++        if len == 0 && self.value.sign() == Sign::NoSign {
++            return Ok(Vec::new());
++        }
+         let sign_byte = 0xFF * u8::from(self.value.sign() == Sign::Minus);
+         let mut decimal_bytes = vec![sign_byte; len];
+         let raw_bytes = self.value.to_signed_bytes_be();
+@@ -190,4 +199,32 @@ mod tests {
+ 
+         Ok(())
+     }
++
++    /// A `bytes` decimal whose length prefix is 0 carries a zero-length unscaled
++    /// value. Apache Avro C++ decodes that and re-encodes it to the byte it came
++    /// from; this used to decode to a `Decimal` that neither yielded its bytes
++    /// nor re-encoded, both failing with a sign-extension error, so a caller
++    /// could not use or forward the result.
++    #[test]
++    fn a_zero_length_unscaled_value_round_trips() {
++        let decimal = Decimal::from(Vec::<u8>::new());
++        assert_eq!(decimal.len(), 0);
++        assert_eq!(decimal.to_vec().unwrap(), Vec::<u8>::new());
++        assert_eq!(<Vec<u8>>::try_from(&decimal).unwrap(), Vec::<u8>::new());
++    }
++
++    /// The guard is on the empty case alone. A non-zero value asked for zero
++    /// bytes still has nowhere to put them, and a zero value asked for a wider
++    /// field is still sign-extended as before.
++    #[test]
++    fn asking_for_too_few_bytes_still_fails() {
++        let one = Decimal::from(vec![1u8]);
++        assert!(one.to_sign_extended_bytes_with_len(0).is_err());
++
++        let zero = Decimal::from(Vec::<u8>::new());
++        assert_eq!(
++            zero.to_sign_extended_bytes_with_len(4).unwrap(),
++            vec![0u8; 4]
++        );
++    }
+ }
+-- 
+2.52.0
+

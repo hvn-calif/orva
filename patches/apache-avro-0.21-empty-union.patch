@@ -1,0 +1,165 @@
+From d2b5acabd414a4e1fa8ad65e155c82998e62c05d Mon Sep 17 00:00:00 2001
+From: Viet Hung Nguyen <hvn@calif.io>
+Date: Tue, 18 Aug 2026 19:47:44 +0700
+Subject: [PATCH] fix: Reject a union with no members
+
+`[]` parsed, and re-rendered as `[]`. No branch index is in range for an empty
+union, so nothing can be encoded into one and no byte sequence decodes under
+one: it is a schema with no inhabitants that the crate nevertheless accepted and
+round-tripped. Apache Avro C++ rejects it as a "bad node of type union", so a
+schema this crate produced could not be read there.
+
+`UnionSchema::new` now returns the existing `Details::EmptyUnion` rather than
+building it. No new error variant, and no signature change. The fields of
+`UnionSchema` are crate-private, so `new` is the only way an external caller
+builds one, and the single struct-literal construction inside the crate
+(`schema.rs`, the nullable wrapper) always supplies two branches. The check
+therefore holds for every union the crate can produce.
+
+`parse_union` used to log an error for the empty case and carry on. That line is
+gone, since the condition is now an error at the point it is detected.
+
+Not additive, like the strict-eof patch and unlike the two settings-based ones.
+Two upstream tests asserted the old behaviour:
+
+- `schema::tests::avro_3946_union_without_any_types` parsed a record with a
+  `"type": []` field and asserted only that the log line was emitted. It now
+  asserts the parse fails.
+- `schema_compatibility::tests::test_compatible_reader_writer_pairs` carried two
+  rows built from an `empty_union_schema()` helper. Both were vacuous, since no
+  value inhabits an empty union, and the helper is removed with them.
+
+Verified on apache-avro 0.21 with the non-UTF-8, uuid and strict-eof patches
+applied: `cargo test -p apache-avro --features derive` goes from 562 to 564, the
+two tests this adds. `cargo fmt --check` clean, and clippy reports nothing new
+in the changed files -- the four `result_large_err` and `useless_vec` warnings
+there are present without this patch.
+---
+ avro/src/schema.rs               | 55 +++++++++++++++++++++++---------
+ avro/src/schema_compatibility.rs |  9 ++----
+ 2 files changed, 43 insertions(+), 21 deletions(-)
+
+diff --git a/avro/src/schema.rs b/avro/src/schema.rs
+index b8907e6..d14853f 100644
+--- a/avro/src/schema.rs
++++ b/avro/src/schema.rs
+@@ -27,7 +27,7 @@ use crate::{
+     },
+ };
+ use digest::Digest;
+-use log::{debug, error, warn};
++use log::{debug, warn};
+ use serde::{
+     Deserialize, Serialize, Serializer,
+     ser::{SerializeMap, SerializeSeq},
+@@ -912,6 +912,9 @@ pub struct UnionSchema {
+ impl UnionSchema {
+     /// Creates a new UnionSchema from a vector of schemas.
+     pub fn new(schemas: Vec<Schema>) -> AvroResult<Self> {
++        if schemas.is_empty() {
++            return Err(Details::EmptyUnion.into());
++        }
+         let mut vindex = BTreeMap::new();
+         for (i, schema) in schemas.iter().enumerate() {
+             if let Schema::Union(_) = schema {
+@@ -1965,13 +1968,9 @@ impl Parser {
+             .map(|v| self.parse(v, enclosing_namespace))
+             .collect::<Result<Vec<_>, _>>()
+             .and_then(|schemas| {
+-                if schemas.is_empty() {
+-                    error!(
+-                        "Union schemas should have at least two members! \
+-                    Please enable debug logging to find out which Record schema \
+-                    declares the union with 'RUST_LOG=apache_avro::schema=debug'."
+-                    );
+-                } else if schemas.len() == 1 {
++                // An empty union is rejected by UnionSchema::new below, so the
++                // log line that used to stand in for that check is gone.
++                if schemas.len() == 1 {
+                     warn!(
+                         "Union schema with just one member! Consider dropping the union! \
+                     Please enable debug logging to find out which Record schema \
+@@ -7063,13 +7062,10 @@ mod tests {
+           ]
+         }"#;
+ 
+-        let _ = Schema::parse_str(schema)?;
+-
+-        assert_logged(
+-            "Union schemas should have at least two members! \
+-                    Please enable debug logging to find out which Record schema \
+-                    declares the union with 'RUST_LOG=apache_avro::schema=debug'.",
+-        );
++        // Used to parse and only log. An empty union has no branch index in
++        // range, so nothing can be encoded into it and no bytes decode under
++        // it; it is now rejected. See avro_rs_empty_union_is_rejected.
++        assert!(Schema::parse_str(schema).is_err());
+ 
+         Ok(())
+     }
+@@ -7314,4 +7310,33 @@ mod tests {
+ 
+         Ok(())
+     }
++
++    /// No branch index is in range for an empty union, so no byte sequence
++    /// decodes under one and nothing can be encoded into one. Apache Avro C++
++    /// rejects it as a "bad node of type union"; this crate used to parse it
++    /// and re-render it as `[]`, so a schema it accepted could not be read by
++    /// avro-cpp.
++    #[test]
++    fn avro_rs_empty_union_is_rejected() {
++        for text in [
++            r#"[]"#,
++            r#"[[]]"#,
++            r#"{"type":"record","name":"R","fields":[{"name":"a","type":[]}]}"#,
++            r#"{"type":"array","items":[]}"#,
++            r#"{"type":"map","values":[]}"#,
++        ] {
++            let parsed = Schema::parse_str(text);
++            assert!(parsed.is_err(), "{text} should not parse: {parsed:?}");
++        }
++
++        // A one-branch union stays legal. It only warns, and index 0 is in
++        // range, so it has a valid encoding.
++        assert!(Schema::parse_str(r#"["int"]"#).is_ok());
++    }
++
++    #[test]
++    fn avro_rs_empty_union_is_rejected_by_the_constructor_too() {
++        assert!(UnionSchema::new(vec![]).is_err());
++        assert!(UnionSchema::new(vec![Schema::Int]).is_ok());
++    }
+ }
+diff --git a/avro/src/schema_compatibility.rs b/avro/src/schema_compatibility.rs
+index 3fec12a..6bcf128 100644
+--- a/avro/src/schema_compatibility.rs
++++ b/avro/src/schema_compatibility.rs
+@@ -642,10 +642,6 @@ mod tests {
+         Schema::parse_str(&format!("[{schema_string}]")).unwrap()
+     }
+ 
+-    fn empty_union_schema() -> Schema {
+-        union_schema(vec![])
+-    }
+-
+     // unused
+     // fn null_union_schema() -> Schema { union_schema(vec![Schema::Null]) }
+ 
+@@ -1044,10 +1040,11 @@ mod tests {
+             (long_map_schema(), int_map_schema()),
+             (enum1_ab_schema(), enum1_ab_schema()),
+             (enum1_abc_schema(), enum1_ab_schema()),
+-            (empty_union_schema(), empty_union_schema()),
++            // The two rows that paired an empty union with something were
++            // removed: an empty union no longer parses, and both were
++            // vacuous anyway, since no value can inhabit one.
+             (int_union_schema(), int_union_schema()),
+             (int_string_union_schema(), string_int_union_schema()),
+-            (int_union_schema(), empty_union_schema()),
+             (long_union_schema(), int_union_schema()),
+             (int_union_schema(), Schema::Int),
+             (Schema::Int, int_union_schema()),
+-- 
+2.52.0
+

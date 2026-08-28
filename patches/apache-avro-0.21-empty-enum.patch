@@ -1,0 +1,116 @@
+From 187ce7d8a350f88a1a81ace32c146abf025a70a7 Mon Sep 17 00:00:00 2001
+From: Viet Hung Nguyen <hvn@calif.io>
+Date: Tue, 18 Aug 2026 19:59:57 +0700
+Subject: [PATCH] fix: Reject an enum with no symbols
+
+`{"type":"enum","name":"E","symbols":[]}` parsed. No symbol index is in range for
+an empty enum, so it has no valid encoding: the same defect as the empty union in
+the previous commit, on a different construct. Apache Avro C++ rejects it as a
+"bad node of type enum", so a schema this crate accepted was unreadable there.
+
+`parse_enum` now returns an error once it has collected the symbols. This covers
+the parse path, which is where untrusted input arrives, and not every possible
+construction: unlike `UnionSchema`, whose fields are crate-private so `new` is
+the only external route, `EnumSchema` has public fields and a `bon` builder, so a
+caller can still hand-build one with no symbols.
+
+Adds `Details::EnumEmptySymbols`. The two existing enum variants describe parse
+failures (`GetEnumSymbolsField`, `GetEnumSymbols`), and reusing one of those would
+report the wrong cause, which is worse than a new variant. `Details` has no
+`#[non_exhaustive]`, so this is breaking for a consumer matching it exhaustively.
+
+Two upstream tests used `"symbols": []` as a placeholder while testing something
+else entirely -- `avro_custom_attributes_schema_without_attributes` and
+`avro_3609_custom_attributes_schema_with_attributes` both assert only on
+`schema.custom_attributes()`. Each fixture gains one symbol, which leaves what
+they check untouched.
+
+Verified on apache-avro 0.21 with the four patches before it applied:
+`cargo test -p apache-avro --features derive` goes from 564 to 565, and
+`cargo fmt --check` is clean.
+---
+ avro/src/error.rs  |  3 +++
+ avro/src/schema.rs | 34 ++++++++++++++++++++++++++++++++--
+ 2 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/avro/src/error.rs b/avro/src/error.rs
+index 95aeb2b..a9beb3b 100644
+--- a/avro/src/error.rs
++++ b/avro/src/error.rs
+@@ -411,6 +411,9 @@ pub enum Details {
+     #[error("Duplicate enum symbol {0}")]
+     EnumSymbolDuplicate(String),
+ 
++    #[error("Enums must have at least one symbol")]
++    EnumEmptySymbols,
++
+     #[error("Default value for enum must be a string! Got: {0}")]
+     EnumDefaultWrongType(serde_json::Value),
+ 
+diff --git a/avro/src/schema.rs b/avro/src/schema.rs
+index d14853f..6e66386 100644
+--- a/avro/src/schema.rs
++++ b/avro/src/schema.rs
+@@ -1870,6 +1870,12 @@ impl Parser {
+                     .ok_or(Details::GetEnumSymbols)
+             })?;
+ 
++        // No symbol index is in range for an empty enum, so it has no valid
++        // encoding, the same reason UnionSchema::new rejects an empty union.
++        if symbols.is_empty() {
++            return Err(Details::EnumEmptySymbols.into());
++        }
++
+         let mut existing_symbols: HashSet<&String> = HashSet::with_capacity(symbols.len());
+         for symbol in symbols.iter() {
+             validate_enum_symbol_name(symbol)?;
+@@ -4876,7 +4882,7 @@ mod tests {
+                 "type": "enum",
+                 "name": "Enum",
+                 "doc": "An Enum schema without custom attributes",
+-                "symbols": []
++                "symbols": ["A"]
+             }
+             "#,
+             r#"
+@@ -4925,7 +4931,7 @@ mod tests {
+                 "name": "Enum",
+                 "namespace": "ns",
+                 "doc": "An Enum schema with custom attributes",
+-                "symbols": [],
++                "symbols": ["A"],
+                 {{{}}}
+             }
+             "#,
+@@ -7339,4 +7345,28 @@ mod tests {
+         assert!(UnionSchema::new(vec![]).is_err());
+         assert!(UnionSchema::new(vec![Schema::Int]).is_ok());
+     }
++
++    /// No symbol index is in range for an enum with no symbols, so it has no
++    /// valid encoding, the same reason an empty union is rejected. Apache Avro
++    /// C++ reports a "bad node of type enum".
++    ///
++    /// Unlike `UnionSchema`, `EnumSchema` has public fields and a builder, so
++    /// this covers the parse path rather than every possible construction. That
++    /// is the path untrusted input arrives on.
++    #[test]
++    fn avro_rs_empty_enum_is_rejected() {
++        for text in [
++            r#"{"type":"enum","name":"E","symbols":[]}"#,
++            r#"{"type":"enum","name":"E","namespace":"ns","symbols":[]}"#,
++            r#"{"type":"record","name":"R","fields":[{"name":"a","type":
++                 {"type":"enum","name":"E","symbols":[]}}]}"#,
++            r#"{"type":"array","items":{"type":"enum","name":"E","symbols":[]}}"#,
++        ] {
++            let parsed = Schema::parse_str(text);
++            assert!(parsed.is_err(), "{text} should not parse: {parsed:?}");
++        }
++
++        // One symbol is enough: index 0 is in range.
++        assert!(Schema::parse_str(r#"{"type":"enum","name":"E","symbols":["A"]}"#).is_ok());
++    }
+ }
+-- 
+2.52.0
+

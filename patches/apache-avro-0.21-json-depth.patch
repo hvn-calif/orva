@@ -1,0 +1,932 @@
+From 2d8da8ca8df0c68d0279cb5b5671a97c83204659 Mon Sep 17 00:00:00 2001
+From: Viet Hung Nguyen <hvn@calif.io>
+Date: Mon, 24 Aug 2026 11:10:21 +0700
+Subject: [PATCH] feat: Optionally bound the JSON nesting depth accepted when
+ parsing a schema
+
+serde_json applies a fixed limit of 128 nested containers when parsing schema
+JSON, assigned where the `Deserializer` is constructed with no setter to change
+it. Apache Avro C++ bounds the same recursion at 600 nested values. A schema
+between those two numbers is therefore readable by one implementation and not by
+the other, and the crate has no way to move.
+
+Adds `util::set_max_json_depth`, unset by default. Unset means nothing changes at
+all: serde_json's own limit stays in force, no depth scan runs, and parsing
+behaves byte for byte as it did before. Calling the setter switches both halves
+at once -- serde_json's limit off, the scan on -- so exactly one of the two limits
+is ever in force and there is no state in which both or neither apply.
+
+The check runs *before* the parse, over the input bytes, and that ordering is the
+design rather than an implementation detail. With serde_json's limit disabled the
+parse is itself the stack risk, so measuring the depth of the resulting `Value`
+would be measuring it after the danger has passed. The scan is a single iterative
+pass, aware of string literals and backslash escapes because a `{` inside a `doc`
+string is not nesting, so a document nested 60,000 levels deep is refused in
+constant stack.
+
+The limit counts nested *values*, not brackets: a value's depth is one plus the
+number of containers enclosing it. That is the unit Apache Avro C++ counts in, and
+it is one more than a bracket count whenever a scalar sits at the bottom, which in
+a schema document it always does -- the innermost thing in a schema is a type name.
+So a limit of 600 admits 599 nested containers with a scalar inside them, which is
+599 nested arrays or 199 nested one-field records, since a record costs three JSON
+levels per Avro level. `set_max_json_depth`'s documentation carries that
+conversion table.
+
+The argument is clamped to `MAX_JSON_DEPTH_CEILING`, 600. A limit above what the
+stack can hold turns a clean rejection into an abort, and how deep the stack
+reaches depends on the build: bisected on aarch64, a document at the limit costs
+6.8 MiB of stack unoptimised and 410 KiB optimised. The setter returns what it
+installed, so a caller asking for more can see that it was clamped.
+
+Every site that parses schema JSON is covered: four functions and five calls,
+since `Schema::parse_str_with_list` parses twice. That includes the container file
+header, where `Reader` parses `avro.schema` itself with `serde_json::from_slice`,
+so a check inside `Schema::parse_str` would have missed it. At that site a depth
+rejection is reported as itself while every other failure keeps reporting
+`GetAvroSchemaFromMap`, so nothing but the new rejection changes there.
+
+`util::json_document_end` is public alongside the setter, for a caller that needs
+to cut input at the end of its first JSON document. Parsing to find that boundary
+is the recursion the limit exists to prevent, so on input that has not been
+depth-checked yet it is the wrong order; the scan already tracks everything
+finding the boundary requires.
+
+Adds `Details::JsonDepthExceeded`, so the rejection says the depth was exceeded
+rather than something about JSON syntax. `Details` has no `#[non_exhaustive]`, so
+a new variant is breaking for a consumer matching it exhaustively.
+
+`unbounded_depth` joins serde_json's features, which is what makes
+`Deserializer::disable_recursion_limit` available. The feature changes nothing on
+its own -- the default stays 128 until something calls the setter -- so it is safe
+under Cargo's feature unification.
+
+Tests are split by the value of the setting, because a `OnceLock` cannot be reset
+within a process: the unset cases and the scan's own unit tests are in
+`src/util.rs`, `tests/max_json_depth.rs` runs at the ceiling, and
+`tests/max_json_depth_lowered.rs` runs at a limit the caller chose, which is what
+distinguishes a limit that honours its argument from one that always installs 600.
+The boundary is pinned as documents rather than as a constant, in two shapes,
+because they cost a different number of JSON levels per Avro level and one shape
+alone could not show the counter counting the right event.
+
+Verified on apache-avro 0.21 with the six patches before it applied:
+`cargo test -p apache-avro --features derive` goes from 567 to 578, the eleven
+tests this adds, `cargo fmt --check` is clean, and clippy reports nothing in any
+changed file.
+---
+ avro/Cargo.toml                      |   7 +-
+ avro/src/error.rs                    |   3 +
+ avro/src/reader.rs                   |  21 +-
+ avro/src/schema.rs                   |  14 +-
+ avro/src/util.rs                     | 358 +++++++++++++++++++++++++++
+ avro/tests/max_json_depth.rs         | 250 +++++++++++++++++++
+ avro/tests/max_json_depth_lowered.rs |  67 +++++
+ 7 files changed, 703 insertions(+), 17 deletions(-)
+ create mode 100644 avro/tests/max_json_depth.rs
+ create mode 100644 avro/tests/max_json_depth_lowered.rs
+
+diff --git a/avro/Cargo.toml b/avro/Cargo.toml
+index 7404cac..ce342d1 100644
+--- a/avro/Cargo.toml
++++ b/avro/Cargo.toml
+@@ -65,7 +65,12 @@ num-bigint = { default-features = false, version = "0.4.6", features = ["std", "
+ regex-lite = { default-features = false, version = "0.1.8", features = ["std", "string"] }
+ serde = { workspace = true }
+ serde_bytes = { workspace = true }
+-serde_json = { workspace = true }
++# `unbounded_depth` is what makes `Deserializer::disable_recursion_limit`
++# available. It changes nothing on its own: serde_json still applies its own
++# limit of 128 until `util::set_max_json_depth` is called, which is what turns
++# serde_json's limit off and this crate's depth scan on. Safe under Cargo's
++# feature unification for that reason.
++serde_json = { workspace = true, features = ["unbounded_depth"] }
+ snap = { default-features = false, version = "1.1.0", optional = true }
+ strum = { default-features = false, version = "0.27.2" }
+ strum_macros = { default-features = false, version = "0.27.2" }
+diff --git a/avro/src/error.rs b/avro/src/error.rs
+index a9beb3b..4995217 100644
+--- a/avro/src/error.rs
++++ b/avro/src/error.rs
+@@ -332,6 +332,9 @@ pub enum Details {
+     #[error("Failed to parse schema from JSON")]
+     ParseSchemaJson(#[source] serde_json::Error),
+ 
++    #[error("JSON nesting depth {depth} exceeds the maximum of {maximum}")]
++    JsonDepthExceeded { depth: usize, maximum: usize },
++
+     #[error("Failed to read schema")]
+     ReadSchemaFromReader(#[source] std::io::Error),
+ 
+diff --git a/avro/src/reader.rs b/avro/src/reader.rs
+index ef05694..d50546d 100644
+--- a/avro/src/reader.rs
++++ b/avro/src/reader.rs
+@@ -31,7 +31,6 @@ use crate::{
+ };
+ use log::warn;
+ use serde::de::DeserializeOwned;
+-use serde_json::from_slice;
+ use std::{
+     collections::HashMap,
+     io::{ErrorKind, Read},
+@@ -214,16 +213,16 @@ impl<'r, R: Read> Block<'r, R> {
+     }
+ 
+     fn read_writer_schema(&mut self, metadata: &HashMap<String, Value>) -> AvroResult<()> {
+-        let json: serde_json::Value = metadata
+-            .get("avro.schema")
+-            .and_then(|bytes| {
+-                if let Value::Bytes(ref bytes) = *bytes {
+-                    from_slice(bytes.as_ref()).ok()
+-                } else {
+-                    None
+-                }
+-            })
+-            .ok_or(Details::GetAvroSchemaFromMap)?;
++        let raw = match metadata.get("avro.schema") {
++            Some(Value::Bytes(bytes)) => bytes.as_ref(),
++            _ => return Err(Details::GetAvroSchemaFromMap.into()),
++        };
++        // A depth rejection is reported as itself. Every other way this parse can
++        // fail keeps reporting GetAvroSchemaFromMap, as it did before the limit
++        // existed, so nothing but the new rejection changes here.
++        util::check_json_depth(raw)?;
++        let json: serde_json::Value =
++            util::parse_json_slice(raw).map_err(|_| Details::GetAvroSchemaFromMap)?;
+         if !self.schemata.is_empty() {
+             let rs = ResolvedSchema::try_from(self.schemata.clone())?;
+             let names: Names = rs
+diff --git a/avro/src/schema.rs b/avro/src/schema.rs
+index 6e66386..552516d 100644
+--- a/avro/src/schema.rs
++++ b/avro/src/schema.rs
+@@ -20,7 +20,7 @@ use crate::{
+     AvroResult,
+     error::{Details, Error},
+     schema_equality, types,
+-    util::MapHelper,
++    util::{self, MapHelper},
+     validator::{
+         validate_enum_symbol_name, validate_namespace, validate_record_field_name,
+         validate_schema_name,
+@@ -1100,7 +1100,8 @@ impl Schema {
+         let mut input_order: Vec<Name> = Vec::with_capacity(input_len);
+         for json in input {
+             let json = json.as_ref();
+-            let schema: Value = serde_json::from_str(json).map_err(Details::ParseSchemaJson)?;
++            util::check_json_depth(json.as_bytes())?;
++            let schema: Value = util::parse_json_str(json).map_err(Details::ParseSchemaJson)?;
+             if let Value::Object(inner) = &schema {
+                 let name = Name::parse(inner, &None)?;
+                 let previous_value = input_schemas.insert(name.clone(), schema);
+@@ -1143,7 +1144,8 @@ impl Schema {
+         let mut input_order: Vec<Name> = Vec::with_capacity(schemata_len);
+         for json in schemata {
+             let json = json.as_ref();
+-            let schema: Value = serde_json::from_str(json).map_err(Details::ParseSchemaJson)?;
++            util::check_json_depth(json.as_bytes())?;
++            let schema: Value = util::parse_json_str(json).map_err(Details::ParseSchemaJson)?;
+             if let Value::Object(inner) = &schema {
+                 let name = Name::parse(inner, &None)?;
+                 if let Some(_previous) = input_schemas.insert(name.clone(), schema) {
+@@ -1162,7 +1164,8 @@ impl Schema {
+         };
+         parser.parse_input_schemas()?;
+ 
+-        let value = serde_json::from_str(schema).map_err(Details::ParseSchemaJson)?;
++        util::check_json_depth(schema.as_bytes())?;
++        let value = util::parse_json_str(schema).map_err(Details::ParseSchemaJson)?;
+         let schema = parser.parse(&value, &None)?;
+         let schemata = parser.parse_list()?;
+         Ok((schema, schemata))
+@@ -1314,7 +1317,8 @@ impl Schema {
+ impl Parser {
+     /// Create a `Schema` from a string representing a JSON Avro schema.
+     fn parse_str(&mut self, input: &str) -> Result<Schema, Error> {
+-        let value = serde_json::from_str(input).map_err(Details::ParseSchemaJson)?;
++        util::check_json_depth(input.as_bytes())?;
++        let value = util::parse_json_str(input).map_err(Details::ParseSchemaJson)?;
+         self.parse(&value, &None)
+     }
+ 
+diff --git a/avro/src/util.rs b/avro/src/util.rs
+index f269c06..f39428c 100644
+--- a/avro/src/util.rs
++++ b/avro/src/util.rs
+@@ -18,6 +18,7 @@
+ //! Utility functions, like configuring various global settings.
+ 
+ use crate::{AvroResult, error::Details, schema::Documentation};
++use serde::Deserialize;
+ use serde_json::{Map, Value};
+ use std::{
+     io::{Read, Write},
+@@ -57,6 +58,33 @@ pub(crate) static UUID_AS_STRING: OnceLock<bool> = OnceLock::new();
+ /// previous release did.
+ pub const DEFAULT_UUID_AS_STRING: bool = false;
+ 
++/// The largest limit [`set_max_json_depth`] will install. The setter clamps to
++/// it and returns what it installed, so a caller asking for more can see that it
++/// did not get it.
++///
++/// A depth limit only helps while the stack can hold a document at the limit:
++/// past that point the parse aborts the process instead of returning an error,
++/// and how deep the stack reaches depends on the build. Measured on chained
++/// `{"type":"array","items":...}` documents, parsed into a [`Value`], turned into
++/// a schema, rendered and dropped: about 630 bytes of stack per level optimised
++/// and about 11.6 KiB per level unoptimised. 600 levels is therefore under
++/// 400 KiB optimised and about 7 MB unoptimised, which is why the ceiling sits
++/// here rather than higher.
++///
++/// It is also the limit avro-cpp's JSON reader uses, counting the same thing, so
++/// a document at the limit is accepted by both.
++pub const MAX_JSON_DEPTH_CEILING: usize = 600;
++
++/// The configured JSON nesting limit, or unset.
++///
++/// Unlike every other setting in this module there is no default value, and that
++/// is deliberate: while this is unset, serde_json's own limit of 128 *containers*
++/// applies, and this limit counts *values*, so any number chosen here as a
++/// default would quietly change what an existing consumer accepts. Reading it
++/// therefore must not lock a value in, which is why the reader below is
++/// [`OnceLock::get`] rather than `get_or_init`.
++static MAX_JSON_DEPTH: OnceLock<usize> = OnceLock::new();
++
+ pub(crate) trait MapHelper {
+     fn string(&self, key: &str) -> Option<String>;
+ 
+@@ -283,6 +311,233 @@ pub(crate) fn uuid_as_string() -> bool {
+     *UUID_AS_STRING.get_or_init(|| DEFAULT_UUID_AS_STRING)
+ }
+ 
++/// Set the maximum JSON nesting depth accepted when parsing a schema.
++///
++/// **Unset by default, and while it is unset nothing here changes.** serde_json
++/// applies its own limit of 128 containers, no depth scan runs, and parsing
++/// behaves exactly as it did before this setting existed. Calling this switches
++/// both halves at once: serde_json's limit goes off and the scan described below
++/// goes on, so exactly one of the two limits is ever in force.
++///
++/// # What the number counts
++///
++/// Nested **values**, not brackets and not Avro type levels. A value's depth is
++/// one plus the number of arrays and objects enclosing it, so the whole
++/// document is depth 1 and the `1` in `[[1]]` is depth 3. A document is rejected
++/// when its deepest value is deeper than the limit.
++///
++/// That is one more than a bracket count whenever a scalar sits at the bottom,
++/// which in a schema document it always does: the innermost thing in a schema is
++/// a type name. So a limit of 600 accepts 599 nested containers with a scalar
++/// inside them and rejects 600.
++///
++/// A reader thinking in Avro type levels needs one more conversion, because the
++/// constructs cost different amounts:
++///
++/// | one level of | JSON levels it costs |
++/// | --- | --- |
++/// | `{"type":"array","items":X}` | 1 |
++/// | `{"type":"map","values":X}` | 1 |
++/// | a union `[X]` | 1 |
++/// | a record with one field of type `X` | 3: the record object, the `fields` array, the field object |
++///
++/// So a limit of 600 admits 599 nested arrays, and 199 nested one-field records.
++///
++/// # How it is enforced
++///
++/// The depth is measured by a single iterative pass over the input bytes, before
++/// any parsing, and a document past the limit is refused without being parsed.
++/// That order is the point: with serde_json's limit off, the parse is itself the
++/// stack risk, so measuring the depth of the parsed value would be measuring it
++/// after the danger has passed. An input nested tens of thousands of levels deep
++/// is therefore refused in constant stack.
++///
++/// # Choosing a number
++///
++/// The argument is clamped to [`MAX_JSON_DEPTH_CEILING`], because a limit above
++/// what the stack can hold converts a clean rejection into an abort, and how
++/// deep the stack reaches depends on the build. The return value is what was
++/// installed.
++///
++/// This function only changes the setting once; on subsequent calls the value
++/// stays as the first call left it. Unlike the other settings here, reading it
++/// does not install a default, so it can be set after parsing has already
++/// happened -- though a caller that wants the limit for untrusted input should
++/// set it before handling any.
++///
++/// # Returns
++/// The limit actually in effect, which differs from the argument if it was
++/// clamped or if something already set it. Callers that require a particular
++/// limit should check the returned value rather than assume it took effect.
++pub fn set_max_json_depth(max_depth: usize) -> usize {
++    *MAX_JSON_DEPTH.get_or_init(|| max_depth.min(MAX_JSON_DEPTH_CEILING))
++}
++
++fn max_json_depth() -> Option<usize> {
++    MAX_JSON_DEPTH.get().copied()
++}
++
++/// One past the last byte of the first complete JSON document in `raw`, or
++/// `None` when `raw` holds no complete document. Trailing whitespace is not
++/// included.
++///
++/// This is a structural scan and not a validator: it tracks string literals,
++/// backslash escapes and nesting, which is all that finding the boundary needs,
++/// and it takes no position on whether the document in front of it is well
++/// formed. It exists so that a caller wanting to cut input at that boundary can
++/// do so without parsing. Parsing to find the end would be the recursion a depth
++/// limit is there to prevent, so on input that has not been depth-checked yet it
++/// is the wrong order.
++pub fn json_document_end(raw: &[u8]) -> Option<usize> {
++    scan_json(raw).document_end
++}
++
++/// What one pass over JSON bytes found.
++struct JsonScan {
++    /// The deepest value in the first document, counted as one plus the number
++    /// of containers enclosing it. 0 for input with no value in it at all.
++    ///
++    /// Only the first document is measured, because that is all a parse of these
++    /// bytes recurses over: serde_json reads one value and then reports whatever
++    /// follows it as trailing characters without descending into it. An
++    /// incomplete document is measured as far as it goes, which is what bounds
++    /// input like a run of unbalanced `[`.
++    max_depth: usize,
++    /// One past the last byte of the first complete document, or `None` when
++    /// there is no complete document to find.
++    document_end: Option<usize>,
++}
++
++/// Whether `byte` ends a scalar token. serde_json's own set, so a token this
++/// scan cuts is the token serde_json cuts.
++fn ends_a_scalar(byte: u8) -> bool {
++    matches!(
++        byte,
++        b' ' | b'\n' | b'\t' | b'\r' | b'"' | b'[' | b']' | b'{' | b'}' | b',' | b':'
++    )
++}
++
++/// One past the closing quote of the string literal starting at `raw[start]`, or
++/// `None` if it never closes. A backslash escapes the byte after it, which is all
++/// this needs to know: no escape sequence can produce an unescaped quote.
++fn string_literal_end(raw: &[u8], start: usize) -> Option<usize> {
++    let mut i = start + 1;
++    while i < raw.len() {
++        match raw[i] {
++            b'\\' => i += 2,
++            b'"' => return Some(i + 1),
++            _ => i += 1,
++        }
++    }
++    None
++}
++
++/// Measures nesting depth and finds the first document's end in one iterative
++/// pass. No recursion and no allocation, so the cost is linear in `raw` and the
++/// stack use is constant however deep the input nests.
++///
++/// An object key is counted as a value here, which `readEntity` in avro-cpp does
++/// not do. It changes no maximum: a key always sits at the same depth as the
++/// value beside it, and every key in a well-formed document has one.
++fn scan_json(raw: &[u8]) -> JsonScan {
++    let mut scan = JsonScan {
++        max_depth: 0,
++        document_end: None,
++    };
++    let mut depth: usize = 0;
++    let mut i: usize = 0;
++    while i < raw.len() {
++        match raw[i] {
++            b'[' | b'{' => {
++                depth += 1;
++                scan.max_depth = scan.max_depth.max(depth);
++                i += 1;
++            }
++            b']' | b'}' => {
++                // A closer with nothing open is malformed: there is no document
++                // boundary to report, and the parse is what says why.
++                if depth == 0 {
++                    break;
++                }
++                depth -= 1;
++                i += 1;
++            }
++            b'"' => {
++                scan.max_depth = scan.max_depth.max(depth + 1);
++                match string_literal_end(raw, i) {
++                    Some(end) => i = end,
++                    // A string that never closes, so no boundary either.
++                    None => break,
++                }
++            }
++            // Nothing here is a value, so nothing here can end the document.
++            b' ' | b'\n' | b'\t' | b'\r' | b',' | b':' => {
++                i += 1;
++                continue;
++            }
++            _ => {
++                // A number, `true`, `false`, `null`, or something the parse will
++                // refuse. Either way it is one value sitting at this depth.
++                scan.max_depth = scan.max_depth.max(depth + 1);
++                while i < raw.len() && !ends_a_scalar(raw[i]) {
++                    i += 1;
++                }
++            }
++        }
++        // Back at the top level with a value behind us: the first document ends
++        // here, and the scan stops because a parse of these bytes would too.
++        if depth == 0 {
++            scan.document_end = Some(i);
++            break;
++        }
++    }
++    scan
++}
++
++/// Rejects `raw` when its JSON nests deeper than the configured limit, before
++/// anything recurses over it.
++///
++/// A no-op while the limit is unset, which is the default: serde_json's own
++/// limit is then still in force at the parse, and no scan runs.
++pub(crate) fn check_json_depth(raw: &[u8]) -> AvroResult<()> {
++    let Some(maximum) = max_json_depth() else {
++        return Ok(());
++    };
++    let depth = scan_json(raw).max_depth;
++    if depth > maximum {
++        return Err(Details::JsonDepthExceeded { depth, maximum }.into());
++    }
++    Ok(())
++}
++
++/// Parses JSON text, with serde_json's recursion limit off exactly when ours is
++/// on, so that one of the two limits always applies and never both.
++///
++/// [`check_json_depth`] must have run on the same bytes first. With the limit
++/// set, this call is the recursion that limit exists to bound.
++pub(crate) fn parse_json_str(input: &str) -> Result<Value, serde_json::Error> {
++    if max_json_depth().is_none() {
++        return serde_json::from_str(input);
++    }
++    let mut deserializer = serde_json::Deserializer::from_str(input);
++    deserializer.disable_recursion_limit();
++    let value = Value::deserialize(&mut deserializer)?;
++    deserializer.end()?;
++    Ok(value)
++}
++
++/// [`parse_json_str`] for bytes, for the container file header's `avro.schema`.
++pub(crate) fn parse_json_slice(raw: &[u8]) -> Result<Value, serde_json::Error> {
++    if max_json_depth().is_none() {
++        return serde_json::from_slice(raw);
++    }
++    let mut deserializer = serde_json::Deserializer::from_slice(raw);
++    deserializer.disable_recursion_limit();
++    let value = Value::deserialize(&mut deserializer)?;
++    deserializer.end()?;
++    Ok(value)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -386,4 +641,107 @@ mod tests {
+ 
+         Ok(())
+     }
++
++    // The depth scan. Nothing here calls `set_max_json_depth`: it is set-once per
++    // process, so setting it in this binary would decide the limit for every
++    // other test in it. The set side lives in `tests/max_json_depth.rs`.
++
++    #[test]
++    fn the_scan_counts_nested_values_and_not_brackets() {
++        // A lone scalar is one value, and so is the document that is only it.
++        assert_eq!(scan_json(br#""int""#).max_depth, 1);
++        assert_eq!(scan_json(b"42").max_depth, 1);
++        assert_eq!(scan_json(b"").max_depth, 0);
++
++        // One container with a scalar inside is two: the container, then the
++        // scalar. This is the off-by-one that makes a bracket count wrong -- both
++        // of these hold one bracket pair.
++        assert_eq!(scan_json(br#"["int"]"#).max_depth, 2);
++        assert_eq!(scan_json(b"[]").max_depth, 1);
++        assert_eq!(scan_json(b"{}").max_depth, 1);
++
++        // The maximum is over all values, so a shallow sibling does not lower it.
++        assert_eq!(scan_json(br#"[1,[2,[3]],4]"#).max_depth, 4);
++
++        // An object key sits at the same depth as the value beside it, so
++        // counting keys as values changes nothing.
++        assert_eq!(scan_json(br#"{"a":1}"#).max_depth, 2);
++        assert_eq!(scan_json(br#"{"a":{"b":1}}"#).max_depth, 3);
++
++        // The two schema shapes whose boundary the limit is pinned on. One Avro
++        // array level costs one JSON level; one one-field record costs three.
++        assert_eq!(scan_json(br#"{"type":"array","items":"int"}"#).max_depth, 2);
++        assert_eq!(
++            scan_json(br#"{"type":"record","name":"R","fields":[{"name":"f","type":"int"}]}"#)
++                .max_depth,
++            4
++        );
++    }
++
++    #[test]
++    fn the_scan_ignores_structure_inside_string_literals() {
++        // A brace in a `doc` string is not nesting, and an escaped quote does not
++        // end the string it is in.
++        // Depth 2, not 3: the object is 1, its keys and values are 2, and the
++        // empty `fields` array has nothing inside it to reach 3.
++        let doc = br#"{"type":"record","name":"R","doc":"} \" [[[","fields":[]}"#;
++        assert_eq!(scan_json(doc).max_depth, 2);
++        assert_eq!(scan_json(doc).document_end, Some(doc.len()));
++
++        // A string that never closes leaves no document boundary to report.
++        assert_eq!(scan_json(br#"["#).document_end, None);
++        assert_eq!(scan_json(br#"{"a"#).document_end, None);
++        // Nor does a trailing backslash, which escapes past the end of input.
++        assert_eq!(scan_json(br#""a\"#).document_end, None);
++    }
++
++    #[test]
++    fn the_scan_finds_the_end_of_the_first_document() {
++        // A scalar document ends with its token, whatever follows it.
++        assert_eq!(scan_json(br#""int"!"#).document_end, Some(5));
++        assert_eq!(scan_json(b"42 43").document_end, Some(2));
++        // A container document ends at the closer that balances it.
++        assert_eq!(scan_json(br#"[1,[2]] junk"#).document_end, Some(7));
++        // Leading whitespace is skipped and trailing whitespace is not included.
++        assert_eq!(scan_json(b"  [1]  ").document_end, Some(5));
++        // An unmatched closer is malformed, so there is no boundary to report.
++        assert_eq!(scan_json(b"]").document_end, None);
++    }
++
++    #[test]
++    fn the_scan_measures_an_incomplete_document_as_far_as_it_goes() {
++        // The shape that costs the least input per level, and the one an
++        // unbounded parser overflows on soonest. There is no complete document
++        // here, so the depth is what the scan walked before running out.
++        let unbalanced = vec![b'['; 5_000];
++        let scan = scan_json(&unbalanced);
++        assert_eq!(scan.max_depth, 5_000);
++        assert_eq!(scan.document_end, None);
++    }
++
++    #[test]
++    fn the_limit_is_unset_by_default() {
++        // Unset means no scan and no rejection of our own: whatever the input,
++        // `check_json_depth` passes it through and serde_json's own limit of 128
++        // containers is what decides.
++        assert_eq!(max_json_depth(), None);
++        let unbalanced = vec![b'['; 60_000];
++        assert!(check_json_depth(&unbalanced).is_ok());
++
++        // And the parse still applies serde_json's limit, so the behaviour a
++        // consumer who never calls the setter sees is unchanged.
++        let mut deep = String::new();
++        for _ in 0..200 {
++            deep.push('[');
++        }
++        assert!(parse_json_str(&deep).is_err());
++    }
++
++    #[test]
++    fn the_ceiling_is_the_limit_avro_cpp_uses() {
++        // Not an assertion about behaviour -- the boundary is pinned as documents
++        // in `tests/max_json_depth.rs`. This is here so that the literal document
++        // sizes over there have a stated source.
++        assert_eq!(MAX_JSON_DEPTH_CEILING, 600);
++    }
+ }
+diff --git a/avro/tests/max_json_depth.rs b/avro/tests/max_json_depth.rs
+new file mode 100644
+index 0000000..670be60
+--- /dev/null
++++ b/avro/tests/max_json_depth.rs
+@@ -0,0 +1,250 @@
++// Licensed to the Apache Software Foundation (ASF) under one
++// or more contributor license agreements.  See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership.  The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License.  You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//! The set side of `util::set_max_json_depth`, at the ceiling.
++//!
++//! The setting is set-once per process, so these live in their own test binary
++//! rather than beside the unset cases in `src/util.rs`. This follows
++//! `tests/uuid_as_string.rs`. `tests/max_json_depth_lowered.rs` is the third
++//! binary, for a limit the caller chose rather than the ceiling.
++
++use apache_avro::{
++    Reader, Schema,
++    error::Details,
++    util::{MAX_JSON_DEPTH_CEILING, set_max_json_depth},
++};
++
++/// The limit every test in this binary runs under.
++///
++/// Asking for more than the ceiling is how the clamp gets covered: the setter
++/// installs the ceiling instead and says so in its return value, which is what a
++/// caller who requires a particular limit should be checking.
++fn enable() -> usize {
++    let installed = set_max_json_depth(usize::MAX);
++    assert_eq!(
++        installed, MAX_JSON_DEPTH_CEILING,
++        "the setter must clamp, and the clamped limit must be in effect here"
++    );
++    installed
++}
++
++/// `levels` nested `{"type":"array","items":X}` objects around an `"int"`.
++///
++/// One Avro array level is one JSON level, so the leaf sits at `levels + 1`.
++fn nested_arrays(levels: usize) -> String {
++    let mut json = String::with_capacity(levels * 25 + 8);
++    for _ in 0..levels {
++        json.push_str(r#"{"type":"array","items":"#);
++    }
++    json.push_str(r#""int""#);
++    for _ in 0..levels {
++        json.push('}');
++    }
++    json
++}
++
++/// `levels` nested one-field records around an `"int"`.
++///
++/// One Avro record level costs three JSON levels -- the record object, the
++/// `fields` array, the field object -- so the leaf sits at `3 * levels + 1`.
++/// Each record needs its own name, since two with the same fullname collide.
++fn nested_records(levels: usize) -> String {
++    let mut json = String::with_capacity(levels * 60 + 8);
++    for level in 0..levels {
++        json.push_str(r#"{"type":"record","name":"R"#);
++        json.push_str(&level.to_string());
++        json.push_str(r#"","fields":[{"name":"f","type":"#);
++    }
++    json.push_str(r#""int""#);
++    for _ in 0..levels {
++        json.push_str("}]}");
++    }
++    json
++}
++
++/// One Avro long, zigzag varint encoded: a map's entry count, or a length prefix.
++fn varint(value: i64) -> Vec<u8> {
++    let mut n = ((value << 1) ^ (value >> 63)) as u64;
++    let mut out = Vec::new();
++    loop {
++        let byte = (n & 0x7f) as u8;
++        n >>= 7;
++        if n == 0 {
++            out.push(byte);
++            return out;
++        }
++        out.push(byte | 0x80);
++    }
++}
++
++/// A container file carrying `schema_json` as its `avro.schema` header metadata,
++/// with no data blocks. Hand-built because the schema whose rejection matters
++/// cannot be parsed, so no writer can produce a file holding it.
++fn container_file(schema_json: &str) -> Vec<u8> {
++    let mut file = b"Obj\x01".to_vec();
++    // The header metadata is a map<bytes>: one block of one entry, then a zero
++    // count to end the map.
++    file.extend_from_slice(&varint(1));
++    file.extend_from_slice(&varint("avro.schema".len() as i64));
++    file.extend_from_slice(b"avro.schema");
++    file.extend_from_slice(&varint(schema_json.len() as i64));
++    file.extend_from_slice(schema_json.as_bytes());
++    file.extend_from_slice(&varint(0));
++    file.extend_from_slice(&[0u8; 16]); // the sync marker
++    file
++}
++
++/// Asserts that `error` is the depth rejection, naming `depth`, rather than
++/// anything about JSON syntax. Measuring before parsing is what buys the caller
++/// an error that says what was actually wrong with the input.
++#[track_caller]
++fn assert_is_depth_error(error: apache_avro::Error, depth: usize) {
++    match error.into_details() {
++        Details::JsonDepthExceeded {
++            depth: reported,
++            maximum,
++        } => {
++            assert_eq!(reported, depth);
++            assert_eq!(maximum, MAX_JSON_DEPTH_CEILING);
++        }
++        other => panic!("expected a depth rejection, got: {other}"),
++    }
++}
++
++#[track_caller]
++fn assert_schema_depth_rejected(json: &str, depth: usize) {
++    let error = Schema::parse_str(json).expect_err("a document past the limit must be refused");
++    assert_is_depth_error(error, depth);
++}
++
++/// Runs `body` on a thread with a stack big enough for a document at the limit.
++///
++/// The thread is not optional and the size is not arbitrary. Bisected on
++/// aarch64, one process per case, parsing and dropping a document at the limit:
++///
++/// | build | 599 arrays | 199 records |
++/// | --- | --- | --- |
++/// | unoptimised, which is what `cargo test` builds | 6.8 MiB of stack | 6.4 MiB |
++/// | optimised | 410 KiB | 851 KiB |
++///
++/// `cargo test` gives each spawned test thread 2 MiB, which runs out at 180
++/// nested arrays and 63 nested records. So the default thread cannot reach the
++/// limit in this build, and 32 MiB leaves about 4.5 times the worst case
++/// measured. Do not remove the thread and do not shrink the size.
++fn on_a_big_stack(body: impl FnOnce() + Send + 'static) {
++    std::thread::Builder::new()
++        .stack_size(32 * 1024 * 1024)
++        .spawn(body)
++        .expect("failed to spawn the deep-parse thread")
++        .join()
++        .expect("a document at the limit must parse without exhausting its stack");
++}
++
++/// The boundary, as documents rather than as a constant.
++///
++/// Two shapes, because they cost a different number of JSON levels per Avro
++/// level: an off-by-one in what the limit counts would move one pair of numbers
++/// here and not the other, which a single shape could not tell apart. The limit
++/// counts nested values, so 600 admits 599 containers with a scalar inside them.
++#[test]
++fn the_boundary_is_599_arrays_and_199_records() {
++    let limit = enable();
++    assert_eq!(
++        limit, 600,
++        "the numbers below are written out for this limit"
++    );
++
++    on_a_big_stack(move || {
++        // 599 arrays put the leaf `"int"` at depth 600. 600 arrays put it at 601.
++        assert!(Schema::parse_str(&nested_arrays(599)).is_ok());
++        assert_schema_depth_rejected(&nested_arrays(600), 601);
++
++        // Three JSON levels per record: 199 records put the leaf at 598, and 200
++        // put it at 601, so the record boundary is nowhere near the array one.
++        assert!(Schema::parse_str(&nested_records(199)).is_ok());
++        assert_schema_depth_rejected(&nested_records(200), 601);
++    });
++}
++
++/// Past the limit is a rejection that never recurses, so this test needs no
++/// stack of its own: it runs on the 2 MiB thread `cargo test` spawns, which dies
++/// at about 176 levels, and would run under the fuzzing build's 128 KiB soft
++/// limit too. Nothing here is parsed. The depths are far past the limit on
++/// purpose -- the assertion is as much that nothing overflows on the way to the
++/// error as that the error arrives.
++#[test]
++fn far_past_the_limit_is_refused_without_recursing() {
++    enable();
++
++    for levels in [601, 6_000, 60_000] {
++        assert_schema_depth_rejected(&nested_arrays(levels), levels + 1);
++    }
++
++    // A run of `[` with nothing closing it: the least input per level, and the
++    // shape an unbounded reader overflows on soonest. There is no complete
++    // document here, so the depth reported is what the scan walked.
++    assert_schema_depth_rejected(&"[".repeat(60_000), 60_000);
++}
++
++/// Every site that parses schema JSON, because a limit reaching only some of
++/// them is a limit a caller cannot rely on.
++///
++/// The container file header is the one that a check inside `Schema::parse_str`
++/// would have missed: `Reader` parses `avro.schema` itself, from bytes, without
++/// going through any of the three functions above it.
++#[test]
++fn every_parse_site_applies_the_limit() {
++    enable();
++    let too_deep = nested_arrays(600);
++    let shallow = r#"{"type":"record","name":"Shallow","fields":[]}"#;
++
++    // Schema::parse_str, via Parser::parse_str.
++    assert_schema_depth_rejected(&too_deep, 601);
++
++    // Schema::parse_list, which parses each document in its own loop.
++    let error = Schema::parse_list([&too_deep]).expect_err("parse_list must apply the limit");
++    assert_is_depth_error(error, 601);
++
++    // Schema::parse_str_with_list parses twice: the schemata, then the schema.
++    let error = Schema::parse_str_with_list(shallow, [&too_deep])
++        .expect_err("the schemata argument must apply the limit");
++    assert_is_depth_error(error, 601);
++    let error = Schema::parse_str_with_list(&too_deep, [shallow])
++        .expect_err("the schema argument must apply the limit");
++    assert_is_depth_error(error, 601);
++
++    // The container file header's avro.schema metadata.
++    let file = container_file(&too_deep);
++    let error = match Reader::new(&file[..]) {
++        Err(error) => error,
++        Ok(_) => panic!("the file header must apply the limit"),
++    };
++    assert_is_depth_error(error, 601);
++}
++
++/// The header at the limit is read rather than refused, which is the other half
++/// of the site above: a limit that rejected everything deep would pass the test
++/// before this one without being a limit at all.
++#[test]
++fn a_header_schema_at_the_limit_is_read() {
++    enable();
++
++    on_a_big_stack(|| {
++        let file = container_file(&nested_arrays(599));
++        let reader = Reader::new(&file[..]).expect("a header schema at the limit must be read");
++        assert!(matches!(reader.writer_schema(), Schema::Array(_)));
++    });
++}
+diff --git a/avro/tests/max_json_depth_lowered.rs b/avro/tests/max_json_depth_lowered.rs
+new file mode 100644
+index 0000000..1352cee
+--- /dev/null
++++ b/avro/tests/max_json_depth_lowered.rs
+@@ -0,0 +1,67 @@
++// Licensed to the Apache Software Foundation (ASF) under one
++// or more contributor license agreements.  See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership.  The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License.  You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//! `util::set_max_json_depth` at a limit the caller chose.
++//!
++//! `tests/max_json_depth.rs` runs at the ceiling, which is also what the setter
++//! clamps to, so on its own it could not tell a limit that honours its argument
++//! from one that always installs 600. This binary is that distinction; it is
++//! separate because the setting is set-once per process.
++
++use apache_avro::{Schema, error::Details, util::set_max_json_depth};
++
++/// Deliberately far below the ceiling, and small enough that both documents
++/// below fit on any stack.
++const LIMIT: usize = 8;
++
++fn enable() {
++    assert_eq!(
++        set_max_json_depth(LIMIT),
++        LIMIT,
++        "a limit under the ceiling must be installed as asked"
++    );
++}
++
++/// `levels` nested `{"type":"array","items":X}` objects around an `"int"`, whose
++/// leaf therefore sits at depth `levels + 1`.
++fn nested_arrays(levels: usize) -> String {
++    let mut json = String::new();
++    for _ in 0..levels {
++        json.push_str(r#"{"type":"array","items":"#);
++    }
++    json.push_str(r#""int""#);
++    for _ in 0..levels {
++        json.push('}');
++    }
++    json
++}
++
++#[test]
++fn a_lowered_limit_is_the_one_in_force() {
++    enable();
++
++    // Seven arrays put the leaf at depth 8, the deepest this limit admits.
++    assert!(Schema::parse_str(&nested_arrays(7)).is_ok());
++
++    let error = Schema::parse_str(&nested_arrays(8)).expect_err("depth 9 is past this limit");
++    match error.into_details() {
++        Details::JsonDepthExceeded { depth, maximum } => {
++            assert_eq!(depth, 9);
++            assert_eq!(maximum, LIMIT);
++        }
++        other => panic!("expected a depth rejection, got: {other}"),
++    }
++}
+-- 
+2.52.0
+
