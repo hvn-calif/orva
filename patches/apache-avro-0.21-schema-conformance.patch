@@ -1,4 +1,4 @@
-From 568ef5c91283141b995e533a3413978b52db6aa0 Mon Sep 17 00:00:00 2001
+From fb3433bdc3fe84e086341dcc3e23db9724fa4835 Mon Sep 17 00:00:00 2001
 From: Viet Hung Nguyen <hvn@calif.io>
 Date: Sat, 29 Aug 2026 00:04:37 +0700
 Subject: [PATCH] fix: Six fixes found by differential fuzzing against Avro C++
@@ -80,12 +80,30 @@ since neither is reachable from the generators:
    one fixed, or a decimal beside the bare fixed it wraps, were accepted
    and would then resolve to whichever branch came first.
 ---
- avro/src/schema.rs | 286 ++++++++++++++++++++++++++++++++++++++++++---
- avro/src/util.rs   | 120 ++++++++++++++++---
- 2 files changed, 378 insertions(+), 28 deletions(-)
+ avro/src/decode.rs          |   2 +-
+ avro/src/schema.rs          | 398 ++++++++++++++++++++++++++++++++++--
+ avro/src/schema_equality.rs |  14 +-
+ avro/src/ser_schema.rs      |   4 +-
+ avro/src/types.rs           |  16 +-
+ avro/src/util.rs            | 120 +++++++++--
+ avro/src/writer.rs          |   2 +-
+ 7 files changed, 508 insertions(+), 48 deletions(-)
 
+diff --git a/avro/src/decode.rs b/avro/src/decode.rs
+index e5ef5fb..3900ebd 100644
+--- a/avro/src/decode.rs
++++ b/avro/src/decode.rs
+@@ -145,7 +145,7 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
+         Schema::LocalTimestampMillis => zag_i64(reader).map(Value::LocalTimestampMillis),
+         Schema::LocalTimestampMicros => zag_i64(reader).map(Value::LocalTimestampMicros),
+         Schema::LocalTimestampNanos => zag_i64(reader).map(Value::LocalTimestampNanos),
+-        Schema::Duration => {
++        Schema::Duration(..) => {
+             let mut buf = [0u8; 12];
+             reader.read_exact(&mut buf).map_err(Details::ReadDuration)?;
+             Ok(Value::Duration(Duration::from(buf)))
 diff --git a/avro/src/schema.rs b/avro/src/schema.rs
-index 552516d..6d71dcf 100644
+index 552516d..d9f8062 100644
 --- a/avro/src/schema.rs
 +++ b/avro/src/schema.rs
 @@ -35,7 +35,7 @@ use serde::{
@@ -97,7 +115,26 @@ index 552516d..6d71dcf 100644
      fmt,
      fmt::Debug,
      hash::Hash,
-@@ -909,6 +909,80 @@ pub struct UnionSchema {
+@@ -133,8 +133,16 @@ pub enum Schema {
+     LocalTimestampMicros,
+     /// An instant in local time represented as the number of nanoseconds after the UNIX epoch.
+     LocalTimestampNanos,
+-    /// An amount of time defined by a number of months, days and milliseconds.
+-    Duration,
++    /// An amount of time defined by a number of months, days and milliseconds,
++    /// carrying the `fixed` it annotates.
++    ///
++    /// The `fixed` is kept rather than discarded because a duration *is* a named
++    /// type: two durations under different names are two types, and a union may
++    /// hold a duration beside a reference only if they name different ones.
++    /// Discarding it also lost the name across serialization, so a schema did
++    /// not survive a round trip through its own rendering. Use
++    /// [`Schema::duration`] where no particular name is meant.
++    Duration(FixedSchema),
+     /// A reference to another schema.
+     Ref { name: Name },
+ }
+@@ -909,6 +917,81 @@ pub struct UnionSchema {
      variant_index: BTreeMap<SchemaKind, usize>,
  }
  
@@ -125,6 +162,10 @@ index 552516d..6d71dcf 100644
 +        // over one `fixed`, or a decimal beside the bare `fixed` it wraps, would
 +        // both be accepted and then resolve to whichever branch came first.
 +        Schema::Decimal(decimal) => union_branch_name(&decimal.inner),
++        // A duration is a `fixed` carrying an annotation, so its name is that
++        // `fixed`'s. Before the variant kept one, a union could hold a duration
++        // and a reference to it and neither rule saw the collision.
++        Schema::Duration(fixed) => Some(&fixed.name),
 +        _ => None,
 +    }
 +}
@@ -163,13 +204,10 @@ index 552516d..6d71dcf 100644
 +            _ => SchemaKind::Decimal,
 +        },
 +        // A duration is a `fixed` carrying an annotation, so it is a named type
-+        // and the name is what distinguishes it -- two durations under different
-+        // names are two branches, which Avro C++ accepts. `Schema::Duration`
-+        // keeps no name, so this cannot check that two of them differ; treating
-+        // it as unnamed is the reading that matches Avro C++ on every union a
-+        // schema can express, at the cost of admitting two durations that name
-+        // the same fixed. Giving `Schema::Duration` a name is the fix, and that
-+        // is a change to the model rather than to this check.
++        // and its name distinguishes it: two durations under different names are
++        // two legal branches, and a duration beside a reference to it is not.
++        // `union_branch_name` reads that name from the `fixed` the variant
++        // carries.
 +        SchemaKind::Duration => return None,
 +        other => other,
 +    })
@@ -178,14 +216,27 @@ index 552516d..6d71dcf 100644
  impl UnionSchema {
      /// Creates a new UnionSchema from a vector of schemas.
      pub fn new(schemas: Vec<Schema>) -> AvroResult<Self> {
-@@ -916,13 +990,33 @@ impl UnionSchema {
+@@ -916,13 +999,49 @@ impl UnionSchema {
              return Err(Details::EmptyUnion.into());
          }
          let mut vindex = BTreeMap::new();
 +        // Duplicate detection is separate from `vindex` because the two ask
 +        // different questions: `vindex` maps a value's own kind to a branch, so
-+        // it has to stay keyed by the exact kind, while the specification's
-+        // uniqueness rule is about the underlying Avro type.
++        // it has to stay keyed by the exact kind, while the uniqueness rule
++        // below is about what identifies a branch.
++        //
++        // Two sets, not one, which is the specification's rule as written: an
++        // unnamed branch is identified by its underlying type and a named one by
++        // its fullname, and the two do not collide. A record named `int` beside
++        // an `int` branch is therefore accepted here.
++        //
++        // Avro C++ accepts that pair for `boolean` and refuses it for `int` and
++        // `null`, so no single rule matches it: unifying the two key spaces
++        // matched the cases it refuses and broke the ones it accepts. Its union
++        // check works from a bit per type (see the 32-type bitmask note in
++        // avro-cpp's Types.cc), which is why the answer varies by type. Treated
++        // as an Avro C++ inconsistency and left as a recorded divergence rather
++        // than reproduced.
 +        let mut branch_types = BTreeSet::new();
 +        let mut branch_names = HashSet::new();
          for (i, schema) in schemas.iter().enumerate() {
@@ -195,26 +246,83 @@ index 552516d..6d71dcf 100644
              let kind = SchemaKind::from(schema);
 -            if !kind.is_named() && vindex.insert(kind, i).is_some() {
 -                return Err(Details::GetUnionDuplicate.into());
-+            if let Some(branch_type) = union_branch_kind(schema) {
-+                if !branch_types.insert(branch_type) {
-+                    return Err(Details::GetUnionDuplicate.into());
++            // The namespace is taken as written: this runs before the enclosing
++            // namespace is known, so two branches that resolve to one fullname
++            // only by inheriting it are not caught. Both a definition and a
++            // reference to it carry the same written name in every case the
++            // parser produces.
++            match union_branch_name(schema) {
++                Some(name) => {
++                    if !branch_names.insert(name.clone()) {
++                        return Err(Details::GetUnionDuplicate.into());
++                    }
 +                }
-+                vindex.insert(kind, i);
-+            }
-+            // A named branch is distinguished by its name, so the name is what
-+            // has to be unique. The namespace is taken as written here: this
-+            // runs before the enclosing namespace is known, so two branches
-+            // that resolve to one full name only by inheriting it are not
-+            // caught. Both a definition and a reference to it carry the same
-+            // written name in every case the parser produces.
-+            if let Some(name) = union_branch_name(schema) {
-+                if !branch_names.insert(name.clone()) {
-+                    return Err(Details::GetUnionDuplicate.into());
++                None => {
++                    let branch_type = union_branch_kind(schema)
++                        .expect("a branch is either named or has an underlying type");
++                    if !branch_types.insert(branch_type) {
++                        return Err(Details::GetUnionDuplicate.into());
++                    }
++                    vindex.insert(kind, i);
 +                }
              }
          }
          Ok(UnionSchema {
-@@ -2010,9 +2104,14 @@ impl Parser {
+@@ -1216,7 +1335,9 @@ impl Schema {
+             Schema::Ref { name, .. }
+             | Schema::Record(RecordSchema { name, .. })
+             | Schema::Enum(EnumSchema { name, .. })
+-            | Schema::Fixed(FixedSchema { name, .. }) => Some(name),
++            | Schema::Fixed(FixedSchema { name, .. })
++            // A duration is a `fixed`, so it has that `fixed`'s name.
++            | Schema::Duration(FixedSchema { name, .. }) => Some(name),
+             _ => None,
+         }
+     }
+@@ -1262,6 +1383,24 @@ impl Schema {
+         })
+     }
+ 
++    /// Returns a `Schema::Duration` over a `fixed` named `duration`.
++    ///
++    /// The specification does not say what a duration's underlying `fixed`
++    /// should be called, so this is the name to use where none is meant --
++    /// notably for a Rust type mapped to a duration, which has no Avro name of
++    /// its own. A duration parsed from a schema keeps the name that schema gave
++    /// it instead.
++    pub fn duration() -> Self {
++        Schema::Duration(FixedSchema {
++            name: Name::new("duration").expect("`duration` is a valid name"),
++            aliases: None,
++            doc: None,
++            size: 12,
++            default: None,
++            attributes: Default::default(),
++        })
++    }
++
+     /// Returns a Schema::Array with the given items.
+     pub fn array(items: Schema) -> Self {
+         Schema::Array(ArraySchema {
+@@ -1670,7 +1809,16 @@ impl Parser {
+                         "duration",
+                         parse_as_native_complex(complex, self, enclosing_namespace)?,
+                         &[SchemaKind::Fixed],
+-                        |_| -> AvroResult<Schema> { Ok(Schema::Duration) },
++                        // The `fixed` is kept, so the name the schema gave it
++                        // survives parsing, serialization and the union
++                        // uniqueness rule. try_convert_to_logical_type has
++                        // already checked the kind, so this match is total.
++                        |inner| -> AvroResult<Schema> {
++                            match inner {
++                                Schema::Fixed(fixed) => Ok(Schema::Duration(fixed)),
++                                other => Ok(other),
++                            }
++                        },
+                     );
+                 }
+                 // In this case, of an unknown logical type, we just pass through the underlying
+@@ -2010,9 +2158,14 @@ impl Parser {
              _ => None,
          });
  
@@ -229,8 +337,12 @@ index 552516d..6d71dcf 100644
                  .ok_or_else(|| Details::GetFixedSizeFieldPositive(size.clone())),
              None => Err(Details::GetFixedSizeField),
          }?;
-@@ -2271,17 +2370,22 @@ impl Serialize for Schema {
-             Schema::Duration => {
+@@ -2268,20 +2421,34 @@ impl Serialize for Schema {
+                 map.serialize_entry("logicalType", "local-timestamp-nanos")?;
+                 map.end()
+             }
+-            Schema::Duration => {
++            Schema::Duration(ref inner) => {
                  let mut map = serializer.serialize_map(None)?;
  
 -                // the Avro doesn't indicate what the name of the underlying fixed type of a
@@ -253,37 +365,71 @@ index 552516d..6d71dcf 100644
 +                // here failed too, so a duration did not survive a round trip
 +                // through its own rendering.
 +                //
-+                // The specification does not say what the underlying fixed
-+                // should be called, and `Schema::Duration` carries no name to
-+                // remember, so the name written here is one this code chooses
-+                // and not necessarily the one that was parsed.
++                // The name and namespace are the ones the schema gave, so a
++                // duration keeps its identity across the round trip. They used
++                // to be dropped, because the variant kept no `fixed` to read
++                // them from.
 +                map.serialize_entry("type", "fixed")?;
-+                map.serialize_entry("name", "duration")?;
-+                map.serialize_entry("size", &12)?;
++                map.serialize_entry("name", &inner.name.name)?;
++                if let Some(namespace) = &inner.name.namespace {
++                    map.serialize_entry("namespace", namespace)?;
++                }
++                if let Some(aliases) = &inner.aliases {
++                    map.serialize_entry("aliases", aliases)?;
++                }
++                if let Some(doc) = &inner.doc {
++                    map.serialize_entry("doc", doc)?;
++                }
++                map.serialize_entry("size", &inner.size)?;
                  map.serialize_entry("logicalType", "duration")?;
                  map.end()
              }
-@@ -2697,6 +2801,158 @@ mod tests {
+@@ -2549,7 +2716,7 @@ pub mod derive {
+     impl_schema!(f64, Schema::Double);
+     impl_schema!(String, Schema::String);
+     impl_schema!(uuid::Uuid, Schema::Uuid);
+-    impl_schema!(core::time::Duration, Schema::Duration);
++    impl_schema!(core::time::Duration, Schema::duration());
+ 
+     impl<T> AvroSchemaComponent for Vec<T>
+     where
+@@ -2697,6 +2864,195 @@ mod tests {
          assert!(schema.is_err());
      }
  
 +    // A duration used to render as {"type":{"type":"fixed",..},..}, which no
 +    // implementation reads, so it did not survive a round trip through its own
-+    // rendering. The name is not asserted: Schema::Duration carries none, so
-+    // the one written is this code's choice.
++    // rendering. It also lost its name, because the variant carried no `fixed`
++    // to read one from; both halves are asserted here.
 +    #[test]
 +    fn test_duration_renders_as_an_annotated_fixed() -> TestResult {
-+        let rendered = Schema::Duration.canonical_form();
-+        let reparsed = Schema::parse_str(&serde_json::to_string(&Schema::Duration)?)?;
-+        assert!(
-+            matches!(reparsed, Schema::Duration),
-+            "a duration must re-parse as a duration, got {reparsed:?} from {rendered}"
-+        );
-+
-+        let json = serde_json::to_value(Schema::Duration)?;
++        let json = serde_json::to_value(Schema::duration())?;
 +        assert_eq!(json["type"], "fixed");
 +        assert_eq!(json["logicalType"], "duration");
 +        assert_eq!(json["size"], 12);
++        assert_eq!(json["name"], "duration");
++
++        let reparsed = Schema::parse_str(&serde_json::to_string(&Schema::duration())?)?;
++        assert!(
++            matches!(reparsed, Schema::Duration(_)),
++            "a duration must re-parse as a duration, got {reparsed:?}"
++        );
++
++        // The name a schema gave survives the round trip, which is what closes
++        // the second half of the finding.
++        let named = Schema::parse_str(
++            r#"{"type":"fixed","name":"B","namespace":"ns","size":12,
++                "logicalType":"duration"}"#,
++        )?;
++        let rendered = serde_json::to_value(&named)?;
++        assert_eq!(rendered["name"], "B");
++        assert_eq!(rendered["namespace"], "ns");
++        assert_eq!(rendered["logicalType"], "duration");
++        assert_eq!(
++            Schema::parse_str(&serde_json::to_string(&named)?)?.name(),
++            named.name(),
++            "the name must survive a second round trip too"
++        );
 +        Ok(())
 +    }
 +
@@ -308,6 +454,27 @@ index 552516d..6d71dcf 100644
 +                "expected a duplicate-branch error: {text}"
 +            );
 +        }
++
++        // A duration is a named `fixed` too, so a duration beside a reference to
++        // it is two branches naming one type, and two durations under different
++        // names are legal. This is what the model change to Schema::Duration
++        // bought: neither could be told apart while the variant was nameless.
++        assert!(
++            Schema::parse_str(
++                r#"[{"type":"fixed","name":"N0","namespace":"_","size":12,
++                     "logicalType":"duration"},
++                    {"type":"long","logicalType":"timestamp-millis"},
++                    "_.N0"]"#
++            )
++            .is_err()
++        );
++        assert!(
++            Schema::parse_str(
++                r#"[{"type":"fixed","name":"A","size":12,"logicalType":"duration"},
++                    {"type":"fixed","name":"B","size":12,"logicalType":"duration"}]"#
++            )
++            .is_ok()
++        );
 +
 +        // A decimal takes its name from the `fixed` it wraps, so two decimals
 +        // over one `fixed`, and a decimal beside that bare `fixed`, are each two
@@ -422,7 +589,7 @@ index 552516d..6d71dcf 100644
      #[test]
      fn test_multi_union_schema() -> TestResult {
          let schema = Schema::parse_str(r#"["null", "int", "float", "string", "bytes"]"#);
-@@ -4894,7 +5150,7 @@ mod tests {
+@@ -4894,7 +5250,7 @@ mod tests {
                  "type": "fixed",
                  "name": "Fixed",
                  "doc": "A Fixed schema without custom attributes",
@@ -431,6 +598,129 @@ index 552516d..6d71dcf 100644
              }
              "#,
          ];
+diff --git a/avro/src/schema_equality.rs b/avro/src/schema_equality.rs
+index 1097594..f77dd48 100644
+--- a/avro/src/schema_equality.rs
++++ b/avro/src/schema_equality.rs
+@@ -82,7 +82,7 @@ impl SchemataEq for StructFieldEq {
+         compare_primitive!(Uuid);
+         compare_primitive!(BigDecimal);
+         compare_primitive!(Date);
+-        compare_primitive!(Duration);
++
+         compare_primitive!(TimeMicros);
+         compare_primitive!(TimeMillis);
+         compare_primitive!(TimestampMicros);
+@@ -133,6 +133,16 @@ impl SchemataEq for StructFieldEq {
+             return false;
+         }
+ 
++        // A duration is a `fixed`, so it is compared like one, by size. It was
++        // in the primitive comparison above while the variant carried nothing to
++        // compare.
++        if let Schema::Duration(FixedSchema { size: size_one, .. }) = schema_one {
++            if let Schema::Duration(FixedSchema { size: size_two, .. }) = schema_two {
++                return size_one == size_two;
++            }
++            return false;
++        }
++
+         if let Schema::Union(UnionSchema {
+             schemas: schemas_one,
+             ..
+@@ -286,7 +296,7 @@ mod tests {
+     test_primitives!(Uuid);
+     test_primitives!(BigDecimal);
+     test_primitives!(Date);
+-    test_primitives!(Duration);
++
+     test_primitives!(TimeMicros);
+     test_primitives!(TimeMillis);
+     test_primitives!(TimestampMicros);
+diff --git a/avro/src/ser_schema.rs b/avro/src/ser_schema.rs
+index 7d0ed3e..5f1af4e 100644
+--- a/avro/src/ser_schema.rs
++++ b/avro/src/ser_schema.rs
+@@ -970,7 +970,7 @@ impl<'s, W: Write> SchemaAwareWriteSerializer<'s, W> {
+                     )))
+                 }
+             }
+-            Schema::Duration => {
++            Schema::Duration(..) => {
+                 if value.len() == 12 {
+                     self.writer
+                         .write(value)
+@@ -1020,7 +1020,7 @@ impl<'s, W: Write> SchemaAwareWriteSerializer<'s, W> {
+                         | Schema::Uuid
+                         | Schema::BigDecimal
+                         | Schema::Fixed(_)
+-                        | Schema::Duration
++                        | Schema::Duration(..)
+                         | Schema::Decimal(_)
+                         | Schema::Ref { name: _ } => {
+                             encode_int(i as i32, &mut *self.writer)?;
+diff --git a/avro/src/types.rs b/avro/src/types.rs
+index b41d257..93c7be7 100644
+--- a/avro/src/types.rs
++++ b/avro/src/types.rs
+@@ -441,7 +441,7 @@ impl Value {
+             (&Value::Date(_), &Schema::Date) => None,
+             (&Value::Decimal(_), &Schema::Decimal { .. }) => None,
+             (&Value::BigDecimal(_), &Schema::BigDecimal) => None,
+-            (&Value::Duration(_), &Schema::Duration) => None,
++            (&Value::Duration(_), &Schema::Duration(..)) => None,
+             (&Value::Uuid(_), &Schema::Uuid) => None,
+             (&Value::Float(_), &Schema::Float) => None,
+             (&Value::Float(_), &Schema::Double) => None,
+@@ -479,7 +479,7 @@ impl Value {
+                     None
+                 }
+             }
+-            (&Value::Fixed(n, _), &Schema::Duration) => {
++            (&Value::Fixed(n, _), &Schema::Duration(..)) => {
+                 if n != 12 {
+                     Some(format!(
+                         "The value's size ('{n}') must be exactly 12 to be a Duration"
+@@ -714,7 +714,7 @@ impl Value {
+             Schema::LocalTimestampMillis => self.resolve_local_timestamp_millis(),
+             Schema::LocalTimestampMicros => self.resolve_local_timestamp_micros(),
+             Schema::LocalTimestampNanos => self.resolve_local_timestamp_nanos(),
+-            Schema::Duration => self.resolve_duration(),
++            Schema::Duration(..) => self.resolve_duration(),
+             Schema::Uuid => self.resolve_uuid(),
+         }
+     }
+@@ -1333,15 +1333,15 @@ mod tests {
+             ),
+             (
+                 Value::Fixed(12, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+-                Schema::Duration,
++                Schema::duration(),
+                 true,
+                 "",
+             ),
+             (
+                 Value::Fixed(11, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+-                Schema::Duration,
++                Schema::duration(),
+                 false,
+-                "Invalid value: Fixed(11, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) for schema: Duration. Reason: The value's size ('11') must be exactly 12 to be a Duration",
++                "Invalid value: Fixed(11, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) for schema: Duration(FixedSchema { name: Name { name: \"duration\", namespace: None }, aliases: None, doc: None, size: 12, default: None, attributes: {} }). Reason: The value's size ('11') must be exactly 12 to be a Duration",
+             ),
+             (
+                 Value::Record(vec![("unknown_field_name".to_string(), Value::Null)]),
+@@ -1900,9 +1900,9 @@ Field with name '"b"' is not a member of the map items"#,
+             Days::new(5),
+             Millis::new(3000),
+         ));
+-        assert!(value.clone().resolve(&Schema::Duration).is_ok());
++        assert!(value.clone().resolve(&Schema::duration()).is_ok());
+         assert!(value.resolve(&Schema::TimestampMicros).is_err());
+-        assert!(Value::Long(1i64).resolve(&Schema::Duration).is_err());
++        assert!(Value::Long(1i64).resolve(&Schema::duration()).is_err());
+     }
+ 
+     #[test]
 diff --git a/avro/src/util.rs b/avro/src/util.rs
 index f0bdede..d696fc2 100644
 --- a/avro/src/util.rs
@@ -611,6 +901,19 @@ index f0bdede..d696fc2 100644
      #[test]
      fn the_scan_measures_an_incomplete_document_as_far_as_it_goes() {
          // The shape that costs the least input per level, and the one an
+diff --git a/avro/src/writer.rs b/avro/src/writer.rs
+index 9c87991..70a2678 100644
+--- a/avro/src/writer.rs
++++ b/avro/src/writer.rs
+@@ -1043,7 +1043,7 @@ mod tests {
+         ));
+         logical_type_test(
+             r#"{"type": {"type": "fixed", "name": "duration", "size": 12}, "logicalType": "duration"}"#,
+-            &Schema::Duration,
++            &Schema::duration(),
+             value,
+             &inner,
+             Value::Fixed(12, vec![0, 1, 0, 0, 0, 2, 0, 0, 0, 4, 0, 0]),
 -- 
 2.52.0
 
