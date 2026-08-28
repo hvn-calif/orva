@@ -1,0 +1,616 @@
+From 568ef5c91283141b995e533a3413978b52db6aa0 Mon Sep 17 00:00:00 2001
+From: Viet Hung Nguyen <hvn@calif.io>
+Date: Sat, 29 Aug 2026 00:04:37 +0700
+Subject: [PATCH] fix: Six fixes found by differential fuzzing against Avro C++
+
+The first four were found by comparing this crate against Avro C++ on
+generated schemas, the last two by reviewing those. In every case Avro C++
+follows the specification, or is simply right, and this crate did not.
+
+1. A union may hold at most one branch per type, except for the named
+   types record, fixed and enum. A logical type annotates an underlying
+   type, so `time-micros` and `timestamp-micros` are two `long` branches
+   and a union of them is no more legal than a union of two plain `long`s.
+   Schema gives each logical type its own variant, so the SchemaKind
+   discriminant that drove duplicate detection saw them as distinct.
+
+   The underlying type of a decimal comes from its inner schema, so a
+   decimal on `bytes` collides with plain `bytes` while one on a `fixed`
+   is named and collides with nothing. That also fixes the opposite error:
+   a union of a decimal on `fixed` beside a decimal on `bytes` was
+   rejected as a duplicate, and Avro C++ accepts it.
+
+   Two branches naming one type are also two branches of the same type, so
+   a union may hold neither a definition and a reference to it nor two
+   references to one name. variant_index's own note has recorded that gap
+   for as long as it has existed.
+
+   Duplicate detection is kept apart from variant_index, which answers a
+   different question -- which branch a value of some kind belongs to --
+   and has to stay keyed by the exact kind, its documented slow path
+   handling logical and named types.
+
+2. A fixed of size zero is rejected. The specification calls `size` "a
+   positive integer", a fixed of no bytes can hold no value, and the error
+   variant raised here has been named GetFixedSizeFieldPositive all along
+   while the check was only that the field parsed as an unsigned integer.
+
+3. A duration renders as one fixed carrying `logicalType`, not as a `type`
+   whose value is a fixed. It nested them, producing
+   {"type":{"type":"fixed",..},"logicalType":"duration"}, which no
+   implementation reads: Avro C++ rejects it with 'Json field "type" is
+   not a string' and re-parsing it with this crate failed too, so a
+   duration did not survive a round trip through its own rendering. The
+   specification does not say what the underlying fixed should be called
+   and Schema::Duration carries no name to remember, so a parsed name is
+   still lost; that is a separate limit of the model.
+
+4. The document scan skips a vertical tab and a form feed rather than
+   reading one as the start of a scalar. Neither is a value under either
+   reading -- strict JSON refuses them, Avro C++ skips them as spacing --
+   but scan_json fell through to its scalar arm, so a leading vertical tab
+   made json_document_end report a boundary of 1 and a caller cutting
+   there was left with no document at all. Found after 38 minutes and 24.9
+   million runs, by an input that needed a leading vertical tab and a
+   trailing NUL together: each alone parsed.
+
+Not additive: one upstream test,
+avro_custom_attributes_schema_without_attributes, declared a fixed of size
+0. That test is about custom attributes and the size is incidental to it,
+so it now declares 16.
+
+Two further fixes, found by reviewing the four above rather than by fuzzing,
+since neither is reachable from the generators:
+
+5. Inside a string literal, only a *bare* byte below 0x20 is escaped. One
+   that follows a backslash is left alone, because there it is not a
+   character an escape denotes: tryString accepts a backslash only before
+   one of " \ / b f n r t u and throws on anything else, so Avro C++
+   rejects such a document and so does serde_json. Escaping it anyway
+   emitted the backslash and then an escape, so a backslash followed by
+   0x01 became two backslashes followed by u0001, which parses as one
+   escaped backslash plus five ordinary characters -- turning a document
+   both readers reject into one this crate accepts, holding text nobody
+   wrote.
+
+6. A union branch's name is read from a decimal's inner schema, as its
+   underlying type already was. A decimal on a named fixed was checked by
+   neither rule: the type rule skipped it as named, and the name rule
+   supplied no name because Schema::Decimal has none. Two decimals over
+   one fixed, or a decimal beside the bare fixed it wraps, were accepted
+   and would then resolve to whichever branch came first.
+---
+ avro/src/schema.rs | 286 ++++++++++++++++++++++++++++++++++++++++++---
+ avro/src/util.rs   | 120 ++++++++++++++++---
+ 2 files changed, 378 insertions(+), 28 deletions(-)
+
+diff --git a/avro/src/schema.rs b/avro/src/schema.rs
+index 552516d..6d71dcf 100644
+--- a/avro/src/schema.rs
++++ b/avro/src/schema.rs
+@@ -35,7 +35,7 @@ use serde::{
+ use serde_json::{Map, Value};
+ use std::{
+     borrow::Borrow,
+-    collections::{BTreeMap, HashMap, HashSet},
++    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+     fmt,
+     fmt::Debug,
+     hash::Hash,
+@@ -909,6 +909,80 @@ pub struct UnionSchema {
+     variant_index: BTreeMap<SchemaKind, usize>,
+ }
+ 
++/// The name a union branch is distinguished by, when it is a named type.
++///
++/// Two branches naming one type are two branches of the same type, so a union
++/// may not hold both a definition and a reference to it, nor two references to
++/// one name. `variant_index`'s note has recorded this gap for as long as it has
++/// existed: "this approach does not work for named types, and will have to be
++/// modified to support that. A simple solution is to also keep a mapping of the
++/// names used."
++///
++/// A reference to a name defined outside the union is a single branch and
++/// collides with nothing, so only names repeated *within* one union matter.
++fn union_branch_name(schema: &Schema) -> Option<&Name> {
++    match schema {
++        Schema::Record(record) => Some(&record.name),
++        Schema::Enum(enumeration) => Some(&enumeration.name),
++        Schema::Fixed(fixed) => Some(&fixed.name),
++        Schema::Ref { name } => Some(name),
++        // A decimal takes its name from its inner schema, exactly as it takes
++        // its underlying type from there. Without this recursion a decimal on a
++        // named `fixed` is checked by neither rule -- `union_branch_kind` skips
++        // it as named, and this would not supply the name -- so two decimals
++        // over one `fixed`, or a decimal beside the bare `fixed` it wraps, would
++        // both be accepted and then resolve to whichever branch came first.
++        Schema::Decimal(decimal) => union_branch_name(&decimal.inner),
++        _ => None,
++    }
++}
++
++/// The underlying Avro type of a union branch, or `None` when the branch is a
++/// named type and so distinguished by name rather than by type.
++///
++/// A logical type is an annotation on an underlying Avro type, and the
++/// specification's uniqueness rule is about that underlying type: a union of
++/// `time-micros` and `timestamp-micros` holds two `long` branches, so it is no
++/// more legal than a union of two plain `long`s. `Schema` gives each logical
++/// type its own variant, so its discriminant cannot answer this question.
++///
++/// A decimal or a duration takes the answer from its inner schema, which is why
++/// this needs the schema and not just the kind: a decimal on `bytes` collides
++/// with plain `bytes`, while one on a `fixed` is named and collides with
++/// nothing.
++fn union_branch_kind(schema: &Schema) -> Option<SchemaKind> {
++    let kind = SchemaKind::from(schema);
++    if kind.is_named() {
++        return None;
++    }
++    Some(match kind {
++        SchemaKind::Date | SchemaKind::TimeMillis => SchemaKind::Int,
++        SchemaKind::TimeMicros
++        | SchemaKind::TimestampMillis
++        | SchemaKind::TimestampMicros
++        | SchemaKind::TimestampNanos
++        | SchemaKind::LocalTimestampMillis
++        | SchemaKind::LocalTimestampMicros
++        | SchemaKind::LocalTimestampNanos => SchemaKind::Long,
++        SchemaKind::Uuid => SchemaKind::String,
++        SchemaKind::BigDecimal => SchemaKind::Bytes,
++        SchemaKind::Decimal => match schema {
++            Schema::Decimal(decimal) => return union_branch_kind(&decimal.inner),
++            _ => SchemaKind::Decimal,
++        },
++        // A duration is a `fixed` carrying an annotation, so it is a named type
++        // and the name is what distinguishes it -- two durations under different
++        // names are two branches, which Avro C++ accepts. `Schema::Duration`
++        // keeps no name, so this cannot check that two of them differ; treating
++        // it as unnamed is the reading that matches Avro C++ on every union a
++        // schema can express, at the cost of admitting two durations that name
++        // the same fixed. Giving `Schema::Duration` a name is the fix, and that
++        // is a change to the model rather than to this check.
++        SchemaKind::Duration => return None,
++        other => other,
++    })
++}
++
+ impl UnionSchema {
+     /// Creates a new UnionSchema from a vector of schemas.
+     pub fn new(schemas: Vec<Schema>) -> AvroResult<Self> {
+@@ -916,13 +990,33 @@ impl UnionSchema {
+             return Err(Details::EmptyUnion.into());
+         }
+         let mut vindex = BTreeMap::new();
++        // Duplicate detection is separate from `vindex` because the two ask
++        // different questions: `vindex` maps a value's own kind to a branch, so
++        // it has to stay keyed by the exact kind, while the specification's
++        // uniqueness rule is about the underlying Avro type.
++        let mut branch_types = BTreeSet::new();
++        let mut branch_names = HashSet::new();
+         for (i, schema) in schemas.iter().enumerate() {
+             if let Schema::Union(_) = schema {
+                 return Err(Details::GetNestedUnion.into());
+             }
+             let kind = SchemaKind::from(schema);
+-            if !kind.is_named() && vindex.insert(kind, i).is_some() {
+-                return Err(Details::GetUnionDuplicate.into());
++            if let Some(branch_type) = union_branch_kind(schema) {
++                if !branch_types.insert(branch_type) {
++                    return Err(Details::GetUnionDuplicate.into());
++                }
++                vindex.insert(kind, i);
++            }
++            // A named branch is distinguished by its name, so the name is what
++            // has to be unique. The namespace is taken as written here: this
++            // runs before the enclosing namespace is known, so two branches
++            // that resolve to one full name only by inheriting it are not
++            // caught. Both a definition and a reference to it carry the same
++            // written name in every case the parser produces.
++            if let Some(name) = union_branch_name(schema) {
++                if !branch_names.insert(name.clone()) {
++                    return Err(Details::GetUnionDuplicate.into());
++                }
+             }
+         }
+         Ok(UnionSchema {
+@@ -2010,9 +2104,14 @@ impl Parser {
+             _ => None,
+         });
+ 
++        // Zero is rejected, which the error variant's name has always claimed
++        // and the check did not do: the specification calls `size` "a positive
++        // integer", a fixed of no bytes can hold no value, and Avro C++ refuses
++        // it ("Size for fixed is not positive").
+         let size = match size_opt {
+             Some(size) => size
+                 .as_u64()
++                .filter(|&size| size > 0)
+                 .ok_or_else(|| Details::GetFixedSizeFieldPositive(size.clone())),
+             None => Err(Details::GetFixedSizeField),
+         }?;
+@@ -2271,17 +2370,22 @@ impl Serialize for Schema {
+             Schema::Duration => {
+                 let mut map = serializer.serialize_map(None)?;
+ 
+-                // the Avro doesn't indicate what the name of the underlying fixed type of a
+-                // duration should be or typically is.
+-                let inner = Schema::Fixed(FixedSchema {
+-                    name: Name::new("duration").unwrap(),
+-                    aliases: None,
+-                    doc: None,
+-                    size: 12,
+-                    default: None,
+-                    attributes: Default::default(),
+-                });
+-                map.serialize_entry("type", &inner)?;
++                // A logical type annotates its underlying type in the same
++                // object, so this is one `fixed` carrying `logicalType`, not a
++                // `type` whose value is a `fixed`. Nesting it produced
++                // {"type":{"type":"fixed",..},"logicalType":"duration"}, which
++                // is not a schema any implementation reads: Avro C++ rejects it
++                // with `Json field "type" is not a string`, and re-parsing it
++                // here failed too, so a duration did not survive a round trip
++                // through its own rendering.
++                //
++                // The specification does not say what the underlying fixed
++                // should be called, and `Schema::Duration` carries no name to
++                // remember, so the name written here is one this code chooses
++                // and not necessarily the one that was parsed.
++                map.serialize_entry("type", "fixed")?;
++                map.serialize_entry("name", "duration")?;
++                map.serialize_entry("size", &12)?;
+                 map.serialize_entry("logicalType", "duration")?;
+                 map.end()
+             }
+@@ -2697,6 +2801,158 @@ mod tests {
+         assert!(schema.is_err());
+     }
+ 
++    // A duration used to render as {"type":{"type":"fixed",..},..}, which no
++    // implementation reads, so it did not survive a round trip through its own
++    // rendering. The name is not asserted: Schema::Duration carries none, so
++    // the one written is this code's choice.
++    #[test]
++    fn test_duration_renders_as_an_annotated_fixed() -> TestResult {
++        let rendered = Schema::Duration.canonical_form();
++        let reparsed = Schema::parse_str(&serde_json::to_string(&Schema::Duration)?)?;
++        assert!(
++            matches!(reparsed, Schema::Duration),
++            "a duration must re-parse as a duration, got {reparsed:?} from {rendered}"
++        );
++
++        let json = serde_json::to_value(Schema::Duration)?;
++        assert_eq!(json["type"], "fixed");
++        assert_eq!(json["logicalType"], "duration");
++        assert_eq!(json["size"], 12);
++        Ok(())
++    }
++
++    // Two branches naming one type are two branches of the same type, which is
++    // the gap variant_index's note has always described. Avro C++ rejects each
++    // of these with "bad node of type union".
++    #[test]
++    fn test_union_rejects_two_branches_naming_one_type() {
++        for text in [
++            // A record beside a reference to itself.
++            r#"["int",
++                {"type":"record","name":"N0","namespace":"a.b.c",
++                 "fields":[{"name":"f","type":"long"}]},
++                "a.b.c.N0"]"#,
++            // Two references to one name.
++            r#"[{"type":"record","name":"R","fields":[
++                  {"name":"f","type":["ns.T","ns.T"]}]},
++                {"type":"record","name":"T","namespace":"ns","fields":[]}]"#,
++        ] {
++            assert!(
++                Schema::parse_str(text).is_err(),
++                "expected a duplicate-branch error: {text}"
++            );
++        }
++
++        // A decimal takes its name from the `fixed` it wraps, so two decimals
++        // over one `fixed`, and a decimal beside that bare `fixed`, are each two
++        // branches naming one type. Neither rule caught these until
++        // `union_branch_name` learned to recurse: the kind rule skips a decimal
++        // on a named type, and the name rule did not look inside.
++        let fixed = |size: usize| {
++            Schema::Fixed(FixedSchema {
++                name: Name::new("F").unwrap(),
++                aliases: None,
++                doc: None,
++                size,
++                default: None,
++                attributes: Default::default(),
++            })
++        };
++        let decimal_on_fixed = |scale: usize| {
++            Schema::Decimal(DecimalSchema {
++                precision: 9,
++                scale,
++                inner: Box::new(fixed(4)),
++            })
++        };
++        assert!(UnionSchema::new(vec![decimal_on_fixed(2), decimal_on_fixed(0)]).is_err());
++        assert!(UnionSchema::new(vec![decimal_on_fixed(2), fixed(4)]).is_err());
++        // One decimal on that `fixed` beside one on `bytes` is still two
++        // different underlying types, and still legal.
++        assert!(
++            UnionSchema::new(vec![
++                decimal_on_fixed(2),
++                Schema::Decimal(DecimalSchema {
++                    precision: 4,
++                    scale: 1,
++                    inner: Box::new(Schema::Bytes),
++                }),
++            ])
++            .is_ok()
++        );
++
++        // Two *different* named types, and a single reference beside a
++        // primitive, both stay legal.
++        for text in [
++            r#"[{"type":"record","name":"A","fields":[]},
++                {"type":"record","name":"B","fields":[]}]"#,
++            // The reference is to the enclosing record, defined before the
++            // union that mentions it, so it resolves and is one named branch.
++            r#"{"type":"record","name":"T","namespace":"ns","fields":[
++                 {"name":"f","type":["null","ns.T"]}]}"#,
++        ] {
++            assert!(
++                Schema::parse_str(text).is_ok(),
++                "expected this union to stay legal: {text}"
++            );
++        }
++    }
++
++    // The specification calls a fixed's `size` "a positive integer", and a
++    // fixed of no bytes can hold no value. Avro C++ refuses it too.
++    #[test]
++    fn test_fixed_rejects_a_size_of_zero() {
++        assert!(Schema::parse_str(r#"{"type":"fixed","name":"F","size":0}"#).is_err());
++        assert!(Schema::parse_str(r#"{"type":"fixed","name":"F","size":1}"#).is_ok());
++    }
++
++    // "Unions may not contain more than one schema with the same type, except
++    // for the named types record, fixed and enum." A logical type is an
++    // annotation on an underlying type, so two branches annotated differently
++    // over one underlying type are still two branches of that type.
++    #[test]
++    fn test_union_rejects_two_branches_of_one_underlying_type() {
++        // Two `long` branches, and two `int` branches.
++        for text in [
++            r#"[{"type":"long","logicalType":"time-micros"},
++                {"type":"long","logicalType":"timestamp-micros"}]"#,
++            r#"["long", {"type":"long","logicalType":"timestamp-millis"}]"#,
++            // Two decimals over one underlying type is still two `bytes`
++            // branches, whatever their precision and scale.
++            r#"[{"type":"bytes","logicalType":"decimal","precision":4,"scale":2},
++                {"type":"bytes","logicalType":"decimal","precision":9,"scale":1}]"#,
++            r#"[{"type":"int","logicalType":"date"},
++                {"type":"int","logicalType":"time-millis"}]"#,
++            r#"["string", {"type":"string","logicalType":"uuid"}]"#,
++        ] {
++            assert!(
++                Schema::parse_str(text).is_err(),
++                "expected a duplicate-branch error: {text}"
++            );
++        }
++
++        // One branch per underlying type is still legal, annotated or not.
++        for text in [
++            r#"[{"type":"int","logicalType":"date"},
++                {"type":"long","logicalType":"timestamp-micros"}]"#,
++            r#"["null", {"type":"long","logicalType":"time-micros"}]"#,
++            // A decimal takes its underlying type from its inner schema, so one
++            // on a named `fixed` sits beside plain `bytes`, and beside a decimal
++            // on `bytes`, without colliding with either.
++            r#"["bytes", {"type":"fixed","name":"F","size":8,
++                "logicalType":"decimal","precision":4,"scale":2}]"#,
++            r#"[{"type":"fixed","name":"N0","size":2,"logicalType":"decimal",
++                 "precision":37,"scale":0},
++                "null",
++                {"type":"bytes","logicalType":"decimal","precision":19,"scale":19}]"#,
++        ] {
++            assert!(
++                Schema::parse_str(text).is_ok(),
++                "expected this union to stay legal: {text}"
++            );
++        }
++    }
++
+     #[test]
+     fn test_multi_union_schema() -> TestResult {
+         let schema = Schema::parse_str(r#"["null", "int", "float", "string", "bytes"]"#);
+@@ -4894,7 +5150,7 @@ mod tests {
+                 "type": "fixed",
+                 "name": "Fixed",
+                 "doc": "A Fixed schema without custom attributes",
+-                "size": 0
++                "size": 16
+             }
+             "#,
+         ];
+diff --git a/avro/src/util.rs b/avro/src/util.rs
+index f0bdede..d696fc2 100644
+--- a/avro/src/util.rs
++++ b/avro/src/util.rs
+@@ -399,12 +399,20 @@ static AVRO_CPP_JSON_WHITESPACE: OnceLock<bool> = OnceLock::new();
+ /// leave the parsed value identical to what Avro C++ would have produced:
+ ///
+ /// - between tokens, a vertical tab or form feed becomes a space;
+-/// - inside a string literal, a byte below 0x20 becomes its `\u00XX` escape,
+-///   which is the same character spelled the way JSON requires.
++/// - inside a string literal, a *bare* byte below 0x20 becomes its `\u00XX`
++///   escape, which is the same character spelled the way JSON requires.
+ ///
+-/// Nothing else is touched, and no byte is dropped, so a document that parses
++/// Nothing else is touched and no byte is dropped, so a document that parses
+ /// carries exactly the data it did.
+ ///
++/// "Bare" is the whole of the second rule. A byte below 0x20 that follows a
++/// backslash is left alone, because there it is not a character an escape
++/// denotes: Avro C++ accepts a backslash only before one of `" \ / b f n r t u`
++/// and throws on anything else, so such a document is refused there and by
++/// serde_json alike. Escaping it anyway would emit the backslash *and* an escape
++/// after it, turning a document both readers reject into one this crate accepts,
++/// holding text nobody wrote.
++///
+ /// This function only changes the setting once; on subsequent calls the value
+ /// stays as the first call left it.
+ ///
+@@ -441,7 +449,7 @@ fn spaces_for_extra_whitespace(raw: &[u8]) -> Option<Vec<u8>> {
+         match raw[i] {
+             b'"' => match string_literal_end(raw, i) {
+                 Some(end) => {
+-                    found = raw[i..end].iter().any(|&byte| byte < 0x20);
++                    found = string_holds_a_bare_control_byte(&raw[i..end]);
+                     i = end;
+                 }
+                 // Unterminated: the parse fails on it either way, and rewriting
+@@ -467,13 +475,7 @@ fn spaces_for_extra_whitespace(raw: &[u8]) -> Option<Vec<u8>> {
+                     out.extend_from_slice(&raw[i..]);
+                     break;
+                 };
+-                for &byte in &raw[i..end] {
+-                    if byte < 0x20 {
+-                        out.extend_from_slice(format!("\\u{byte:04x}").as_bytes());
+-                    } else {
+-                        out.push(byte);
+-                    }
+-                }
++                escape_bare_control_bytes(&raw[i..end], &mut out);
+                 i = end;
+             }
+             byte => {
+@@ -485,6 +487,53 @@ fn spaces_for_extra_whitespace(raw: &[u8]) -> Option<Vec<u8>> {
+     Some(out)
+ }
+ 
++/// Whether `literal`, one string literal including its quotes, holds a byte
++/// below 0x20 that stands on its own rather than following a backslash.
++///
++/// The distinction is the whole point. A byte below 0x20 *after* a backslash is
++/// not a character an escape denotes: Avro C++'s `tryString` accepts a backslash
++/// only before one of `" \ / b f n r t u` and throws on anything else, so such a
++/// document is refused there, and serde_json refuses it too. Rewriting it would
++/// turn a document both readers reject into one this crate accepts, holding text
++/// nobody wrote.
++fn string_holds_a_bare_control_byte(literal: &[u8]) -> bool {
++    let mut i = 0;
++    while i < literal.len() {
++        match literal[i] {
++            // Skip the escape and whatever it applies to, as
++            // `string_literal_end` does.
++            b'\\' => i += 2,
++            byte if byte < 0x20 => return true,
++            _ => i += 1,
++        }
++    }
++    false
++}
++
++/// Appends `literal` to `out` with every bare byte below 0x20 replaced by the
++/// `\u00XX` escape denoting the same character. An escape and the byte it
++/// applies to are copied unchanged, so a document that was invalid stays
++/// invalid; see [`string_holds_a_bare_control_byte`].
++fn escape_bare_control_bytes(literal: &[u8], out: &mut Vec<u8>) {
++    let mut i = 0;
++    while i < literal.len() {
++        match literal[i] {
++            b'\\' => {
++                out.extend_from_slice(&literal[i..(i + 2).min(literal.len())]);
++                i += 2;
++            }
++            byte if byte < 0x20 => {
++                out.extend_from_slice(format!("\\u{byte:04x}").as_bytes());
++                i += 1;
++            }
++            byte => {
++                out.push(byte);
++                i += 1;
++            }
++        }
++    }
++}
++
+ /// One past the last byte of the first complete JSON document in `raw`, or
+ /// `None` when `raw` holds no complete document. Trailing whitespace is not
+ /// included.
+@@ -521,7 +570,7 @@ struct JsonScan {
+ fn ends_a_scalar(byte: u8) -> bool {
+     matches!(
+         byte,
+-        b' ' | b'\n' | b'\t' | b'\r' | b'"' | b'[' | b']' | b'{' | b'}' | b',' | b':'
++        b' ' | b'\n' | b'\t' | b'\r' | b'"' | b'[' | b']' | b'{' | b'}' | b',' | b':' | 0x0b | 0x0c
+     )
+ }
+ 
+@@ -579,7 +628,15 @@ fn scan_json(raw: &[u8]) -> JsonScan {
+                 }
+             }
+             // Nothing here is a value, so nothing here can end the document.
+-            b' ' | b'\n' | b'\t' | b'\r' | b',' | b':' => {
++            //
++            // A vertical tab and a form feed are in this set whatever
++            // `set_avro_cpp_json_whitespace` says, because neither is a value
++            // under either reading: strict JSON refuses them outright, and Avro
++            // C++ skips them as spacing. Treating one as the start of a scalar
++            // put the first document's end at the byte after it, so a leading
++            // vertical tab made `json_document_end` report a boundary of 1 and
++            // a caller cutting there was left with no document at all.
++            b' ' | b'\n' | b'\t' | b'\r' | b',' | b':' | 0x0b | 0x0c => {
+                 i += 1;
+                 continue;
+             }
+@@ -812,10 +869,47 @@ mod tests {
+         assert_eq!(scan_json(br#"[1,[2]] junk"#).document_end, Some(7));
+         // Leading whitespace is skipped and trailing whitespace is not included.
+         assert_eq!(scan_json(b"  [1]  ").document_end, Some(5));
++        // A vertical tab and a form feed are skipped too, whatever
++        // `set_avro_cpp_json_whitespace` says, because neither is a value under
++        // either reading. Read as the start of a scalar, a leading one put the
++        // boundary at 1 and a caller cutting there had no document left.
++        assert_eq!(scan_json(b"\x0b\"int\"\x00").document_end, Some(6));
++        assert_eq!(scan_json(b"\x0c[1] junk").document_end, Some(4));
++        assert_eq!(scan_json(b"\x0b\x0c 42\x0b43").document_end, Some(5));
+         // An unmatched closer is malformed, so there is no boundary to report.
+         assert_eq!(scan_json(b"]").document_end, None);
+     }
+ 
++    // The rewrite escapes a bare control byte inside a string and leaves one
++    // that follows a backslash alone. The second half is the important one: a
++    // byte below 0x20 after a backslash is not a character an escape denotes,
++    // so Avro C++'s tryString throws on it and serde_json refuses it too.
++    // Escaping it anyway produced two backslashes followed by literal `u0001`,
++    // which parses -- turning a document both readers reject into one this crate
++    // accepts, holding text nobody wrote.
++    #[test]
++    fn the_rewrite_escapes_a_bare_control_byte_and_not_an_escaped_one() {
++        // Bare: escaped to the same character, spelled as JSON requires.
++        assert_eq!(
++            spaces_for_extra_whitespace(b"\"\x01\"").unwrap(),
++            br#""\u0001""#
++        );
++        let parsed: Value =
++            serde_json::from_slice(&spaces_for_extra_whitespace(b"\"a\x01b\"").unwrap()).unwrap();
++        assert_eq!(parsed.as_str(), Some("a\u{1}b"));
++
++        // After a backslash: untouched, so the document stays invalid to both.
++        assert!(spaces_for_extra_whitespace(b"\"\\\x01\"").is_none());
++        assert!(serde_json::from_slice::<Value>(b"\"\\\x01\"").is_err());
++
++        // A real escape is copied through, and a bare byte beside it is still
++        // escaped, so one does not mask the other.
++        assert_eq!(
++            spaces_for_extra_whitespace(b"\"\\n\x01\"").unwrap(),
++            br#""\n\u0001""#
++        );
++    }
++
+     #[test]
+     fn the_scan_measures_an_incomplete_document_as_far_as_it_goes() {
+         // The shape that costs the least input per level, and the one an
+-- 
+2.52.0
+

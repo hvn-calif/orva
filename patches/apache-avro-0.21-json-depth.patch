@@ -1,88 +1,38 @@
-From 2d8da8ca8df0c68d0279cb5b5671a97c83204659 Mon Sep 17 00:00:00 2001
+From 50762a385c18ec06e7a295338fda20123bcdd2fd Mon Sep 17 00:00:00 2001
 From: Viet Hung Nguyen <hvn@calif.io>
 Date: Mon, 24 Aug 2026 11:10:21 +0700
-Subject: [PATCH] feat: Optionally bound the JSON nesting depth accepted when
- parsing a schema
+Subject: [PATCH] feat: Optionally bound JSON nesting depth and accept Avro
+ C++'s control bytes
 
-serde_json applies a fixed limit of 128 nested containers when parsing schema
-JSON, assigned where the `Deserializer` is constructed with no setter to change
-it. Apache Avro C++ bounds the same recursion at 600 nested values. A schema
-between those two numbers is therefore readable by one implementation and not by
-the other, and the crate has no way to move.
+Two opt-in settings over one shared pre-parse pass on schema JSON, both
+unset by default so nothing changes for a caller who does not ask.
 
-Adds `util::set_max_json_depth`, unset by default. Unset means nothing changes at
-all: serde_json's own limit stays in force, no depth scan runs, and parsing
-behaves byte for byte as it did before. Calling the setter switches both halves
-at once -- serde_json's limit off, the scan on -- so exactly one of the two limits
-is ever in force and there is no state in which both or neither apply.
+util::set_max_json_depth bounds how deep a schema JSON document may nest,
+measured by a linear scan over the bytes before any parsing, and switches
+serde_json's own 128-container limit off so exactly one limit applies.
+Clamped to MAX_JSON_DEPTH_CEILING, 600, which is what Avro C++'s
+DepthTracker enforces, in the same unit: nested values, so 599 nested
+containers with a scalar at the bottom.
 
-The check runs *before* the parse, over the input bytes, and that ordering is the
-design rather than an implementation detail. With serde_json's limit disabled the
-parse is itself the stack risk, so measuring the depth of the resulting `Value`
-would be measuring it after the danger has passed. The scan is a single iterative
-pass, aware of string literals and backslash escapes because a `{` inside a `doc`
-string is not nesting, so a document nested 60,000 levels deep is refused in
-constant stack.
+util::set_avro_cpp_json_whitespace accepts the raw control bytes Avro C++
+takes and JSON forbids. Between tokens it skips whitespace with isspace,
+which also takes a vertical tab and a form feed; inside a string literal
+tryString copies through any byte that is not a quote or a backslash. The
+pass rewrites the first to a space and the second to the \u00XX escape
+denoting the same character, so a document that parses carries exactly the
+data it did.
 
-The limit counts nested *values*, not brackets: a value's depth is one plus the
-number of containers enclosing it. That is the unit Apache Avro C++ counts in, and
-it is one more than a bracket count whenever a scalar sits at the bottom, which in
-a schema document it always does -- the innermost thing in a schema is a type name.
-So a limit of 600 admits 599 nested containers with a scalar inside them, which is
-599 nested arrays or 199 nested one-field records, since a record costs three JSON
-levels per Avro level. `set_max_json_depth`'s documentation carries that
-conversion table.
-
-The argument is clamped to `MAX_JSON_DEPTH_CEILING`, 600. A limit above what the
-stack can hold turns a clean rejection into an abort, and how deep the stack
-reaches depends on the build: bisected on aarch64, a document at the limit costs
-6.8 MiB of stack unoptimised and 410 KiB optimised. The setter returns what it
-installed, so a caller asking for more can see that it was clamped.
-
-Every site that parses schema JSON is covered: four functions and five calls,
-since `Schema::parse_str_with_list` parses twice. That includes the container file
-header, where `Reader` parses `avro.schema` itself with `serde_json::from_slice`,
-so a check inside `Schema::parse_str` would have missed it. At that site a depth
-rejection is reported as itself while every other failure keeps reporting
-`GetAvroSchemaFromMap`, so nothing but the new rejection changes there.
-
-`util::json_document_end` is public alongside the setter, for a caller that needs
-to cut input at the end of its first JSON document. Parsing to find that boundary
-is the recursion the limit exists to prevent, so on input that has not been
-depth-checked yet it is the wrong order; the scan already tracks everything
-finding the boundary requires.
-
-Adds `Details::JsonDepthExceeded`, so the rejection says the depth was exceeded
-rather than something about JSON syntax. `Details` has no `#[non_exhaustive]`, so
-a new variant is breaking for a consumer matching it exhaustively.
-
-`unbounded_depth` joins serde_json's features, which is what makes
-`Deserializer::disable_recursion_limit` available. The feature changes nothing on
-its own -- the default stays 128 until something calls the setter -- so it is safe
-under Cargo's feature unification.
-
-Tests are split by the value of the setting, because a `OnceLock` cannot be reset
-within a process: the unset cases and the scan's own unit tests are in
-`src/util.rs`, `tests/max_json_depth.rs` runs at the ceiling, and
-`tests/max_json_depth_lowered.rs` runs at a limit the caller chose, which is what
-distinguishes a limit that honours its argument from one that always installs 600.
-The boundary is pinned as documents rather than as a constant, in two shapes,
-because they cost a different number of JSON levels per Avro level and one shape
-alone could not show the counter counting the right event.
-
-Verified on apache-avro 0.21 with the six patches before it applied:
-`cargo test -p apache-avro --features derive` goes from 567 to 578, the eleven
-tests this adds, `cargo fmt --check` is clean, and clippy reports nothing in any
-changed file.
+util::json_document_end exposes the scan's other answer, the end of the
+first JSON document, for a caller that needs the boundary without parsing.
 ---
  avro/Cargo.toml                      |   7 +-
  avro/src/error.rs                    |   3 +
  avro/src/reader.rs                   |  21 +-
  avro/src/schema.rs                   |  14 +-
- avro/src/util.rs                     | 358 +++++++++++++++++++++++++++
- avro/tests/max_json_depth.rs         | 250 +++++++++++++++++++
- avro/tests/max_json_depth_lowered.rs |  67 +++++
- 7 files changed, 703 insertions(+), 17 deletions(-)
+ avro/src/util.rs                     | 466 +++++++++++++++++++++++++++
+ avro/tests/max_json_depth.rs         | 250 ++++++++++++++
+ avro/tests/max_json_depth_lowered.rs |  67 ++++
+ 7 files changed, 811 insertions(+), 17 deletions(-)
  create mode 100644 avro/tests/max_json_depth.rs
  create mode 100644 avro/tests/max_json_depth_lowered.rs
 
@@ -211,7 +161,7 @@ index 6e66386..552516d 100644
      }
  
 diff --git a/avro/src/util.rs b/avro/src/util.rs
-index f269c06..f39428c 100644
+index f269c06..f0bdede 100644
 --- a/avro/src/util.rs
 +++ b/avro/src/util.rs
 @@ -18,6 +18,7 @@
@@ -256,7 +206,7 @@ index f269c06..f39428c 100644
  pub(crate) trait MapHelper {
      fn string(&self, key: &str) -> Option<String>;
  
-@@ -283,6 +311,233 @@ pub(crate) fn uuid_as_string() -> bool {
+@@ -283,6 +311,341 @@ pub(crate) fn uuid_as_string() -> bool {
      *UUID_AS_STRING.get_or_init(|| DEFAULT_UUID_AS_STRING)
  }
  
@@ -324,6 +274,114 @@ index f269c06..f39428c 100644
 +
 +fn max_json_depth() -> Option<usize> {
 +    MAX_JSON_DEPTH.get().copied()
++}
++
++static AVRO_CPP_JSON_WHITESPACE: OnceLock<bool> = OnceLock::new();
++
++/// Whether the raw control bytes the Avro C++ implementation's JSON reader
++/// accepts are accepted here too, in the two places it takes them.
++///
++/// JSON's grammar allows exactly four whitespace bytes between tokens -- space,
++/// tab, line feed and carriage return -- and forbids every unescaped byte below
++/// 0x20 inside a string literal. serde_json implements both rules. Avro C++
++/// implements neither: it skips whitespace with `isspace` (`JsonIO.cc:42`), which
++/// also takes a vertical tab (0x0B) and a form feed (0x0C), and its string
++/// tokenizer (`tryString`, `JsonIO.cc:272`) copies any byte that is not a quote
++/// or a backslash straight through. So schema text carrying such a byte parses
++/// there and not here.
++///
++/// Off by default, which leaves the strict JSON reading in force and changes
++/// nothing for a caller who does not ask. Set it on to accept what Avro C++
++/// accepts.
++///
++/// Set, the input is rewritten before it is parsed, in the only two ways that
++/// leave the parsed value identical to what Avro C++ would have produced:
++///
++/// - between tokens, a vertical tab or form feed becomes a space;
++/// - inside a string literal, a byte below 0x20 becomes its `\u00XX` escape,
++///   which is the same character spelled the way JSON requires.
++///
++/// Nothing else is touched, and no byte is dropped, so a document that parses
++/// carries exactly the data it did.
++///
++/// This function only changes the setting once; on subsequent calls the value
++/// stays as the first call left it.
++///
++/// # Returns
++/// The setting actually in effect, which differs from the argument if something
++/// already set it.
++pub fn set_avro_cpp_json_whitespace(lenient: bool) -> bool {
++    *AVRO_CPP_JSON_WHITESPACE.get_or_init(|| lenient)
++}
++
++fn avro_cpp_json_whitespace() -> bool {
++    AVRO_CPP_JSON_WHITESPACE.get().copied().unwrap_or(false)
++}
++
++/// `raw` rewritten so that the control bytes Avro C++ accepts parse here too, or
++/// `None` when there are none and the input can be parsed as it stands.
++///
++/// Between tokens a vertical tab or form feed becomes a space. Inside a string
++/// literal a byte below 0x20 becomes its `\u00XX` escape, which denotes the same
++/// character; escaping rather than replacing is what keeps the parsed string
++/// equal to the one Avro C++ reads. Byte offsets therefore shift inside strings,
++/// so a parse error's position refers to the rewritten form; the document
++/// boundary the C1 cut needs is measured by [`json_document_end`] on the
++/// caller's own bytes, before any of this runs.
++///
++/// One pass to decide whether anything needs rewriting, so the common case
++/// allocates nothing.
++fn spaces_for_extra_whitespace(raw: &[u8]) -> Option<Vec<u8>> {
++    let is_extra_space = |byte: u8| byte == 0x0b || byte == 0x0c;
++
++    let mut i = 0;
++    let mut found = false;
++    while i < raw.len() && !found {
++        match raw[i] {
++            b'"' => match string_literal_end(raw, i) {
++                Some(end) => {
++                    found = raw[i..end].iter().any(|&byte| byte < 0x20);
++                    i = end;
++                }
++                // Unterminated: the parse fails on it either way, and rewriting
++                // a broken document would only change which error it gives.
++                None => return None,
++            },
++            byte => {
++                found = is_extra_space(byte);
++                i += 1;
++            }
++        }
++    }
++    if !found {
++        return None;
++    }
++
++    let mut out = Vec::with_capacity(raw.len() + 16);
++    let mut i = 0;
++    while i < raw.len() {
++        match raw[i] {
++            b'"' => {
++                let Some(end) = string_literal_end(raw, i) else {
++                    out.extend_from_slice(&raw[i..]);
++                    break;
++                };
++                for &byte in &raw[i..end] {
++                    if byte < 0x20 {
++                        out.extend_from_slice(format!("\\u{byte:04x}").as_bytes());
++                    } else {
++                        out.push(byte);
++                    }
++                }
++                i = end;
++            }
++            byte => {
++                out.push(if is_extra_space(byte) { b' ' } else { byte });
++                i += 1;
++            }
++        }
++    }
++    Some(out)
 +}
 +
 +/// One past the last byte of the first complete JSON document in `raw`, or
@@ -465,18 +523,18 @@ index f269c06..f39428c 100644
 +/// [`check_json_depth`] must have run on the same bytes first. With the limit
 +/// set, this call is the recursion that limit exists to bound.
 +pub(crate) fn parse_json_str(input: &str) -> Result<Value, serde_json::Error> {
-+    if max_json_depth().is_none() {
-+        return serde_json::from_str(input);
-+    }
-+    let mut deserializer = serde_json::Deserializer::from_str(input);
-+    deserializer.disable_recursion_limit();
-+    let value = Value::deserialize(&mut deserializer)?;
-+    deserializer.end()?;
-+    Ok(value)
++    parse_json_slice(input.as_bytes())
 +}
 +
 +/// [`parse_json_str`] for bytes, for the container file header's `avro.schema`.
 +pub(crate) fn parse_json_slice(raw: &[u8]) -> Result<Value, serde_json::Error> {
++    let spaced = if avro_cpp_json_whitespace() {
++        spaces_for_extra_whitespace(raw)
++    } else {
++        None
++    };
++    let raw = spaced.as_deref().unwrap_or(raw);
++
 +    if max_json_depth().is_none() {
 +        return serde_json::from_slice(raw);
 +    }
@@ -490,7 +548,7 @@ index f269c06..f39428c 100644
  #[cfg(test)]
  mod tests {
      use super::*;
-@@ -386,4 +641,107 @@ mod tests {
+@@ -386,4 +749,107 @@ mod tests {
  
          Ok(())
      }

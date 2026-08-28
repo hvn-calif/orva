@@ -11,7 +11,8 @@ Patches this repo maintains against `apache-avro` (avro-rs), each a normal
 | `apache-avro-0.21-empty-union.patch` | the strict-eof patch above | Rejects a union with no members. `[]` used to parse and re-render as `[]`, though no branch index is in range for it, so it has no encodable value. **Not** additive: two upstream tests asserted the old behaviour. Closes the `schema-acceptance` / "bad node of type union" divergence |
 | `apache-avro-0.21-empty-enum.patch` | the empty-union patch above | Rejects an enum with no symbols, the same defect on a different construct. Guards the parse path only: `EnumSchema` has public fields and a builder, unlike `UnionSchema`. Adds `Details::EnumEmptySymbols`. Closes the `schema-acceptance` / "bad node of type enum" divergence |
 | `apache-avro-0.21-empty-decimal.patch` | the empty-enum patch above | Lets a zero-length unscaled decimal value round-trip. It used to decode into a `Decimal` that could be neither read nor re-encoded, both failing with a sign-extension error. Closes the `reencode-failed` / "decimal sign extension 0" divergence |
-| `apache-avro-0.21-json-depth.patch` | the empty-decimal patch above | Adds `util::set_max_json_depth`, **unset by default**. Set, it bounds how deep a schema JSON document may nest, checked by a linear scan over the bytes *before* parsing, and switches serde_json's own 128-container limit off so exactly one limit applies. Clamped to `MAX_JSON_DEPTH_CEILING`, 600, which is avro-cpp's `DepthTracker::kMaxDepth` in the same unit. Also adds `util::json_document_end`. Closes the 128-against-600 acceptance divergence; see `doc/specs/JsonDepthLimit.md` in orva-difffuzz |
+| `apache-avro-0.21-json-depth.patch` | the empty-decimal patch above | Two settings over one shared pre-parse pass on schema JSON, **both unset by default**. `util::set_max_json_depth` bounds how deep a document may nest, checked by a linear scan over the bytes *before* parsing, and switches serde_json's own 128-container limit off so exactly one limit applies; clamped to `MAX_JSON_DEPTH_CEILING`, 600, which is avro-cpp's `DepthTracker::kMaxDepth` in the same unit. `util::set_avro_cpp_json_whitespace` accepts the raw control bytes avro-cpp takes and JSON forbids: a vertical tab or form feed between tokens becomes a space, and a byte below 0x20 inside a string literal becomes its `\u00XX` escape, so the data is unchanged. Also adds `util::json_document_end`. Closes the 128-against-600 acceptance divergence and the control-byte one; see `doc/specs/JsonDepthLimit.md` in orva-difffuzz |
+| `apache-avro-0.21-schema-conformance.patch` | the json-depth patch above | Six specification-conformance fixes found by differential fuzzing against avro-cpp and by reviewing those, all unconditional because avro-cpp follows the spec and the crate did not. **Unions:** at most one branch per *underlying* type and per *name*, so `time-micros` beside `timestamp-micros` is two `long` branches and illegal, as is a record beside a reference to it or two decimals over one `fixed`, while a `decimal` on `fixed` beside a `decimal` on `bytes` is legal and used to be rejected. **Fixed:** a `size` of zero is refused, which the error variant `GetFixedSizeFieldPositive` always claimed and the check never did. **Duration:** renders as one `fixed` carrying `logicalType` rather than a `type` whose value is a `fixed`, a shape no implementation could read. **Document scan:** a vertical tab or form feed is skipped rather than read as the start of a scalar, which had put the first document's boundary at 1 and left a caller cutting there with no document. **Escapes:** only a *bare* control byte in a string is escaped, since one after a backslash is invalid to both readers and rewriting it fabricated content. Not additive: one upstream test declared a zero-size fixed incidentally and now declares 16 |
 | `apache-avro-0.22-read-into.patch` | avro-rs `8000091350d32f4ed4d94166dcb7695a4a25e409` | Allocation-reusing value decoding: `read_into`, `read_value_into`, `OwnedGenericDatumReader`. Superseded by the 0.23 rewrite below; kept because docs and recorded benchmark results reference it |
 | `apache-avro-0.23-read-into.patch` | avro-rs `4617efecb7159e56b122282c950ed32e04d36859` | Allocation-reusing value decoding, rewritten for the 0.23 main line: same API as the 0.22 patch plus integration with the per-datum allocation budget and recursion depth limit that landed upstream after 0.22, and a criterion bench. This is the version being submitted upstream |
 
@@ -317,7 +318,31 @@ file this patch touches (the `result_large_err` and `useless_vec` findings in
 `schema.rs` are the pre-existing ones noted above), and the suite goes from 567
 with the six patches above to 578, the eleven tests this one adds.
 
-Why it exists. serde_json assigns `remaining_depth: 128` where the `Deserializer`
+**Two settings, one pass.** The patch grew a second setting after the depth
+limit landed, because both need the same thing: a look at the bytes before
+serde_json sees them, aware of string literals and escapes.
+`set_avro_cpp_json_whitespace` closes a second acceptance divergence, the raw
+control bytes avro-cpp accepts and JSON forbids. avro-cpp skips whitespace with
+`isspace` (`JsonIO.cc:42`), which also takes a vertical tab (0x0B) and a form
+feed (0x0C), and its string tokenizer (`tryString`, `JsonIO.cc:272`) copies any
+byte that is not a quote or a backslash straight through. Set, the pass rewrites
+the first case to a space and a *bare* byte below 0x20 in a string to the
+`\u00XX` escape denoting the same character, so the parsed document holds exactly
+the data it did and only its spelling changed. Unset, as with the depth limit,
+nothing runs.
+
+**"Bare" is the whole of the second rule**, and getting it wrong was a real bug
+before review caught it. A byte below 0x20 that follows a backslash is left
+untouched, because there it is not a character an escape denotes: avro-cpp's
+`tryString` accepts a backslash only before one of `" \ / b f n r t u` and throws
+on anything else, so such a document is refused there and by serde_json alike.
+Escaping it anyway emitted the backslash *and* an escape after it, so
+a backslash followed by 0x01 became two backslashes followed by `u0001`, which
+parses as one escaped backslash plus five ordinary characters -- turning a
+document both readers reject into one the crate accepts, holding text nobody
+wrote.
+
+Why the depth limit exists. serde_json assigns `remaining_depth: 128` where the `Deserializer`
 is constructed and offers no setter, so 128 nested containers is the hard limit on
 schema JSON. avro-cpp bounds the same recursion at 600 nested values. A schema
 between those two numbers is therefore readable by one implementation and not by
@@ -414,6 +439,59 @@ comment carries the measurements above so a later reader does not shrink it.
 
 No public signature changes, and the default preserves every existing behaviour,
 so it is additive for any other consumer of the crate.
+
+## apache-avro-0.21-schema-conformance.patch
+
+Base: the json-depth patch above. Six unconditional fixes, five in
+`avro/src/schema.rs` and one in `avro/src/util.rs`, found by fuzzing this
+crate against avro-cpp on generated schemas and all cases where avro-cpp follows
+the specification, or is simply right, and this crate did not. Unconditional
+rather than settable for the same reason the Tier A patches are: the crate's
+behaviour was wrong, not merely more lenient.
+
+**A union may hold at most one branch per underlying type.** The specification
+allows one schema per type except for the named types record, fixed and enum. A
+logical type annotates an underlying type, so `time-micros` beside
+`timestamp-micros` is two `long` branches and no more legal than two plain
+`long`s; `Schema` gives each logical type its own variant, so the `SchemaKind`
+discriminant driving duplicate detection saw them as distinct. The fix maps a
+kind to its underlying type, taking a decimal's from its inner schema, which
+also fixes the **opposite** error: a union of a `decimal` on `fixed` beside a
+`decimal` on `bytes` was rejected as a duplicate where avro-cpp accepts it.
+Duplicate detection now lives in a set apart from `variant_index`, which answers
+a different question -- which branch a value of a given kind belongs to -- and
+has to stay keyed by the exact kind, its own documented slow path covering
+logical and named types.
+
+**A fixed of size zero is refused.** The specification calls `size` "a positive
+integer", a fixed of no bytes can hold no value, and avro-cpp says "Size for
+fixed is not positive". The check was only that the field parsed as an unsigned
+integer, while the error variant it raises has been named
+`GetFixedSizeFieldPositive` all along.
+
+**A duration renders as an annotated fixed.** It nested them, producing
+`{"type":{"type":"fixed",..},"logicalType":"duration"}`, which no implementation
+reads: avro-cpp rejects it with `Json field "type" is not a string`, and
+re-parsing it with this crate failed too, so a duration did not survive a round
+trip through its own rendering. A parsed name is still lost, because
+`Schema::Duration` carries none; that is a limit of the model and not addressed
+here.
+
+**The document scan skips a vertical tab and a form feed.** Neither is a value
+under either reading -- strict JSON refuses them and avro-cpp skips them as
+spacing -- but `scan_json` fell through to its scalar arm on both, so a leading
+vertical tab made `json_document_end` report a boundary of 1 and a caller cutting
+there was left with no document at all. This is the depth patch's scan, fixed
+here because that is where the fuzzer found it: after 38 minutes and 24.9 million
+runs, on an input needing a leading vertical tab *and* a trailing NUL together,
+since each alone already parsed. It is independent of
+`set_avro_cpp_json_whitespace`, which changes what parses rather than where a
+document ends.
+
+Not additive, in one place: `avro_custom_attributes_schema_without_attributes`
+declared a fixed of size 0. That test is about custom attributes and the size is
+incidental to it, so the patch changes it to 16. No other upstream test asserts
+any of the three behaviours; the suite passes with the patch applied.
 
 ## apache-avro-0.22-read-into.patch
 
