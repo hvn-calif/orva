@@ -1,0 +1,678 @@
+From 28bd5334629524a89e903027994ea9af8139b990 Mon Sep 17 00:00:00 2001
+From: Viet Hung Nguyen <hvn@calif.io>
+Date: Sun, 6 Sep 2026 20:30:01 +0700
+Subject: [PATCH] feat: Add TimeNanos logical type
+
+Add a `time-nanos` logical type, backed by `long`, that mirrors the
+existing `time-micros` type: the time of day as the number of
+nanoseconds after midnight.
+
+Changes:
+- `Schema::TimeNanos` and `Value::TimeNanos(i64)`, with parsing of
+  `{"type": "long", "logicalType": "time-nanos"}` and serialization
+  back to the same JSON.
+- Encode/decode as a zig-zag long, like `TimeMicros`.
+- `Value::resolve` accepts `TimeNanos`, `Long`, or `Int`; a new
+  `Details::GetTimeNanos` error covers the mismatch case.
+- Serde support in the value deserializer and the schema-aware
+  serializer.
+- Schema compatibility: `long <-> time-nanos` promotion, same rules as
+  `time-micros`.
+- Schema equality, test helper schema examples, README and crate docs.
+- Unit tests for each of the above.
+
+Note: `time-nanos` is not part of the Avro specification. Other
+implementations will treat it as an unknown logical type and fall back
+to the underlying `long`, so data remains readable across
+implementations.
+---
+ avro/README.md                   |  6 ++++
+ avro/src/de.rs                   | 21 ++++++++++++
+ avro/src/decode.rs               |  1 +
+ avro/src/encode.rs               |  3 +-
+ avro/src/error.rs                |  3 ++
+ avro/src/lib.rs                  |  6 ++++
+ avro/src/schema.rs               | 18 ++++++++++
+ avro/src/schema_compatibility.rs | 31 ++++++++++++++++--
+ avro/src/schema_equality.rs      |  2 ++
+ avro/src/ser_schema.rs           | 56 ++++++++++++++++++++++++++++++++
+ avro/src/types.rs                | 30 +++++++++++++++++
+ avro/src/writer.rs               | 11 +++++++
+ avro_test_helper/src/data.rs     | 10 ++++++
+ 13 files changed, 195 insertions(+), 3 deletions(-)
+
+diff --git a/avro/README.md b/avro/README.md
+index 0a850f8..c5e8044 100644
+--- a/avro/README.md
++++ b/avro/README.md
+@@ -510,6 +510,11 @@ fn main() -> Result<(), Error> {
+           "type": "long",
+           "logicalType": "time-micros"
+         },
++        {
++          "name": "time_nanos",
++          "type": "long",
++          "logicalType": "time-nanos"
++        },
+         {
+           "name": "timestamp_millis",
+           "type": "long",
+@@ -556,6 +561,7 @@ fn main() -> Result<(), Error> {
+     record.put("date", Value::Date(1));
+     record.put("time_millis", Value::TimeMillis(2));
+     record.put("time_micros", Value::TimeMicros(3));
++    record.put("time_nanos", Value::TimeNanos(3));
+     record.put("timestamp_millis", Value::TimestampMillis(4));
+     record.put("timestamp_micros", Value::TimestampMicros(5));
+     record.put("timestamp_nanos", Value::TimestampNanos(6));
+diff --git a/avro/src/de.rs b/avro/src/de.rs
+index 92a3b68..1587980 100644
+--- a/avro/src/de.rs
++++ b/avro/src/de.rs
+@@ -321,6 +321,7 @@ impl<'de> de::Deserializer<'de> for &Deserializer<'de> {
+             Value::Int(i) | Value::Date(i) | Value::TimeMillis(i) => visitor.visit_i32(*i),
+             Value::Long(i)
+             | Value::TimeMicros(i)
++            | Value::TimeNanos(i)
+             | Value::TimestampMillis(i)
+             | Value::TimestampMicros(i)
+             | Value::TimestampNanos(i)
+@@ -335,6 +336,7 @@ impl<'de> de::Deserializer<'de> for &Deserializer<'de> {
+                 Value::Int(i) | Value::Date(i) | Value::TimeMillis(i) => visitor.visit_i32(i),
+                 Value::Long(i)
+                 | Value::TimeMicros(i)
++                | Value::TimeNanos(i)
+                 | Value::TimestampMillis(i)
+                 | Value::TimestampMicros(i)
+                 | Value::TimestampNanos(i)
+@@ -1255,6 +1257,15 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn test_time_nanos() -> TestResult {
++        let raw_value = 1;
++        let value = Value::TimeNanos(raw_value);
++        let result = crate::from_value::<i64>(&value)?;
++        assert_eq!(result, raw_value);
++        Ok(())
++    }
++
+     #[test]
+     fn test_timestamp_millis() -> TestResult {
+         let raw_value = 1;
+@@ -1356,6 +1367,7 @@ mod tests {
+             ("long_two".to_string(), 2),
+             ("long_three".to_string(), 3),
+             ("time_micros_a".to_string(), 123),
++            ("time_nanos_a".to_string(), 123_001),
+             ("timestamp_millis_b".to_string(), 234),
+             ("timestamp_micros_c".to_string(), 345),
+             ("timestamp_nanos_d".to_string(), 345_001),
+@@ -1372,6 +1384,7 @@ mod tests {
+             .map(|(k, v)| match k {
+                 key if key.starts_with("long_") => (k.clone(), Value::Long(*v)),
+                 key if key.starts_with("time_micros_") => (k.clone(), Value::TimeMicros(*v)),
++                key if key.starts_with("time_nanos_") => (k.clone(), Value::TimeNanos(*v)),
+                 key if key.starts_with("timestamp_millis_") => {
+                     (k.clone(), Value::TimestampMillis(*v))
+                 }
+@@ -1423,6 +1436,14 @@ mod tests {
+                 "a_non_existing_time_micros".to_string(),
+                 Value::Union(0, Box::new(Value::TimeMicros(-123))),
+             ),
++            (
++                "a_time_nanos".to_string(),
++                Value::Union(0, Box::new(Value::TimeNanos(123_001))),
++            ),
++            (
++                "a_non_existing_time_nanos".to_string(),
++                Value::Union(0, Box::new(Value::TimeNanos(-123_001))),
++            ),
+             (
+                 "a_timestamp_millis".to_string(),
+                 Value::Union(0, Box::new(Value::TimestampMillis(234))),
+diff --git a/avro/src/decode.rs b/avro/src/decode.rs
+index 78fefbd..c77a52a 100644
+--- a/avro/src/decode.rs
++++ b/avro/src/decode.rs
+@@ -141,6 +141,7 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
+         Schema::TimeMillis => zag_i32(reader).map(Value::TimeMillis),
+         Schema::Long => decode_long(reader),
+         Schema::TimeMicros => zag_i64(reader).map(Value::TimeMicros),
++        Schema::TimeNanos => zag_i64(reader).map(Value::TimeNanos),
+         Schema::TimestampMillis => zag_i64(reader).map(Value::TimestampMillis),
+         Schema::TimestampMicros => zag_i64(reader).map(Value::TimestampMicros),
+         Schema::TimestampNanos => zag_i64(reader).map(Value::TimestampNanos),
+diff --git a/avro/src/encode.rs b/avro/src/encode.rs
+index 38203f9..13adbc0 100644
+--- a/avro/src/encode.rs
++++ b/avro/src/encode.rs
+@@ -100,7 +100,8 @@ pub(crate) fn encode_internal<W: Write, S: Borrow<Schema>>(
+         | Value::LocalTimestampMillis(i)
+         | Value::LocalTimestampMicros(i)
+         | Value::LocalTimestampNanos(i)
+-        | Value::TimeMicros(i) => encode_long(*i, writer),
++        | Value::TimeMicros(i)
++        | Value::TimeNanos(i) => encode_long(*i, writer),
+         Value::Float(x) => writer
+             .write(&x.to_le_bytes())
+             .map_err(|e| Details::WriteBytes(e).into()),
+diff --git a/avro/src/error.rs b/avro/src/error.rs
+index 95aeb2b..b23c6ca 100644
+--- a/avro/src/error.rs
++++ b/avro/src/error.rs
+@@ -208,6 +208,9 @@ pub enum Details {
+     #[error("Expected Value::TimeMicros, Value::Long or Value::Int, got: {0:?}")]
+     GetTimeMicros(Value),
+ 
++    #[error("Expected Value::TimeNanos, Value::Long or Value::Int, got: {0:?}")]
++    GetTimeNanos(Value),
++
+     #[error("Expected Value::TimestampMillis, Value::Long or Value::Int, got: {0:?}")]
+     GetTimestampMillis(Value),
+ 
+diff --git a/avro/src/lib.rs b/avro/src/lib.rs
+index f4612c5..9015103 100644
+--- a/avro/src/lib.rs
++++ b/avro/src/lib.rs
+@@ -623,6 +623,11 @@
+ //!           "logicalType": "time-micros"
+ //!         },
+ //!         {
++//!           "name": "time_nanos",
++//!           "type": "long",
++//!           "logicalType": "time-nanos"
++//!         },
++//!         {
+ //!           "name": "timestamp_millis",
+ //!           "type": "long",
+ //!           "logicalType": "timestamp-millis"
+@@ -668,6 +673,7 @@
+ //!     record.put("date", Value::Date(1));
+ //!     record.put("time_millis", Value::TimeMillis(2));
+ //!     record.put("time_micros", Value::TimeMicros(3));
++//!     record.put("time_nanos", Value::TimeNanos(3));
+ //!     record.put("timestamp_millis", Value::TimestampMillis(4));
+ //!     record.put("timestamp_micros", Value::TimestampMicros(5));
+ //!     record.put("timestamp_nanos", Value::TimestampNanos(6));
+diff --git a/avro/src/schema.rs b/avro/src/schema.rs
+index b8907e6..6326786 100644
+--- a/avro/src/schema.rs
++++ b/avro/src/schema.rs
+@@ -121,6 +121,9 @@ pub enum Schema {
+     /// The time of day in number of microseconds after midnight with no reference any calendar,
+     /// time zone or date in particular.
+     TimeMicros,
++    /// The time of day in number of nanoseconds after midnight with no reference any calendar,
++    /// time zone or date in particular.
++    TimeNanos,
+     /// An instant in time represented as the number of milliseconds after the UNIX epoch.
+     TimestampMillis,
+     /// An instant in time represented as the number of microseconds after the UNIX epoch.
+@@ -208,6 +211,7 @@ impl From<&types::Value> for SchemaKind {
+             Value::Date(_) => Self::Date,
+             Value::TimeMillis(_) => Self::TimeMillis,
+             Value::TimeMicros(_) => Self::TimeMicros,
++            Value::TimeNanos(_) => Self::TimeNanos,
+             Value::TimestampMillis(_) => Self::TimestampMillis,
+             Value::TimestampMicros(_) => Self::TimestampMicros,
+             Value::TimestampNanos(_) => Self::TimestampNanos,
+@@ -1610,6 +1614,14 @@ impl Parser {
+                         |_| -> AvroResult<Schema> { Ok(Schema::TimeMicros) },
+                     );
+                 }
++                "time-nanos" => {
++                    return try_convert_to_logical_type(
++                        "time-nanos",
++                        parse_as_native_complex(complex, self, enclosing_namespace)?,
++                        &[SchemaKind::Long],
++                        |_| -> AvroResult<Schema> { Ok(Schema::TimeNanos) },
++                    );
++                }
+                 "timestamp-millis" => {
+                     return try_convert_to_logical_type(
+                         "timestamp-millis",
+@@ -2223,6 +2235,12 @@ impl Serialize for Schema {
+                 map.serialize_entry("logicalType", "time-micros")?;
+                 map.end()
+             }
++            Schema::TimeNanos => {
++                let mut map = serializer.serialize_map(None)?;
++                map.serialize_entry("type", "long")?;
++                map.serialize_entry("logicalType", "time-nanos")?;
++                map.end()
++            }
+             Schema::TimestampMillis => {
+                 let mut map = serializer.serialize_map(None)?;
+                 map.serialize_entry("type", "long")?;
+diff --git a/avro/src/schema_compatibility.rs b/avro/src/schema_compatibility.rs
+index 3fec12a..e349689 100644
+--- a/avro/src/schema_compatibility.rs
++++ b/avro/src/schema_compatibility.rs
+@@ -91,6 +91,7 @@ impl Checker {
+                 || r_type == SchemaKind::Date
+                 || r_type == SchemaKind::TimeMillis
+                 || r_type == SchemaKind::TimeMicros
++                || r_type == SchemaKind::TimeNanos
+                 || r_type == SchemaKind::TimestampMillis
+                 || r_type == SchemaKind::TimestampMicros
+                 || r_type == SchemaKind::TimestampNanos
+@@ -441,6 +442,7 @@ impl SchemaCompatibility {
+                     );
+                 }
+                 SchemaKind::TimeMicros
++                | SchemaKind::TimeNanos
+                 | SchemaKind::TimestampNanos
+                 | SchemaKind::TimestampMillis
+                 | SchemaKind::TimestampMicros
+@@ -484,6 +486,7 @@ impl SchemaCompatibility {
+                     SchemaKind::Float,
+                     SchemaKind::Double,
+                     SchemaKind::TimeMicros,
++                    SchemaKind::TimeNanos,
+                     SchemaKind::TimestampMillis,
+                     SchemaKind::TimestampMicros,
+                     SchemaKind::TimestampNanos,
+@@ -505,6 +508,7 @@ impl SchemaCompatibility {
+                 check_reader_type(r_type, SchemaKind::Int, w_type)
+             }
+             SchemaKind::TimeMicros
++            | SchemaKind::TimeNanos
+             | SchemaKind::TimestampMicros
+             | SchemaKind::TimestampMillis
+             | SchemaKind::TimestampNanos
+@@ -705,6 +709,7 @@ mod tests {
+             (Schema::Bytes, Schema::Int),
+             // logical types
+             (Schema::TimeMicros, Schema::Int),
++            (Schema::TimeNanos, Schema::Int),
+             (Schema::TimestampMillis, Schema::Int),
+             (Schema::TimestampMicros, Schema::Int),
+             (Schema::TimestampNanos, Schema::Int),
+@@ -770,11 +775,16 @@ mod tests {
+         r#"{"type": "int"}"#,
+         r#"{"type": "int", "logicalType": "time-millis"}"#
+     )]
+-    // time-millis type
++    // time-micros type
+     #[case(
+         r#"{"type": "long"}"#,
+         r#"{"type": "long", "logicalType": "time-micros"}"#
+     )]
++    // time-nanos type
++    #[case(
++        r#"{"type": "long"}"#,
++        r#"{"type": "long", "logicalType": "time-nanos"}"#
++    )]
+     // timetimestamp-nanos type
+     #[case(
+         r#"{"type": "long"}"#,
+@@ -848,6 +858,7 @@ mod tests {
+             SchemaKind::Float,
+             SchemaKind::Double,
+             SchemaKind::TimeMicros,
++            SchemaKind::TimeNanos,
+             SchemaKind::TimestampMillis,
+             SchemaKind::TimestampMicros,
+             SchemaKind::TimestampNanos,
+@@ -865,6 +876,7 @@ mod tests {
+             SchemaKind::Float,
+             SchemaKind::Double,
+             SchemaKind::TimeMicros,
++            SchemaKind::TimeNanos,
+             SchemaKind::TimestampMillis,
+             SchemaKind::TimestampMicros,
+             SchemaKind::TimestampNanos,
+@@ -893,7 +905,7 @@ mod tests {
+             SchemaKind::Uuid,
+         ]}
+     )]
+-    // time-millis type
++    // time-micros type
+     #[case(
+         r#"{"type": "int"}"#,
+         r#"{"type": "long", "logicalType": "time-micros"}"#,
+@@ -906,6 +918,19 @@ mod tests {
+             SchemaKind::TimeMillis
+         ]}
+     )]
++    // time-nanos type
++    #[case(
++        r#"{"type": "int"}"#,
++        r#"{"type": "long", "logicalType": "time-nanos"}"#,
++        CompatibilityError::TypeExpected{schema_type: String::from("readers_schema"), expected_type: vec![
++            SchemaKind::Int,
++            SchemaKind::Long,
++            SchemaKind::Float,
++            SchemaKind::Double,
++            SchemaKind::Date,
++            SchemaKind::TimeMillis
++        ]}
++    )]
+     // timestamp-nanos type. This test should fail because it is not supported on schema parse_complex
+     // #[case(
+     //     r#"{"type": "string"}"#,
+@@ -1022,6 +1047,7 @@ mod tests {
+             (Schema::Date, Schema::Int),
+             (Schema::TimeMillis, Schema::Int),
+             (Schema::TimeMicros, Schema::Long),
++            (Schema::TimeNanos, Schema::Long),
+             (Schema::TimestampMillis, Schema::Long),
+             (Schema::TimestampMicros, Schema::Long),
+             (Schema::TimestampNanos, Schema::Long),
+@@ -1032,6 +1058,7 @@ mod tests {
+             (Schema::Int, Schema::Date),
+             (Schema::Int, Schema::TimeMillis),
+             (Schema::Long, Schema::TimeMicros),
++            (Schema::Long, Schema::TimeNanos),
+             (Schema::Long, Schema::TimestampMillis),
+             (Schema::Long, Schema::TimestampMicros),
+             (Schema::Long, Schema::TimestampNanos),
+diff --git a/avro/src/schema_equality.rs b/avro/src/schema_equality.rs
+index 1097594..da9ebb8 100644
+--- a/avro/src/schema_equality.rs
++++ b/avro/src/schema_equality.rs
+@@ -84,6 +84,7 @@ impl SchemataEq for StructFieldEq {
+         compare_primitive!(Date);
+         compare_primitive!(Duration);
+         compare_primitive!(TimeMicros);
++        compare_primitive!(TimeNanos);
+         compare_primitive!(TimeMillis);
+         compare_primitive!(TimestampMicros);
+         compare_primitive!(TimestampMillis);
+@@ -288,6 +289,7 @@ mod tests {
+     test_primitives!(Date);
+     test_primitives!(Duration);
+     test_primitives!(TimeMicros);
++    test_primitives!(TimeNanos);
+     test_primitives!(TimeMillis);
+     test_primitives!(TimestampMicros);
+     test_primitives!(TimestampMillis);
+diff --git a/avro/src/ser_schema.rs b/avro/src/ser_schema.rs
+index 7d0ed3e..6bebf3b 100644
+--- a/avro/src/ser_schema.rs
++++ b/avro/src/ser_schema.rs
+@@ -528,6 +528,7 @@ impl<'s, W: Write> SchemaAwareWriteSerializer<'s, W> {
+             Schema::Int | Schema::TimeMillis | Schema::Date => encode_int(value, &mut self.writer),
+             Schema::Long
+             | Schema::TimeMicros
++            | Schema::TimeNanos
+             | Schema::TimestampMillis
+             | Schema::TimestampMicros
+             | Schema::TimestampNanos
+@@ -542,6 +543,7 @@ impl<'s, W: Write> SchemaAwareWriteSerializer<'s, W> {
+                         | Schema::Date
+                         | Schema::Long
+                         | Schema::TimeMicros
++                        | Schema::TimeNanos
+                         | Schema::TimestampMillis
+                         | Schema::TimestampMicros
+                         | Schema::TimestampNanos
+@@ -579,6 +581,7 @@ impl<'s, W: Write> SchemaAwareWriteSerializer<'s, W> {
+             }
+             Schema::Long
+             | Schema::TimeMicros
++            | Schema::TimeNanos
+             | Schema::TimestampMillis
+             | Schema::TimestampMicros
+             | Schema::TimestampNanos
+@@ -593,6 +596,7 @@ impl<'s, W: Write> SchemaAwareWriteSerializer<'s, W> {
+                         | Schema::Date
+                         | Schema::Long
+                         | Schema::TimeMicros
++                        | Schema::TimeNanos
+                         | Schema::TimestampMillis
+                         | Schema::TimestampMicros
+                         | Schema::TimestampNanos
+@@ -629,6 +633,7 @@ impl<'s, W: Write> SchemaAwareWriteSerializer<'s, W> {
+             }
+             Schema::Long
+             | Schema::TimeMicros
++            | Schema::TimeNanos
+             | Schema::TimestampMillis
+             | Schema::TimestampMicros
+             | Schema::TimestampNanos
+@@ -644,6 +649,7 @@ impl<'s, W: Write> SchemaAwareWriteSerializer<'s, W> {
+                         | Schema::Date
+                         | Schema::Long
+                         | Schema::TimeMicros
++                        | Schema::TimeNanos
+                         | Schema::TimestampMillis
+                         | Schema::TimestampMicros
+                         | Schema::TimestampNanos
+@@ -682,6 +688,7 @@ impl<'s, W: Write> SchemaAwareWriteSerializer<'s, W> {
+             }
+             Schema::Long
+             | Schema::TimeMicros
++            | Schema::TimeNanos
+             | Schema::TimestampMillis
+             | Schema::TimestampMicros
+             | Schema::TimestampNanos
+@@ -696,6 +703,7 @@ impl<'s, W: Write> SchemaAwareWriteSerializer<'s, W> {
+                         | Schema::Date
+                         | Schema::Long
+                         | Schema::TimeMicros
++                        | Schema::TimeNanos
+                         | Schema::TimestampMillis
+                         | Schema::TimestampMicros
+                         | Schema::TimestampNanos
+@@ -733,6 +741,7 @@ impl<'s, W: Write> SchemaAwareWriteSerializer<'s, W> {
+             }
+             Schema::Long
+             | Schema::TimeMicros
++            | Schema::TimeNanos
+             | Schema::TimestampMillis
+             | Schema::TimestampMicros
+             | Schema::TimestampNanos
+@@ -751,6 +760,7 @@ impl<'s, W: Write> SchemaAwareWriteSerializer<'s, W> {
+                         | Schema::Date
+                         | Schema::Long
+                         | Schema::TimeMicros
++                        | Schema::TimeNanos
+                         | Schema::TimestampMillis
+                         | Schema::TimestampMicros
+                         | Schema::TimestampNanos
+@@ -2563,6 +2573,52 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn test_serialize_time_nanos() -> TestResult {
++        let schema = Schema::parse_str(
++            r#"{
++            "type": "long",
++            "logicalType": "time-nanos"
++        }"#,
++        )?;
++
++        let mut buffer: Vec<u8> = Vec::new();
++        let names = HashMap::new();
++        let mut serializer = SchemaAwareWriteSerializer::new(&mut buffer, &schema, &names, None);
++
++        100_u8.serialize(&mut serializer)?;
++        1000_u16.serialize(&mut serializer)?;
++        10000_u32.serialize(&mut serializer)?;
++        1000_i16.serialize(&mut serializer)?;
++        10000_i32.serialize(&mut serializer)?;
++        10000_i64.serialize(&mut serializer)?;
++
++        match 10000_f32
++            .serialize(&mut serializer)
++            .map_err(Error::into_details)
++        {
++            Err(Details::SerializeValueWithSchema {
++                value_type,
++                value,
++                schema,
++            }) => {
++                assert_eq!(value_type, "f32");
++                assert_eq!(value, "10000. Cause: Expected: TimeNanos. Got: Float");
++                assert_eq!(schema, schema);
++            }
++            unexpected => panic!("Expected an error. Got: {unexpected:?}"),
++        }
++
++        assert_eq!(
++            buffer.as_slice(),
++            &[
++                200, 1, 208, 15, 160, 156, 1, 208, 15, 160, 156, 1, 160, 156, 1
++            ]
++        );
++
++        Ok(())
++    }
++
+     #[test]
+     fn test_serialize_time_micros() -> TestResult {
+         let schema = Schema::parse_str(
+diff --git a/avro/src/types.rs b/avro/src/types.rs
+index 4448eef..5c96d76 100644
+--- a/avro/src/types.rs
++++ b/avro/src/types.rs
+@@ -109,6 +109,8 @@ pub enum Value {
+     TimeMillis(i32),
+     /// Time in microseconds.
+     TimeMicros(i64),
++    /// Time in nanoseconds.
++    TimeNanos(i64),
+     /// Timestamp in milliseconds.
+     TimestampMillis(i64),
+     /// Timestamp in microseconds.
+@@ -341,6 +343,7 @@ impl TryFrom<Value> for JsonValue {
+             }
+             Value::TimeMillis(t) => Ok(Self::Number(t.into())),
+             Value::TimeMicros(t) => Ok(Self::Number(t.into())),
++            Value::TimeNanos(t) => Ok(Self::Number(t.into())),
+             Value::TimestampMillis(t) => Ok(Self::Number(t.into())),
+             Value::TimestampMicros(t) => Ok(Self::Number(t.into())),
+             Value::TimestampNanos(t) => Ok(Self::Number(t.into())),
+@@ -425,6 +428,7 @@ impl Value {
+             (&Value::Int(_), &Schema::Long) => None,
+             (&Value::Long(_), &Schema::Long) => None,
+             (&Value::Long(_), &Schema::TimeMicros) => None,
++            (&Value::Long(_), &Schema::TimeNanos) => None,
+             (&Value::Long(_), &Schema::TimestampMillis) => None,
+             (&Value::Long(_), &Schema::TimestampMicros) => None,
+             (&Value::Long(_), &Schema::LocalTimestampMillis) => None,
+@@ -436,6 +440,7 @@ impl Value {
+             (&Value::LocalTimestampMillis(_), &Schema::LocalTimestampMillis) => None,
+             (&Value::LocalTimestampNanos(_), &Schema::LocalTimestampNanos) => None,
+             (&Value::TimeMicros(_), &Schema::TimeMicros) => None,
++            (&Value::TimeNanos(_), &Schema::TimeNanos) => None,
+             (&Value::TimeMillis(_), &Schema::TimeMillis) => None,
+             (&Value::Date(_), &Schema::Date) => None,
+             (&Value::Decimal(_), &Schema::Decimal { .. }) => None,
+@@ -698,6 +703,7 @@ impl Value {
+             Schema::Date => self.resolve_date(),
+             Schema::TimeMillis => self.resolve_time_millis(),
+             Schema::TimeMicros => self.resolve_time_micros(),
++            Schema::TimeNanos => self.resolve_time_nanos(),
+             Schema::TimestampMillis => self.resolve_timestamp_millis(),
+             Schema::TimestampMicros => self.resolve_timestamp_micros(),
+             Schema::TimestampNanos => self.resolve_timestamp_nanos(),
+@@ -813,6 +819,14 @@ impl Value {
+         }
+     }
+ 
++    fn resolve_time_nanos(self) -> Result<Self, Error> {
++        match self {
++            Value::TimeNanos(t) | Value::Long(t) => Ok(Value::TimeNanos(t)),
++            Value::Int(t) => Ok(Value::TimeNanos(i64::from(t))),
++            other => Err(Details::GetTimeNanos(other).into()),
++        }
++    }
++
+     fn resolve_timestamp_millis(self) -> Result<Self, Error> {
+         match self {
+             Value::TimestampMillis(ts) | Value::Long(ts) => Ok(Value::TimestampMillis(ts)),
+@@ -1795,6 +1809,13 @@ Field with name '"b"' is not a member of the map items"#,
+         assert!(value.resolve(&Schema::TimeMillis).is_err());
+     }
+ 
++    #[test]
++    fn resolve_time_nanos() {
++        let value = Value::TimeNanos(10);
++        assert!(value.clone().resolve(&Schema::TimeNanos).is_ok());
++        assert!(value.resolve(&Schema::TimeMillis).is_err());
++    }
++
+     #[test]
+     fn resolve_timestamp_millis() {
+         let value = Value::TimestampMillis(10);
+@@ -2052,6 +2073,10 @@ Field with name '"b"' is not a member of the map items"#,
+             JsonValue::try_from(Value::TimeMicros(1))?,
+             JsonValue::Number(1.into())
+         );
++        assert_eq!(
++            JsonValue::try_from(Value::TimeNanos(1))?,
++            JsonValue::Number(1.into())
++        );
+         assert_eq!(
+             JsonValue::try_from(Value::TimestampMillis(1))?,
+             JsonValue::Number(1.into())
+@@ -3264,6 +3289,11 @@ Field with name '"b"' is not a member of the map items"#,
+                 Value::Float(123_f32),
+                 "Expected Value::TimeMicros, Value::Long or Value::Int, got: Float(123.0)",
+             ),
++            (
++                r#"{ "name": "NAME", "type": "long", "logicalType": "time-nanos" }"#,
++                Value::Float(123_f32),
++                "Expected Value::TimeNanos, Value::Long or Value::Int, got: Float(123.0)",
++            ),
+             (
+                 r#"{ "name": "NAME", "type": "long", "logicalType": "timestamp-millis" }"#,
+                 Value::Float(123_f32),
+diff --git a/avro/src/writer.rs b/avro/src/writer.rs
+index 9c87991..8ded217 100644
+--- a/avro/src/writer.rs
++++ b/avro/src/writer.rs
+@@ -962,6 +962,17 @@ mod tests {
+         )
+     }
+ 
++    #[test]
++    fn time_nanos() -> TestResult {
++        logical_type_test(
++            r#"{"type": "long", "logicalType": "time-nanos"}"#,
++            &Schema::TimeNanos,
++            Value::TimeNanos(1_i64),
++            &Schema::Long,
++            1_i64,
++        )
++    }
++
+     #[test]
+     fn timestamp_millis() -> TestResult {
+         logical_type_test(
+diff --git a/avro_test_helper/src/data.rs b/avro_test_helper/src/data.rs
+index 662df23..c402a73 100644
+--- a/avro_test_helper/src/data.rs
++++ b/avro_test_helper/src/data.rs
+@@ -531,6 +531,15 @@ pub const TIMEMICROS_LOGICAL_TYPE: &[(&str, bool)] = &[
+     (r#"{"type": "int", "logicalType": "time-micros"}"#, true),
+ ];
+ 
++pub const TIMENANOS_LOGICAL_TYPE: &[(&str, bool)] = &[
++    (r#"{"type": "long", "logicalType": "time-nanos"}"#, true),
++    // this is valid even though its logical type is "time-nano" (missing the last "s"), because
++    // unknown logical types are ignored
++    (r#"{"type": "long", "logicalType": "time-nano"}"#, true),
++    // this is still valid because unknown logicalType should be ignored
++    (r#"{"type": "int", "logicalType": "time-nanos"}"#, true),
++];
++
+ pub const TIMESTAMPMILLIS_LOGICAL_TYPE: &[(&str, bool)] = &[
+     (
+         r#"{"type": "long", "logicalType": "timestamp-millis"}"#,
+@@ -622,6 +631,7 @@ pub fn examples() -> &'static Vec<(&'static str, bool)> {
+             .chain(DATE_LOGICAL_TYPE.iter().copied())
+             .chain(TIMEMILLIS_LOGICAL_TYPE.iter().copied())
+             .chain(TIMEMICROS_LOGICAL_TYPE.iter().copied())
++            .chain(TIMENANOS_LOGICAL_TYPE.iter().copied())
+             .chain(TIMESTAMPMILLIS_LOGICAL_TYPE.iter().copied())
+             .chain(TIMESTAMPMICROS_LOGICAL_TYPE.iter().copied())
+             .chain(LOCAL_TIMESTAMPMILLIS_LOGICAL_TYPE.iter().copied())
+-- 
+2.52.0
+
